@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tellerx-knowledge-chatbot"
+version = "0.1.0"
+description = "Evidence-first business knowledge chatbot powered by Qwen"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic>=1.14,<2",
+  "beautifulsoup4>=4.12,<5",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "openpyxl>=3.1,<4",
+  "elasticsearch==9.4.1",
+  "psycopg[binary]>=3.2,<4",
+  "pydantic-settings>=2.7,<3",
+  "pypdf>=5,<7",
+  "python-docx>=1.2,<2",
+  "python-multipart>=0.0.20,<1",
+  "PyYAML>=6,<7",
+  "reportlab>=4.2,<5",
+  "sqlalchemy>=2.0,<3",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<8",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+knowledge-worker = "app.worker:main"
+knowledge-indexer = "app.indexer:main"
+knowledge-reconcile = "app.indexer:reconcile_main"
+qwen-diagnostics = "app.cli:diagnostics_main"
+knowledge-eval = "app.cli:evaluate_main"
+knowledge-benchmark = "app.benchmark:main"
+knowledge-reindex = "app.reindex:main"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.setuptools.package-data]
+app = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+extend-per-file-ignores = { "app/api.py" = ["B008"], "app/worker.py" = ["BLE001"], "app/indexer.py" = ["BLE001"], "app/benchmark.py" = ["BLE001", "S112"] }

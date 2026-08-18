@@ -1,0 +1,37 @@
+models:
+  - id: qwen3.7-plus-2026-05-26
+    tier: plus
+    quota_tokens: 1000000
+    priority: 10
+    enabled: true
+    stable: true
+  - id: qwen3.7-plus
+    tier: plus
+    quota_tokens: 1000000
+    priority: 20
+    enabled: true
+    stable: false
+  - id: qwen3.7-max-2026-05-20
+    tier: max
+    quota_tokens: 1000000
+    priority: 10
+    enabled: true
+    stable: true
+  - id: qwen3.7-max-2026-05-17
+    tier: max
+    quota_tokens: 1000000
+    priority: 20
+    enabled: false
+    stable: true
+  - id: qwen3.7-max
+    tier: max
+    quota_tokens: 1000000
+    priority: 30
+    enabled: true
+    stable: false
+  - id: qwen3.7-max-preview
+    tier: max
+    quota_tokens: 1000000
+    priority: 40
+    enabled: false
+    stable: false

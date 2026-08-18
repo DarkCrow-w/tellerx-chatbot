@@ -1,0 +1,99 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: knowledge
+      POSTGRES_USER: knowledge
+      POSTGRES_PASSWORD: knowledge
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U knowledge -d knowledge"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.4.3
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.enrollment.enabled: "false"
+      ES_JAVA_OPTS: "-Xms768m -Xmx768m"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=2s' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+
+  migrate:
+    build: .
+    env_file: .env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      QWEN_API_KEY_FILE: /run/secrets/qwen_api_key
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      elasticsearch:
+        condition: service_healthy
+    secrets:
+      - qwen_api_key
+    ports:
+      - "8000:8000"
+    volumes:
+      - uploads:/data/knowledge
+
+  worker:
+    build: .
+    env_file: .env
+    environment:
+      QWEN_API_KEY_FILE: /run/secrets/qwen_api_key
+    command: ["knowledge-worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      elasticsearch:
+        condition: service_healthy
+    secrets:
+      - qwen_api_key
+    volumes:
+      - uploads:/data/knowledge
+
+  indexer:
+    build: .
+    env_file: .env
+    environment:
+      QWEN_API_KEY_FILE: /run/secrets/qwen_api_key
+    command: ["knowledge-indexer"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      elasticsearch:
+        condition: service_healthy
+    secrets:
+      - qwen_api_key
+    volumes:
+      - uploads:/data/knowledge
+
+secrets:
+  qwen_api_key:
+    file: "./Qwen/Qwen token.txt"
+
+volumes:
+  postgres-data:
+  elasticsearch-data:
+  # Keep the existing volume name so OpenSearch-era original files remain available.
+  uploads:
