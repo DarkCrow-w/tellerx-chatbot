@@ -6,13 +6,19 @@
   "scripts": {
     "dev": "vite --config frontend/vite.config.js",
     "build": "vite build --config frontend/vite.config.js",
-    "preview": "vite preview --config frontend/vite.config.js"
+    "preview": "vite preview --config frontend/vite.config.js",
+    "generate:chaos-corpus": "node scripts/generate-chaos-corpus.mjs"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "latest",
     "lucide-react": "latest",
     "vite": "latest",
     "react": "latest",
     "react-dom": "latest"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "latest",
+    "docx": "9.6.1",
+    "exceljs": "4.4.0",
+    "pdf-lib": "1.17.1"
   }
 }

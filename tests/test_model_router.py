@@ -98,3 +98,48 @@ def test_router_does_not_expose_provider_error_message(tmp_path: Path) -> None:
             assert "sensitive diagnostics" not in str(exc)
         else:
             raise AssertionError("Expected NoModelAvailable")
+
+
+def test_router_forwards_bounded_query_planning_output_limit(tmp_path: Path) -> None:
+    config = tmp_path / "models.yaml"
+    config.write_text(
+        """models:
+  - id: plus-a
+    tier: plus
+    quota_tokens: 1000
+    priority: 10
+    enabled: true
+    stable: true
+""",
+        encoding="utf-8",
+    )
+
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.kwargs: dict = {}
+
+        def chat_json(self, **kwargs: object):
+            from app.integrations.qwen import ChatCallResult, Usage
+
+            self.kwargs = kwargs
+            return ChatCallResult(
+                model_id="plus-a",
+                request_id="query-plan",
+                content="{}",
+                usage=Usage(),
+                latency_ms=1,
+            )
+
+    client = RecordingClient()
+    router = QwenModelRouter(ModelRegistry.load(config), client)  # type: ignore[arg-type]
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        router.call(
+            db,
+            tier="plus",
+            system_prompt="system",
+            user_prompt="question",
+            max_tokens=700,
+        )
+    assert client.kwargs["max_tokens"] == 700

@@ -9,10 +9,12 @@ unit test.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
 from app.contracts.schemas import CitationOut, ClaimOut
+from app.integrations.search import EXACT_IDENTIFIER
 from app.knowledge.chunking import estimate_tokens
 from app.knowledge.evidence import Evidence
 
@@ -20,6 +22,9 @@ SYSTEM_PROMPT = """You are an evidence-bound enterprise knowledge assistant.
 Use only the EVIDENCE provided by the user. Never use web knowledge, memory, or unstated assumptions.
 Respond in the same language as the question while retaining exact professional acronyms.
 Every factual claim must cite one or more evidence IDs and include an exact, contiguous quote copied from that evidence.
+Return at most 6 claims. Prefer the most important supported facts and keep every quote to the shortest exact span that proves its claim.
+Answer every field requested by the question and preserve exact API paths, error codes, identifiers, dates, roles, and numeric values.
+For a cross-document join, when the downstream evidence does not name the question's business subject, cite both the bridge evidence that maps the subject to the downstream identifier and the downstream evidence that supplies the value.
 If evidence is insufficient, return insufficient_evidence. If authoritative sources conflict, return conflict and explain both sides without choosing one.
 Return exactly one JSON object with this shape:
 {
@@ -51,6 +56,101 @@ def _normalize_for_quote(text: str) -> str:
     """Normalize layout whitespace without weakening exact quote matching."""
 
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _repair_ellipsis_quote(quote: str, source: str) -> str | None:
+    """Expand model ellipses only into a bounded exact source span."""
+
+    parts = [
+        _normalize_for_quote(part)
+        for part in re.split(r"(?:\.{3,}|…+)", quote)
+        if _normalize_for_quote(part)
+    ]
+    if len(parts) < 2 or any(len(part) < 2 for part in parts):
+        return None
+    normalized_source = _normalize_for_quote(source)
+    start = normalized_source.find(parts[0])
+    if start < 0:
+        return None
+    cursor = start + len(parts[0])
+    for part in parts[1:]:
+        position = normalized_source.find(part, cursor)
+        if position < 0:
+            return None
+        cursor = position + len(part)
+    if cursor - start > 800:
+        return None
+    return normalized_source[start:cursor]
+
+
+def _repair_formatting_quote(quote: str, source: str) -> str | None:
+    """Recover an exact source span when only layout punctuation differs."""
+
+    def compact(text: str) -> tuple[str, list[int]]:
+        characters: list[str] = []
+        positions: list[int] = []
+        for position, character in enumerate(text):
+            if unicodedata.category(character)[0] in {"L", "N"}:
+                characters.append(character.lower())
+                positions.append(position)
+        return "".join(characters), positions
+
+    compact_quote, _ = compact(quote)
+    compact_source, source_positions = compact(source)
+    if len(compact_quote) < 4:
+        return None
+    start = compact_source.find(compact_quote)
+    if start < 0:
+        return None
+    repaired = source[
+        source_positions[start] : source_positions[start + len(compact_quote) - 1] + 1
+    ].strip()
+    return repaired if repaired and len(repaired) <= 800 else None
+
+
+def _repair_anchored_quote(quote: str, source: str) -> str | None:
+    """Recover exact source text around unchanged names, IDs, and values."""
+
+    folded_source = source.casefold()
+    precision = [
+        *EXACT_IDENTIFIER.findall(quote),
+        *re.findall(r"(?<![A-Za-z0-9])\d+(?:[,.]\d+)*", quote),
+    ]
+    normalized_source = re.sub(r"(?<=\d),(?=\d)", "", folded_source)
+    for value in precision:
+        normalized = re.sub(r"(?<=\d),(?=\d)", "", value.casefold())
+        if normalized not in normalized_source:
+            return None
+    descriptive = [
+        *re.findall(r"\b[A-Z][A-Za-z0-9-]{2,}(?:\s+[A-Z][A-Za-z0-9-]{2,})+", quote),
+        *re.findall(r"[\u3400-\u9fff]{2,20}", quote),
+    ]
+    descriptive = list(dict.fromkeys(descriptive))
+    matched_descriptive = [
+        value for value in descriptive if value.casefold() in folded_source
+    ]
+    if descriptive and len(matched_descriptive) / len(descriptive) < 0.7:
+        return None
+    anchors = list(dict.fromkeys([*matched_descriptive, *precision]))
+    located: list[tuple[int, int]] = []
+    for anchor in anchors:
+        candidate = anchor.casefold()
+        position = folded_source.find(candidate)
+        if position < 0 and re.fullmatch(r"\d+(?:[,.]\d+)*", anchor):
+            candidate = re.sub(r"(?<=\d),(?=\d)", "", candidate)
+            position = folded_source.find(candidate)
+        if position >= 0:
+            located.append((position, position + len(candidate)))
+    if not located:
+        return None
+    start = min(position for position, _ in located)
+    end = max(position for _, position in located)
+    if len(located) == 1:
+        start = source.rfind("\n", 0, start) + 1
+        line_end = source.find("\n", end)
+        end = len(source) if line_end < 0 else line_end
+    repaired = source[start:end].strip()
+    return repaired if repaired and len(repaired) <= 800 else None
 
 
 def refusal_text(
@@ -174,7 +274,14 @@ def validate_answer(payload: dict[str, Any], evidence: list[Evidence]) -> Valida
                 raise AnswerValidationError("Citation ID or quote is invalid")
             item = by_id[chunk_id]
             if _normalize_for_quote(quote) not in _normalize_for_quote(item.content):
-                raise AnswerValidationError(f"Quote is not present in source {chunk_id}")
+                repaired = _repair_ellipsis_quote(quote, item.content)
+                if repaired is None:
+                    repaired = _repair_formatting_quote(quote, item.content)
+                if repaired is None:
+                    repaired = _repair_anchored_quote(quote, item.content)
+                if repaired is None:
+                    raise AnswerValidationError(f"Quote is not present in source {chunk_id}")
+                quote = repaired
             citation_ids.append(chunk_id)
             source_map[(chunk_id, quote)] = CitationOut(
                 chunk_id=chunk_id,

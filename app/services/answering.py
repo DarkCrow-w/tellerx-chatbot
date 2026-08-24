@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Protocol
@@ -11,11 +12,11 @@ from typing import Protocol
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.contracts.schemas import ChatResponse
+from app.contracts.schemas import ChatResponse, CitationOut
 from app.core.config import Settings
 from app.db.models import Chunk, Conversation, Document, DocumentVersion, Message, QueryTrace
 from app.integrations.qwen import ChatCallResult, parse_json_object
-from app.integrations.search import normalize_query
+from app.integrations.search import _lexical_signals, normalize_query
 from app.knowledge.evidence import Evidence
 from app.services.answer_contract import (
     SYSTEM_PROMPT,
@@ -27,6 +28,11 @@ from app.services.answer_contract import (
     validate_answer,
 )
 from app.services.model_router import NoModelAvailable, route_tier
+from app.services.query_understanding import (
+    QueryPlan,
+    QueryUnderstandingService,
+    fallback_query_plan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +40,13 @@ logger = logging.getLogger(__name__)
 class EvidenceRetriever(Protocol):
     """Minimal retrieval port required by the answer use case."""
 
-    def search(self, query: str, project_ids: list[str]) -> list[Evidence]: ...
+    def search(
+        self,
+        query: str,
+        project_ids: list[str],
+        principal_ids: list[str] | None = None,
+        query_plan: QueryPlan | None = None,
+    ) -> list[Evidence]: ...
 
 
 class AnswerModelRouter(Protocol):
@@ -49,7 +61,104 @@ class AnswerModelRouter(Protocol):
         user_prompt: str,
         pinned_model: str | None = None,
         prompt_version: str | None = None,
+        max_tokens: int | None = None,
     ) -> ChatCallResult: ...
+
+BRIDGE_IDENTIFIER = re.compile(
+    r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]{1,12}-\d{2,}(?:-[A-Za-z0-9]+)*)",
+    re.IGNORECASE,
+)
+ZH_BRIDGE_SUBJECT = re.compile(
+    r"^([\u3400-\u9fff]{2,20}?)\s*(?:当前|的|在|受|使用|由|如果|若|最新)"
+)
+
+
+def attach_cross_document_bridges(
+    question: str, validated: ValidatedAnswer, evidence: list[Evidence]
+) -> ValidatedAnswer:
+    """Add deterministic provenance bridges without adding or changing claims."""
+    if validated.status not in {"answered", "conflict"}:
+        return validated
+    query_ids = {value.casefold() for value in BRIDGE_IDENTIFIER.findall(question)}
+    subject_anchors = {
+        *query_ids,
+        *(value.casefold() for value in _lexical_signals(question)),
+        *(match.group(1).casefold() for match in ZH_BRIDGE_SUBJECT.finditer(question)),
+    }
+    if not subject_anchors:
+        return validated
+    by_id = {item.chunk_id: item for item in evidence}
+    source_keys = {(source.chunk_id, source.quote) for source in validated.sources}
+    for claim in validated.claims:
+        cited = [by_id[citation] for citation in claim.citations if citation in by_id]
+        if any(
+            any(anchor in item.content.casefold() for anchor in subject_anchors)
+            for item in cited
+        ):
+            continue
+        downstream_ids = {
+            value.casefold()
+            for item in cited
+            for value in BRIDGE_IDENTIFIER.findall(
+                " ".join([item.heading_path or "", item.content])
+            )
+            if value.casefold() not in query_ids
+        }
+        if not downstream_ids:
+            continue
+        bridge = next(
+            (
+                item
+                for item in evidence
+                if item.chunk_id not in claim.citations
+                and any(
+                    anchor in item.filename.casefold()
+                    or anchor in item.content.casefold()
+                    for anchor in subject_anchors
+                )
+                and any(
+                    identifier
+                    in " ".join([item.filename, item.heading_path or "", item.content]).casefold()
+                    for identifier in downstream_ids
+                )
+            ),
+            None,
+        )
+        if bridge is None:
+            continue
+        quote_parts = [
+            part.strip()
+            for part in re.split(r"(?<=[。！？.!?])\s*|\n+", bridge.content)
+            if part.strip()
+        ]
+        quote = next(
+            (
+                part
+                for part in quote_parts
+                if any(identifier in part.casefold() for identifier in downstream_ids)
+            ),
+            quote_parts[0] if quote_parts else bridge.content.strip(),
+        )
+        if not quote:
+            continue
+        claim.citations = list(dict.fromkeys([*claim.citations, bridge.chunk_id]))
+        key = (bridge.chunk_id, quote)
+        if key not in source_keys:
+            validated.sources.append(
+                CitationOut(
+                    chunk_id=bridge.chunk_id,
+                    document_id=bridge.document_id,
+                    filename=bridge.filename,
+                    document_status=bridge.document_status,
+                    heading_path=bridge.heading_path,
+                    page_number=bridge.page_number,
+                    sheet_name=bridge.sheet_name,
+                    cell_range=bridge.cell_range,
+                    quote=quote,
+                )
+            )
+            source_keys.add(key)
+    return validated
 
 
 class AnswerService:
@@ -58,10 +167,12 @@ class AnswerService:
         settings: Settings,
         retriever: EvidenceRetriever,
         router: AnswerModelRouter,
+        query_understanding: QueryUnderstandingService | None = None,
     ):
         self.settings = settings
         self.retriever = retriever
         self.router = router
+        self.query_understanding = query_understanding
 
     @staticmethod
     def _get_conversation(db: Session, conversation_id: str | None) -> Conversation:
@@ -86,6 +197,7 @@ class AnswerService:
         evidence: list[Evidence],
         requested_tier: str | None,
         actual_tier: str | None,
+        query_plan: QueryPlan,
     ) -> Message:
         retrieval_index = getattr(
             self.settings,
@@ -118,6 +230,7 @@ class AnswerService:
                         "requested_tier": requested_tier,
                         "actual_tier": actual_tier,
                     },
+                    "query_understanding": query_plan.as_trace_dict(),
                     "embedding_fingerprint": getattr(
                         self.settings, "embedding_fingerprint", None
                     ),
@@ -181,7 +294,20 @@ class AnswerService:
         started_at = time.perf_counter()
         trace_id = str(uuid.uuid4())
         conversation = self._get_conversation(db, conversation_id)
-        evidence = self.retriever.search(question, project_ids)
+        if self.query_understanding is not None:
+            query_plan = self.query_understanding.understand(
+                db,
+                question,
+                pinned_model=pinned_model,
+            )
+            evidence = self.retriever.search(
+                question,
+                project_ids,
+                query_plan=query_plan,
+            )
+        else:
+            query_plan = fallback_query_plan(question, "service-not-configured")
+            evidence = self.retriever.search(question, project_ids)
         if not evidence:
             validated = ValidatedAnswer(
                 status="insufficient_evidence",
@@ -201,6 +327,7 @@ class AnswerService:
                 evidence=evidence,
                 requested_tier=None,
                 actual_tier=None,
+                query_plan=query_plan,
             )
             return ChatResponse(
                 status=validated.status,
@@ -239,6 +366,7 @@ class AnswerService:
                 )
                 model_id = call.model_id
                 validated = validate_answer(parse_json_object(call.content), evidence)
+                validated = attach_cross_document_bridges(question, validated, evidence)
                 if validated.status == "insufficient_evidence":
                     validated.answer = refusal_text(question)
                 self._validate_live_sources(db, validated, evidence)
@@ -254,6 +382,7 @@ class AnswerService:
                     evidence=evidence,
                     requested_tier=tier,
                     actual_tier=attempted_tier,
+                    query_plan=query_plan,
                 )
                 return ChatResponse(
                     status=validated.status,
@@ -280,6 +409,21 @@ class AnswerService:
                         attempted_tier = "plus"
                         continue
                     break
+                logger.warning(
+                    "Answer output rejected; retrying with citation correction (%s: %s)",
+                    type(exc).__name__,
+                    str(exc),
+                )
+                user_prompt += (
+                    "\n\nPREVIOUS_OUTPUT_REJECTED: Return a fresh JSON object. "
+                    "Copy each quote exactly and contiguously from one evidence block. "
+                    "Do not paraphrase inside quote fields. Return at most 6 claims, use "
+                    "the shortest sufficient quote for each claim, and keep the JSON compact. "
+                    "Prioritize the most important supported facts instead of producing an "
+                    "exhaustive answer. "
+                    "For cross-document joins, cite the subject-to-identifier bridge evidence "
+                    "together with the downstream value evidence."
+                )
                 if pinned_model:
                     continue
         validated = ValidatedAnswer(
@@ -304,6 +448,7 @@ class AnswerService:
             evidence=evidence,
             requested_tier=tier,
             actual_tier=attempted_tier,
+            query_plan=query_plan,
         )
         return ChatResponse(
             status=validated.status,

@@ -17,7 +17,7 @@ flowchart TD
     SERVICE --> ADAPTER
     ADAPTER --> KNOWLEDGE
     ADAPTER --> QWEN["Qwen API"]
-    ADAPTER --> ES["Elasticsearch"]
+    ADAPTER --> SEARCH["PostgreSQL FTS + pgvector"]
     DB --> PG["PostgreSQL"]
 ```
 
@@ -28,7 +28,7 @@ flowchart TD
 - `app/contracts/`：跨边界 DTO，不依赖数据库、FastAPI 或外部客户端。
 - `app/services/`：问答、入库、索引和模型路由用例编排。
 - `app/knowledge/`：证据值对象、解析和切块等纯知识处理逻辑。
-- `app/integrations/`：Qwen、Elasticsearch 与不可变对象存储适配器。
+- `app/integrations/`：Qwen、PostgreSQL 检索投影与不可变对象存储适配器。
 - `app/db/`：SQLAlchemy Session、ORM 模型和持久工作流记录。
 - `app/core/config.py`：环境配置与启动安全校验。
 - `app/core/container.py`：唯一组合根；这是允许构造并连接所有层的唯一位置。
@@ -57,7 +57,7 @@ app/
 │   └── chunking.py             确定性文本/表格切块
 ├── integrations/
 │   ├── qwen.py                 Qwen API 连接池和错误归一化
-│   ├── search.py               Elasticsearch 映射、读写与过滤适配
+│   ├── search.py               PostgreSQL FTS、pgvector 与过滤适配
 │   └── storage.py              内容寻址的原文件和向量存储
 ├── db/
 │   ├── session.py              Engine、Session 和 Base
@@ -97,7 +97,7 @@ frontend/src/
 4. Parser 输出携带页码、标题路径、工作表和单元格范围的逻辑单元。
 5. Chunk ID、内容 hash 和 record hash 必须确定性生成，保证重试幂等。
 6. Embedding 同时写 PostgreSQL 元数据和不可变对象文件，重建索引时优先复用。
-7. Worker 只提交 Outbox；Indexer 发布 Elasticsearch 并核验 chunk manifest。
+7. Worker 只提交 Outbox；Indexer 在同一 PostgreSQL 中发布检索投影并核验 chunk manifest。
 8. 新批准版本完全可检索后才切换 `is_current`，旧版本不会提前消失。
 
 ## 5. 回答安全不变量
@@ -117,7 +117,7 @@ frontend/src/
 - `Settings` 在进程启动时校验切块、召回数量、缓存和生产模式安全约束。
 - `APP_ENV=production` 时禁止 BM25-only 降级、内联入库和通配 CORS。
 - `ApplicationContainer` 是唯一对象组合根；API、Worker、Indexer 各自拥有进程内实例。
-- Qwen 使用长连接池，Elasticsearch 使用官方客户端连接池；SIGTERM 后显式关闭。
+- Qwen 使用长连接池，PostgreSQL 检索适配器使用 SQLAlchemy 连接池；SIGTERM 后显式关闭。
 - 凭证只从只读 secret 文件加载，异常和日志不得包含 token。
 - Docker 的 `runtime` 目标供 API、迁移和 Indexer 使用；仅 `worker-runtime` 安装
   LibreOffice Writer/Calc，以隔离旧 `.doc/.xls` 转换依赖和安全补丁面。
@@ -126,7 +126,7 @@ frontend/src/
 ## 7. 修改规则
 
 - 新文档格式：修改 `app/knowledge/parsers.py` 并补解析、来源定位和入库持久化测试。
-- 新检索算法：修改 `app/services/retrieval.py`；Elasticsearch DSL 变更才修改
+- 新检索算法：修改 `app/services/retrieval.py`；PostgreSQL SQL/索引变更才修改
   `app/integrations/search.py`，并同步补 Recall、精确标识符和项目过滤测试。
 - 新模型或供应商：在 `app/integrations/` 实现独立适配器，通过组合根注入。
 - 新 HTTP 接口：放入 `app/api/routes/`；跨接口业务规则应先提取到 `app/services/`。

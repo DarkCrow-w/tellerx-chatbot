@@ -13,6 +13,7 @@ from pathlib import Path
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.contracts.schemas import JobOut, ProjectOut, SourceOut, UploadResponse, VersionOut
@@ -71,10 +72,18 @@ def upload_document(
     project_name = project.strip()
     project_row = db.scalar(select(Project).where(Project.name == project_name))
     if not project_row:
-        project_row = Project(name=project_name)
-        db.add(project_row)
-        db.flush()
-
+        try:
+            with db.begin_nested():
+                project_row = Project(name=project_name)
+                db.add(project_row)
+                db.flush()
+        except IntegrityError:
+            # Concurrent first uploads can both observe a missing project. The
+            # savepoint rolls back only the losing insert, then reuses the row
+            # committed by the winner instead of returning HTTP 500.
+            project_row = db.scalar(select(Project).where(Project.name == project_name))
+            if not project_row:
+                raise
     resolved_logical_key = (logical_key or Path(filename).name).strip()
     document = db.scalar(
         select(Document).where(

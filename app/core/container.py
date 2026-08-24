@@ -19,6 +19,7 @@ from app.services.answering import AnswerService
 from app.services.indexing import IndexingService
 from app.services.ingestion import IngestionService
 from app.services.model_router import ModelRegistry, QwenModelRouter
+from app.services.query_understanding import QueryUnderstandingService
 from app.services.retrieval import Retriever
 
 
@@ -53,8 +54,17 @@ class ApplicationContainer:
         return Retriever(self.settings, self.index, self.qwen)
 
     @cached_property
+    def query_understanding(self) -> QueryUnderstandingService:
+        return QueryUnderstandingService(self.settings, self.router)
+
+    @cached_property
     def answering(self) -> AnswerService:
-        return AnswerService(self.settings, self.retrieval, self.router)
+        return AnswerService(
+            self.settings,
+            self.retrieval,
+            self.router,
+            self.query_understanding,
+        )
 
     @cached_property
     def ingestion(self) -> IngestionService:

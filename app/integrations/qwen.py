@@ -152,7 +152,7 @@ class QwenClient:
         model_id: str,
         system_prompt: str,
         user_prompt: str,
-        max_tokens: int = 1200,
+        max_tokens: int = 1600,
     ) -> ChatCallResult:
         payload = {
             "model": model_id,

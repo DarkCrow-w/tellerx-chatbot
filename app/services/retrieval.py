@@ -4,23 +4,27 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
 from collections import OrderedDict
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.core.config import Settings
 from app.integrations.qwen import QwenAPIError, QwenClient
 from app.integrations.search import (
     ACRONYM,
-    EN_ENTITY,
+    CONTROLLED_ALIAS,
     EXACT_IDENTIFIER,
-    ZH_ENTITY,
     SearchIndex,
     _lexical_signals,
+    _query_subject_signals,
     _source_status,
     normalize_query,
 )
 from app.knowledge.evidence import Evidence
+
+if TYPE_CHECKING:
+    from app.services.query_understanding import QueryPlan
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +79,11 @@ class Retriever:
         return sorted(combined.values(), key=lambda row: row["score"], reverse=True)
 
     @staticmethod
-    def _enforce_exact_identifiers(query: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _enforce_exact_identifiers(
+        query: str,
+        rows: list[dict[str, Any]],
+        linked_identifiers: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         identifiers = {
             match.casefold()
             for pattern in (EXACT_IDENTIFIER, ACRONYM)
@@ -85,13 +93,108 @@ class Retriever:
             return rows
         matched: list[dict[str, Any]] = []
         covered: set[str] = set()
+        linked = {value.casefold() for value in linked_identifiers or []}
         for row in rows:
             searchable = Retriever._source_text(row)
             row_identifiers = {identifier for identifier in identifiers if identifier in searchable}
-            if row_identifiers:
+            if row_identifiers or any(identifier in searchable for identifier in linked):
                 matched.append(row)
-                covered.update(row_identifiers)
+            covered.update(row_identifiers)
         return matched if covered == identifiers else []
+
+    @classmethod
+    def _discover_linked_identifiers(
+        cls,
+        query: str,
+        rows: list[dict[str, Any]],
+        limit: int = 12,
+        anchor_signals: tuple[str, ...] | None = None,
+    ) -> list[str]:
+        """Extract approved reference IDs and controlled aliases from subject anchors."""
+
+        query_identifiers = {
+            match.casefold()
+            for pattern in (EXACT_IDENTIFIER, ACRONYM)
+            for match in pattern.findall(normalize_query(query))
+        }
+        signals = [
+            value.casefold()
+            for value in (anchor_signals or tuple(_lexical_signals(query)))
+        ]
+        anchors = [
+            row for row in rows if any(signal in cls._source_text(row) for signal in signals)
+        ]
+        if not anchors:
+            return []
+        discovered: list[str] = []
+        for row in anchors[:8]:
+            for value in EXACT_IDENTIFIER.findall(cls._source_text(row)):
+                normalized = value.casefold()
+                if normalized not in query_identifiers and normalized not in {
+                    item.casefold() for item in discovered
+                }:
+                    discovered.append(value.upper())
+                    if len(discovered) >= limit:
+                        return discovered
+            source = row.get("hit", {}).get("_source", {})
+            alias_text = "\n".join(
+                str(source.get(field) or "")
+                for field in ("title_path", "heading_path", "content")
+            )
+            for value in CONTROLLED_ALIAS.findall(alias_text):
+                normalized = value.casefold().strip()
+                if normalized and normalized not in query_identifiers and normalized not in {
+                    item.casefold() for item in discovered
+                }:
+                    discovered.append(value.strip())
+                    if len(discovered) >= limit:
+                        return discovered
+        return discovered
+
+    @staticmethod
+    def _merge_fused(
+        primary: list[dict[str, Any]], secondary: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+        for channel, rows in enumerate((primary, secondary)):
+            weight = 1.0 if channel == 0 else 0.92
+            for row in rows:
+                source = row.get("hit", {}).get("_source", {})
+                chunk_id = str(source.get("chunk_id") or row.get("hit", {}).get("_id") or "")
+                if not chunk_id:
+                    continue
+                if chunk_id not in merged:
+                    merged[chunk_id] = {
+                        **row,
+                        "score": float(row.get("score") or 0.0) * weight,
+                    }
+                else:
+                    merged[chunk_id]["score"] += float(row.get("score") or 0.0) * weight
+        return sorted(merged.values(), key=lambda row: row["score"], reverse=True)
+
+    @classmethod
+    def _boost_anchor_matches(
+        cls, rows: list[dict[str, Any]], anchor_signals: tuple[str, ...]
+    ) -> list[dict[str, Any]]:
+        signals = [value.casefold() for value in anchor_signals if value.strip()]
+        if not signals:
+            return rows
+        boosted = []
+        for row in rows:
+            score = float(row.get("score") or 0.0)
+            if any(signal in cls._source_text(row) for signal in signals):
+                score *= 1.35
+            boosted.append({**row, "score": score})
+        return sorted(boosted, key=lambda row: row["score"], reverse=True)
+
+    @classmethod
+    def _has_grounded_subject(
+        cls, rows: list[dict[str, Any]], subject_signals: tuple[str, ...]
+    ) -> bool:
+        signals = [value.casefold() for value in subject_signals if value.strip()]
+        return bool(signals) and any(
+            signal in cls._source_text(row) for row in rows for signal in signals
+        )
 
     @staticmethod
     def _deduplicate_content(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -108,19 +211,231 @@ class Retriever:
         return unique
 
     @classmethod
-    def _prefer_complete_entity_matches(
-        cls, query: str, rows: list[dict[str, Any]]
+    def _select_rerank_candidate_pool(
+        cls,
+        fused: list[dict[str, Any]],
+        related_hits: list[dict[str, Any]],
+        *,
+        limit: int,
+        expansion_slots: int,
+        query: str,
     ) -> list[dict[str, Any]]:
-        normalized = normalize_query(query)
-        entity_signals = [
-            *[match.group(1) for match in ZH_ENTITY.finditer(normalized)],
-            *[match.group(1) for match in EN_ENTITY.finditer(normalized)],
+        """Reserve rerank slots for adjacent chunks from proven documents."""
+
+        if limit <= 0:
+            return []
+        reserve = min(max(0, expansion_slots), max(0, limit - 1))
+        base_count = max(1, limit - reserve)
+        base = fused[:base_count]
+        seen = {
+            str(row.get("hit", {}).get("_source", {}).get("chunk_id") or "")
+            for row in base
+        }
+        origins: dict[str, list[int]] = {}
+        document_order: list[str] = []
+        for row in base:
+            source = row.get("hit", {}).get("_source", {})
+            document_id = str(source.get("document_id") or "")
+            if not document_id:
+                continue
+            if document_id not in origins:
+                origins[document_id] = []
+                document_order.append(document_id)
+            origins[document_id].append(int(source.get("chunk_ordinal") or 0))
+
+        by_document: dict[str, list[dict[str, Any]]] = {}
+        for hit in related_hits:
+            source = hit.get("_source", {})
+            chunk_id = str(source.get("chunk_id") or "")
+            document_id = str(source.get("document_id") or "")
+            if not chunk_id or chunk_id in seen or document_id not in origins:
+                continue
+            by_document.setdefault(document_id, []).append(
+                {
+                    "hit": hit,
+                    "score": 0.0,
+                    "channels": {"document_expansion"},
+                    "raw_scores": {},
+                }
+            )
+
+        expanded: list[dict[str, Any]] = []
+        for document_id in document_order:
+            options = by_document.get(document_id, [])
+            if not options or len(expanded) >= reserve:
+                continue
+            origin_ordinals = origins[document_id]
+            selected = min(
+                options,
+                key=lambda row: (
+                    min(
+                        abs(
+                            int(row["hit"].get("_source", {}).get("chunk_ordinal") or 0)
+                            - ordinal
+                        )
+                        for ordinal in origin_ordinals
+                    ),
+                    -cls._authority_quality(query, row),
+                    int(row["hit"].get("_source", {}).get("chunk_ordinal") or 0),
+                ),
+            )
+            expanded.append(selected)
+            seen.add(str(selected["hit"].get("_source", {}).get("chunk_id") or ""))
+
+        remaining = [
+            row
+            for row in fused[base_count:]
+            if str(row.get("hit", {}).get("_source", {}).get("chunk_id") or "")
+            not in seen
         ]
+        return cls._deduplicate_content([*base, *expanded, *remaining])[:limit]
+
+    @classmethod
+    def _attach_short_chunk_neighbors(
+        cls,
+        selected: list[dict[str, Any]],
+        related_hits: list[dict[str, Any]],
+        *,
+        max_extra: int = 4,
+        short_threshold: int = 180,
+    ) -> list[dict[str, Any]]:
+        """Attach a nearby value block when a selected chunk is only a heading."""
+
+        if max_extra <= 0:
+            return selected
+        seen = {
+            str(row.get("hit", {}).get("_source", {}).get("chunk_id") or "")
+            for row in selected
+        }
+        extras: list[dict[str, Any]] = []
+        for row in selected:
+            if len(extras) >= max_extra:
+                break
+            source = row.get("hit", {}).get("_source", {})
+            if len(str(source.get("content") or "").strip()) >= short_threshold:
+                continue
+            document_id = str(source.get("document_id") or "")
+            origin = int(source.get("chunk_ordinal") or 0)
+            options = [
+                hit
+                for hit in related_hits
+                if str(hit.get("_source", {}).get("document_id") or "") == document_id
+                and str(hit.get("_source", {}).get("chunk_id") or "") not in seen
+            ]
+            if not options:
+                continue
+            hit = min(
+                options,
+                key=lambda candidate: (
+                    abs(int(candidate.get("_source", {}).get("chunk_ordinal") or 0) - origin),
+                    int(candidate.get("_source", {}).get("chunk_ordinal") or 0) < origin,
+                ),
+            )
+            wrapped = {
+                "hit": hit,
+                "score": float(row.get("score") or 0.0) * 0.99,
+                "channels": {"selected_neighbor"},
+                "raw_scores": {},
+            }
+            extras.append(wrapped)
+            seen.add(str(hit.get("_source", {}).get("chunk_id") or ""))
+        return cls._deduplicate_content([*selected, *extras])
+
+    @classmethod
+    def _prefer_complete_entity_matches(
+        cls,
+        query: str,
+        rows: list[dict[str, Any]],
+        linked_identifiers: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        entity_signals = _query_subject_signals(query)
         if len(entity_signals) != 1:
             return rows
         signal = entity_signals[0].casefold()
-        matched = [row for row in rows if signal in cls._source_text(row)]
-        return matched or rows
+        if signal in {"业务", "系统", "项目", "模块", "规则", "接口", "文档", "策略"}:
+            return rows
+        linked = {value.casefold() for value in linked_identifiers or []}
+        return [
+            row
+            for row in rows
+            if signal in cls._source_text(row)
+            or any(identifier in cls._source_text(row) for identifier in linked)
+        ]
+
+    @staticmethod
+    def _authority_quality(query: str, row: dict[str, Any]) -> int:
+        """Score current approved evidence above history inside the same file."""
+
+        normalized_query = normalize_query(query).casefold()
+        text = Retriever._source_text(row)
+        authoritative = (
+            "approved", "current", "effective date", "signed", "authoritative",
+            "正式", "当前", "生效", "已批准",
+        )
+        historical = (
+            "not the approval page", "not current", "not the final decision", "retired",
+            "historical", "superseded", "deprecated", "draft", "candidate",
+            "never approved", "旧值", "退役", "历史", "草稿", "候选", "作废",
+        )
+        asks_for_history = any(
+            term in normalized_query for term in ("历史", "旧值", "过去", "退役")
+        ) or bool(re.search(r"\b(?:historical|old|retired)\b", normalized_query))
+        if asks_for_history:
+            return 2 * sum(term in text for term in historical) - 2 * sum(
+                term in text for term in authoritative
+            )
+        return 2 * sum(term in text for term in authoritative) - 3 * sum(
+            term in text for term in historical
+        )
+
+    @staticmethod
+    def _diversify_documents(
+        candidates: list[dict[str, Any]],
+        ranked: list[tuple[int, float]],
+        top_k: int,
+        query: str = "",
+    ) -> list[tuple[int, float]]:
+        """Put one authoritative, useful chunk per document before duplicates."""
+
+        valid = [(index, score) for index, score in ranked if 0 <= index < len(candidates)]
+        seen_indexes: set[int] = set()
+        document_order: list[str] = []
+        by_document: dict[str, list[tuple[int, tuple[int, float]]]] = {}
+        deduplicated: list[tuple[int, float]] = []
+        for position, item in enumerate(valid):
+            index = item[0]
+            if index in seen_indexes:
+                continue
+            seen_indexes.add(index)
+            deduplicated.append(item)
+            source = candidates[index]["hit"].get("_source", {})
+            document_id = str(source.get("document_id") or source.get("filename") or index)
+            if document_id not in by_document:
+                document_order.append(document_id)
+                by_document[document_id] = []
+            by_document[document_id].append((position, item))
+        representatives = [
+            max(
+                by_document[document_id],
+                key=lambda positioned: (
+                    Retriever._authority_quality(query, candidates[positioned[1][0]]),
+                    len(
+                        str(
+                            candidates[positioned[1][0]]["hit"]
+                            .get("_source", {})
+                            .get("content")
+                            or ""
+                        ).strip()
+                    )
+                    >= 100,
+                    -positioned[0],
+                ),
+            )[1]
+            for document_id in document_order
+        ]
+        representative_indexes = {item[0] for item in representatives}
+        deferred = [item for item in deduplicated if item[0] not in representative_indexes]
+        return [*representatives, *deferred][:top_k]
 
     @staticmethod
     def _to_evidence(source: dict[str, Any], score: float) -> Evidence:
@@ -169,11 +484,13 @@ class Retriever:
         candidates: list[dict[str, Any]],
         ranked: list[tuple[int, float]],
         top_k: int,
+        additional_signals: tuple[str, ...] = (),
     ) -> list[tuple[int, float]]:
         selected = [(index, score) for index, score in ranked if 0 <= index < len(candidates)]
         selected = list(dict.fromkeys(selected))
         mandatory_indexes: list[int] = []
-        for signal in (value.casefold() for value in _lexical_signals(query)):
+        signals = tuple(dict.fromkeys((*_lexical_signals(query), *additional_signals)))
+        for signal in (value.casefold() for value in signals):
             if any(signal in cls._source_text(candidates[index]) for index in mandatory_indexes):
                 continue
             mandatory = next(
@@ -232,9 +549,54 @@ class Retriever:
         query: str,
         project_ids: list[str],
         principal_ids: list[str] | None = None,
+        query_plan: QueryPlan | None = None,
     ) -> list[Evidence]:
         query = normalize_query(query)
         fused = self._retrieve_for_statuses(query, project_ids, ["approved"], principal_ids)
+        focus_terms = list(query_plan.subjects) if query_plan else _query_subject_signals(query)
+        focus_query = " ".join(focus_terms)
+        retrieval_queries = (
+            list(query_plan.retrieval_queries)
+            if query_plan
+            else ([focus_query] if focus_query else [])
+        )
+        for retrieval_query in retrieval_queries[:4]:
+            retrieval_query = normalize_query(retrieval_query)
+            if not retrieval_query or retrieval_query.casefold() == query.casefold():
+                continue
+            focused = self._retrieve_for_statuses(
+                retrieval_query, project_ids, ["approved"], principal_ids
+            )
+            fused = self._merge_fused(fused, focused)
+        semantic_anchors = query_plan.anchor_signals if query_plan else ()
+        fused = self._boost_anchor_matches(fused, semantic_anchors)
+        if (
+            query_plan
+            and query_plan.subjects
+            and not self._has_grounded_subject(fused, query_plan.subject_anchor_signals)
+        ):
+            logger.info("Semantic subject was not grounded in any candidate; abstaining")
+            return []
+        linked_identifiers = self._discover_linked_identifiers(
+            query,
+            fused,
+            anchor_signals=semantic_anchors or None,
+        )
+        semantic_context = query_plan.rerank_context() if query_plan else ""
+        if linked_identifiers:
+            expanded_query = "\n".join(
+                part
+                for part in [
+                    query,
+                    semantic_context,
+                    "Approved cross-document references: " + " ".join(linked_identifiers),
+                ]
+                if part
+            )
+            expanded = self._retrieve_for_statuses(
+                expanded_query, project_ids, ["approved"], principal_ids
+            )
+            fused = self._merge_fused(fused, expanded)
         if len(fused) < 3:
             fallback = self._retrieve_for_statuses(
                 query, project_ids, ["approved", "draft"], principal_ids
@@ -244,26 +606,88 @@ class Retriever:
                 by_id.setdefault(row["hit"]["_source"]["chunk_id"], row)
             fused = sorted(by_id.values(), key=lambda row: row["score"], reverse=True)
         fused = self._deduplicate_content(fused)
-        fused = self._enforce_exact_identifiers(query, fused)
-        fused = self._prefer_complete_entity_matches(query, fused)
-        candidates = fused[: self.settings.rerank_candidates]
+        fused = self._enforce_exact_identifiers(query, fused, linked_identifiers)
+        fused = self._prefer_complete_entity_matches(query, fused, linked_identifiers)
+        related_document_ids = list(
+            dict.fromkeys(
+                str(row["hit"].get("_source", {}).get("document_id") or "")
+                for row in fused
+                if row["hit"].get("_source", {}).get("document_id")
+            )
+        )[: self.settings.evidence_top_k * 2]
+        related_hits: list[dict[str, Any]] = []
+        if related_document_ids:
+            related_hits = self.index.document_chunks(
+                related_document_ids,
+                project_ids,
+                ["approved"],
+                max(
+                    self.settings.rerank_candidates * 4,
+                    len(related_document_ids) * 12,
+                ),
+                principal_ids,
+            )
+        candidates = self._select_rerank_candidate_pool(
+            fused,
+            related_hits,
+            limit=self.settings.rerank_candidates,
+            expansion_slots=self.settings.evidence_top_k,
+            query=query,
+        )
         if not candidates:
             return []
         passages = [self._rerank_passage(row) for row in candidates]
         try:
-            ranked = self.qwen.rerank(query, passages, self.settings.evidence_top_k)
-            ranked = self._ensure_signal_coverage(
-                query, candidates, ranked, self.settings.evidence_top_k
+            rerank_query = "\n".join(
+                part
+                for part in [
+                    query,
+                    semantic_context,
+                    (
+                        "Approved cross-document references: " + " ".join(linked_identifiers)
+                        if linked_identifiers
+                        else ""
+                    ),
+                ]
+                if part
             )
-            return [
-                self._to_evidence(candidates[index]["hit"]["_source"], score)
+            rerank_top_n = min(
+                len(candidates),
+                max(self.settings.evidence_top_k * 3, self.settings.evidence_top_k),
+            )
+            ranked = self.qwen.rerank(rerank_query, passages, rerank_top_n)
+            ranked = self._ensure_signal_coverage(
+                query,
+                candidates,
+                ranked,
+                rerank_top_n,
+                additional_signals=semantic_anchors,
+            )
+            ranked = self._diversify_documents(
+                candidates, ranked, self.settings.evidence_top_k, query=query
+            )
+            selected_rows = [
+                {**candidates[index], "score": score}
                 for index, score in ranked[: self.settings.evidence_top_k]
                 if 0 <= index < len(candidates)
             ]
+            selected_rows = self._attach_short_chunk_neighbors(
+                selected_rows,
+                related_hits,
+                max_extra=max(1, self.settings.evidence_top_k // 2),
+            )
+            return [
+                self._to_evidence(row["hit"]["_source"], float(row.get("score") or 0.0))
+                for row in selected_rows
+            ]
         except QwenAPIError as exc:
             logger.warning("Rerank unavailable; using RRF ordering: %s", exc.code)
+            selected_rows = self._attach_short_chunk_neighbors(
+                candidates[: self.settings.evidence_top_k],
+                related_hits,
+                max_extra=max(1, self.settings.evidence_top_k // 2),
+            )
             return [
                 self._to_evidence(row["hit"]["_source"], row["score"])
-                for row in candidates[: self.settings.evidence_top_k]
+                for row in selected_rows
             ]
-

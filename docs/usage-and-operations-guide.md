@@ -6,7 +6,7 @@
 
 ## 1. 系统能做什么
 
-TellerX 将业务文档解析、切块并写入 PostgreSQL 和 Elasticsearch，然后通过 BM25、向量检索、Qwen Rerank 和 Qwen 生成模型回答问题。每项结论必须引用知识库中的原文；引用校验失败或证据不足时，系统会拒绝猜测。
+TellerX 将业务文档解析、切块并写入 PostgreSQL；全文检索使用 PostgreSQL FTS，向量检索使用 pgvector，然后由 Qwen Rerank 和 Qwen 生成模型回答问题。每项结论必须引用知识库中的原文；引用校验失败或证据不足时，系统会拒绝猜测。
 
 当前支持：
 
@@ -39,7 +39,7 @@ flowchart LR
     B["浏览器 / Vite"] --> A["FastAPI API"]
     A --> AS["AnswerService"]
     AS --> S["混合检索与证据编排"]
-    S --> O["Elasticsearch"]
+    S --> O["PostgreSQL FTS + pgvector"]
     S --> Q1["Qwen Embedding / Rerank"]
     AS --> R["模型路由器"]
     R --> Q2["Qwen Plus / Max"]
@@ -61,7 +61,7 @@ flowchart LR
 5. 切块器生成约 450 tokens、最大 650 tokens 的知识块。
 6. Qwen Embedding 为知识块生成 1024 维向量。
 7. Worker 在一个 PostgreSQL 事务中写入 Chunk、向量清单和 Outbox 事件。
-8. 单实例 Indexer 幂等写 Elasticsearch，核验数量和 manifest 后才发布版本。
+8. 单实例 Indexer 幂等写 PostgreSQL 检索投影，核验数量和 manifest 后才发布版本。
 
 问答链路：
 
@@ -83,7 +83,7 @@ TellerxChatBot/
 │   ├── contracts/               请求、响应和应用 DTO
 │   ├── services/                问答、入库、索引和模型路由用例
 │   ├── knowledge/               解析、切块和证据值对象
-│   ├── integrations/            Qwen、Elasticsearch 和对象存储
+│   ├── integrations/            Qwen、PostgreSQL 检索投影和对象存储
 │   ├── db/                      SQLAlchemy 会话与 PostgreSQL 模型
 │   ├── core/                    配置和 ApplicationContainer 组合根
 │   ├── jobs/                    后台解析 Worker 与索引 Worker
@@ -130,7 +130,7 @@ TellerxChatBot/
 
 - Worker 使用 `FOR UPDATE SKIP LOCKED` 并发安全领取任务，无需 Redis 或 Kafka。
 - Worker 只提交 PostgreSQL Chunk、向量清单和 Outbox，不直接发布搜索索引；单实例
-  Indexer 按事件顺序完成 Elasticsearch 写入、核对和版本切换。
+  Indexer 按事件顺序完成 PostgreSQL 检索投影写入、核对和版本切换。
 - 任务状态通常经过 `queued -> running -> succeeded`，失败为 `failed`。
 - 阶段包括 `starting`、`parsing`、`embedding`、`indexing`、`complete` 和 `failed`。
 - `ALLOW_BM25_ONLY=true` 时，Embedding 不可用仍可创建纯文本索引，但这不代表正式混合检索验收通过。
@@ -138,7 +138,7 @@ TellerxChatBot/
 `app/services/retrieval.py` 与 `app/integrations/search.py`
 
 - `retrieval.py` 负责混合召回、RRF、标识符覆盖和 Rerank 排序策略。
-- `search.py` 只负责 Elasticsearch 映射、BM25/Vector 查询和索引读写。
+- `search.py` 只负责 PostgreSQL FTS/pgvector 查询、过滤和检索投影读写。
 - 默认 BM25 与向量各召回 50 个块。
 - RRF 融合后将最多 30 个候选发送给 `qwen3-rerank`。
 - 默认选出 8 个证据块，并保留精确编号、缩写和中英文实体覆盖。
@@ -168,10 +168,10 @@ TellerxChatBot/
 
 - PostgreSQL：项目、文档、不可变版本、知识块、导入任务、outbox、索引代际、对话、反馈、模型用量和 ACL 结构。
 - uploads Docker 卷：原始文件、规范化解析产物和可复用的 Embedding 向量。
-- Elasticsearch：可重建的全文与向量检索索引。
+- PostgreSQL `chunk_search_index`：可重建且事务维护的全文与向量检索投影。
 - 浏览器 `localStorage`：前端最近 24 个对话的显示副本和主题设置。
 
-PostgreSQL 和原始文件是事实来源，Elasticsearch 是派生索引。浏览器历史并不是服务端对话的完整管理界面，换浏览器后不会自动显示旧历史。
+PostgreSQL 和原始文件是事实来源；`chunk_search_index` 与业务表保存在同一 PostgreSQL 持久卷中，并可从 Chunk 与持久向量重建。浏览器历史并不是服务端对话的完整管理界面，换浏览器后不会自动显示旧历史。
 
 ### 3.3 前端当前功能与边界
 
@@ -196,7 +196,7 @@ React 页面目前提供：
 推荐方式只要求：
 
 - Docker Desktop，支持 `docker compose`
-- 至少约 4 GB 可用内存；Elasticsearch JVM 当前分配 768 MB
+- 至少约 2 GB 可用内存；大规模导入和并行评测建议 4 GB 以上
 - 可访问阿里云百炼 API 的网络
 
 开发前端还需要 Node.js 22；本地运行 Python 后端需要 Python 3.12。
@@ -255,14 +255,14 @@ docker compose up --build
 
 ```bash
 docker compose ps
-docker compose logs --tail=100 migrate api worker indexer postgres elasticsearch
+docker compose logs --tail=100 migrate api worker indexer postgres
 ```
 
 `migrate` 是一次性数据库迁移服务，显示 `Exited (0)` 表示升级成功；API、Worker 和
 Indexer 只有在它成功完成后才会启动。若它非零退出，先查看
 `docker compose logs migrate`，不要绕过迁移直接启动应用进程。
 
-等待 `postgres` 和 `elasticsearch` 健康后，检查系统：
+等待 `postgres` 健康且 `migrate` 成功后，检查系统：
 
 ```bash
 curl -fsS http://localhost:8000/health/live
@@ -274,10 +274,10 @@ curl -fsS http://localhost:8000/health/ready
 - Web 页面：<http://localhost:8000>
 - Swagger API 文档：<http://localhost:8000/docs>
 - OpenAPI JSON：<http://localhost:8000/openapi.json>
-- Elasticsearch：<http://localhost:9200>
+- PostgreSQL 检索状态：<http://localhost:8000/api/v1/index/status>
 
 一次性 Migrate 容器先执行 `alembic upgrade head`。Worker 负责解析、切块与 Embedding；
-Indexer 消费 PostgreSQL outbox，只有 Elasticsearch 写入和计数校验成功后任务才会变为
+Indexer 消费 PostgreSQL outbox，只有检索投影写入和计数校验成功后任务才会变为
 `succeeded`、版本才会变为 `searchable`。
 
 ### 5.2 日常启动
@@ -308,7 +308,7 @@ docker compose up --build -d
 docker compose stop
 ```
 
-停止并删除容器和项目网络，但保留三个命名卷的数据：
+停止并删除容器和项目网络，但保留 PostgreSQL 与 uploads 两个命名卷的数据：
 
 ```bash
 docker compose down
@@ -322,7 +322,7 @@ docker compose down
 docker compose down -v
 ```
 
-`-v` 会删除 PostgreSQL、Elasticsearch 和 uploads 命名卷，即文档记录、对话、索引及上传文件。除非明确要清空本地系统且已有备份，否则不要执行。
+`-v` 会删除 PostgreSQL 和 uploads 命名卷，即文档记录、对话、全文/向量索引及上传文件。除非明确要清空本地系统且已有备份，否则不要执行。
 
 ## 6. 前后端分别开发
 
@@ -375,7 +375,7 @@ services:
 启动基础设施：
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.local.yml up -d postgres elasticsearch
+docker compose -f docker-compose.yml -f docker-compose.local.yml up -d postgres
 ```
 
 创建 Python 环境：
@@ -391,7 +391,8 @@ python -m pip install -e '.[dev]'
 
 ```bash
 export DATABASE_URL='postgresql+psycopg://knowledge:knowledge@localhost:5432/knowledge'
-export ELASTICSEARCH_URL='http://localhost:9200'
+export SEARCH_BACKEND='postgresql-pgvector-fts'
+export POSTGRES_SEARCH_TABLE='chunk_search_index'
 export STORAGE_ROOT="$PWD/.local-data/uploads"
 export QWEN_API_KEY_FILE="$PWD/Qwen/Qwen token.txt"
 export MODEL_REGISTRY_PATH="$PWD/config/models.yaml"
@@ -428,7 +429,7 @@ npm run dev
 三个前台进程都用 `Ctrl+C` 关闭，基础设施使用：
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.local.yml stop postgres elasticsearch
+docker compose -f docker-compose.yml -f docker-compose.local.yml stop postgres
 ```
 
 不要同时运行 Docker `worker` 和本地 `knowledge-worker`，除非你确实要测试多个 Worker；它们会竞争同一任务队列。
@@ -528,13 +529,16 @@ curl -sS -X POST 'http://localhost:8000/api/v1/chat' \
 
 普通交互不建议固定模型，让路由器根据证据复杂度和额度选择。
 
+自然语言问法的主题抽取、聚焦检索、追踪与排障方式详见
+[多种问题表述识别机制](query-phrasing-handling.md)。
+
 ### 7.4 删除文档
 
 ```bash
 curl -i -X DELETE 'http://localhost:8000/api/v1/documents/DOCUMENT_ID'
 ```
 
-该操作先提交数据库软删除和 outbox tombstone，Indexer 随后从 Elasticsearch 删除各版本。
+该操作先提交数据库软删除和 outbox tombstone，Indexer 随后从 PostgreSQL 检索投影删除各版本。
 原始文件、解析产物和向量不会立即物理删除，以支持审计和恢复。
 
 ## 8. API 功能说明
@@ -544,7 +548,7 @@ curl -i -X DELETE 'http://localhost:8000/api/v1/documents/DOCUMENT_ID'
 | 方法 | 路径 | 功能 | 常见响应 |
 |---|---|---|---|
 | `GET` | `/health/live` | API 进程存活检查 | 200 |
-| `GET` | `/health/ready` | PostgreSQL 和 Elasticsearch 就绪检查 | 200/503 |
+| `GET` | `/health/ready` | PostgreSQL、FTS 扩展和 pgvector 就绪检查 | 200/503 |
 | `GET` | `/api/v1/projects` | 项目列表 | 200 |
 | `POST` | `/api/v1/documents` | 上传文档、版本和导入任务 | 202/413/415/422 |
 | `GET` | `/api/v1/ingestion-jobs/{id}` | 查询导入状态 | 200/404 |
@@ -638,11 +642,10 @@ curl -sS 'http://localhost:8000/api/v1/models/usage'
 |---|---|---|
 | `APP_ENV` | `development` | 运行环境标识 |
 | `DATABASE_URL` | `...@postgres:5432/knowledge` | PostgreSQL 连接串 |
-| `ELASTICSEARCH_URL` | `http://elasticsearch:9200` | Elasticsearch 地址 |
-| `ELASTICSEARCH_READ_ALIAS` | `knowledge-chunks-read` | 查询别名 |
-| `ELASTICSEARCH_WRITE_ALIAS` | `knowledge-chunks-write` | 增量写入别名 |
-| `ELASTICSEARCH_INDEX_PREFIX` | `knowledge-chunks` | 物理索引前缀 |
-| `ELASTICSEARCH_SCHEMA_VERSION` | `3` | Mapping 代际 |
+| `SEARCH_BACKEND` | `postgresql-pgvector-fts` | 当前检索后端；启动时严格校验 |
+| `POSTGRES_SEARCH_TABLE` | `chunk_search_index` | FTS 与向量检索投影表 |
+| `POSTGRES_SEARCH_SCHEMA_VERSION` | `1` | 检索结构代际 |
+| `PGVECTOR_HNSW_EF_SEARCH` | `200` | HNSW 查询候选深度 |
 | `STORAGE_ROOT` | `/data/knowledge` | 原文件存储根目录 |
 | `QWEN_API_KEY_FILE` | `/run/secrets/qwen_api_key` | token 文件路径 |
 | `QWEN_CHAT_BASE_URL` | 百炼兼容模式 URL | Chat API 根地址 |
@@ -671,8 +674,10 @@ curl -sS 'http://localhost:8000/api/v1/models/usage'
 | `RETRIEVAL_TOP_K` | `50` | 每路初始召回数 |
 | `RERANK_CANDIDATES` | `30` | Rerank 候选数 |
 | `EVIDENCE_TOP_K` | `8` | 最终证据块数 |
-| `VECTOR_NUM_CANDIDATES` | `400` | filtered kNN 候选数 |
 | `VECTOR_MIN_SIMILARITY` | `0.25` | 向量最低相似度初值；正式值由评测标定 |
+| `SEMANTIC_QUERY_UNDERSTANDING_ENABLED` | `true` | 对自然语言问题启用受限查询规划 |
+| `QUERY_PLAN_CACHE_SIZE` | `500` | 查询计划进程内缓存条数 |
+| `QUERY_PLAN_CACHE_TTL_SECONDS` | `3600` | 查询计划缓存秒数 |
 | `PROMPT_VERSION` | `grounded-qa-v1` | Prompt 审计版本 |
 | `CORS_ORIGINS` | `["http://localhost:8000"]` | JSON 数组格式的允许来源 |
 
@@ -715,11 +720,12 @@ Worker 不负责生成模型路由，但如果同时修改了 Embedding/Rerank �
 |---|---|
 | `knowledge-worker` | 启动导入 Worker |
 | `knowledge-indexer` | 消费可靠索引 outbox |
-| `knowledge-reconcile` | 对账 PostgreSQL 与 Elasticsearch；可加 `--repair` |
+| `knowledge-reconcile` | 对账事实表与 PostgreSQL 检索投影；可加 `--repair` |
 | `qwen-diagnostics` | 显式检查 Chat、Embedding、Rerank |
 | `knowledge-eval` | 运行 JSONL 业务问答评测 |
 | `knowledge-benchmark` | 生成和运行千文档基准 |
 | `knowledge-reindex` | 从事实库和持久向量构建、验证并切换新索引代际 |
+| `knowledge-pgvector-smoke` | 验证 FTS、pgvector、项目过滤和版本状态 |
 
 Docker 内执行一次性命令的一般形式：
 
@@ -884,7 +890,7 @@ npm run build
 docker compose config
 ```
 
-单元测试可使用 SQLite 和 mock Qwen；完整链路仍需 PostgreSQL、Elasticsearch 和可用的 Qwen 权限。
+单元测试可使用 SQLite 和 mock Qwen；完整链路仍需带 `vector`/`pg_trgm` 扩展的 PostgreSQL 和可用的 Qwen 权限。
 
 ## 13. Docker 命令速查
 
@@ -915,7 +921,7 @@ docker compose down
 只启动部分服务：
 
 ```bash
-docker compose up -d postgres elasticsearch
+docker compose up -d postgres
 ```
 
 重建单个服务：
@@ -936,7 +942,9 @@ docker compose up -d --build --no-deps indexer
 docker compose exec api sh
 docker compose exec api python --version
 docker compose exec postgres psql -U knowledge -d knowledge
-docker compose exec elasticsearch curl -sS http://localhost:9200/_cluster/health
+docker compose exec postgres psql -U knowledge -d knowledge -c '\dx'
+docker compose exec postgres psql -U knowledge -d knowledge -c \
+  'SELECT count(*), count(embedding) FROM chunk_search_index;'
 ```
 
 ### 13.4 构建和拉取
@@ -944,7 +952,7 @@ docker compose exec elasticsearch curl -sS http://localhost:9200/_cluster/health
 ```bash
 docker compose build
 docker compose build --no-cache migrate api worker indexer
-docker compose pull postgres elasticsearch
+docker compose pull postgres
 ```
 
 升级基础镜像前先备份，并重新执行测试和 Qwen 回归，不要把 `latest` 式升级直接带入正式环境。
@@ -961,9 +969,9 @@ docker compose exec api du -sh /data/knowledge
 
 ## 14. 备份与恢复
 
-至少备份 PostgreSQL 和 uploads 卷；该卷现在同时包含原文件、解析产物和持久向量。
-Elasticsearch 可以直接从这些数据重建，同一 Embedding fingerprint 下不需要再次消耗 Qwen
-额度。生产环境还应配置 Elasticsearch SLM snapshot 到集群外仓库，以缩短恢复时间。
+至少备份 PostgreSQL 和 uploads 卷；uploads 包含原文件、解析产物和可复用向量，PostgreSQL
+包含业务事实、对话、任务和在线 FTS/pgvector 索引。同一 Embedding fingerprint 下重建检索
+投影不需要再次消耗 Qwen 额度。生产环境应启用 PostgreSQL PITR，并把备份存放到数据库主机之外。
 
 创建本次专用备份目录，避免重复运行时把目录嵌套或覆盖：
 
@@ -1008,22 +1016,21 @@ docker compose start api worker indexer
 
 ```bash
 docker compose ps
-docker compose logs --tail=200 postgres elasticsearch migrate api
-curl -sS http://localhost:9200/_cluster/health
+docker compose logs --tail=200 postgres migrate api
+docker compose exec postgres psql -U knowledge -d knowledge -c '\dx'
+docker compose exec postgres psql -U knowledge -d knowledge -c \
+  "SELECT to_regclass('chunk_search_index');"
 ```
 
-`live` 正常但 `ready` 失败，通常表示 PostgreSQL、Elasticsearch、读写 alias 或 Mapping
-未就绪。Elasticsearch 9 所在 Linux/容器虚拟机的 `vm.max_map_count` 应按官方要求设置为
-`1048576`；这是主机级变更，应由本机或公司平台管理员执行。参见 Elastic 官方
-[Increase virtual memory](https://www.elastic.co/docs/deploy-manage/deploy/self-managed/vm-max-map-count)。
+`live` 正常但 `ready` 失败，通常表示 PostgreSQL 不可达、Alembic 迁移未完成、`vector` 或
+`pg_trgm` 扩展缺失，或 `chunk_search_index` 尚未创建。先检查 `migrate` 日志和 `alembic current`。
 
 ### 15.2 页面无法打开或端口冲突
 
-检查 8000、9200 和开发模式下的 5173：
+检查 8000 和开发模式下的 5173：
 
 ```bash
 lsof -nP -iTCP:8000 -sTCP:LISTEN
-lsof -nP -iTCP:9200 -sTCP:LISTEN
 lsof -nP -iTCP:5173 -sTCP:LISTEN
 ```
 
@@ -1039,7 +1046,7 @@ docker compose restart worker
 docker compose restart indexer
 ```
 
-确认 Worker、Indexer 与 API 使用相同 `DATABASE_URL`、`ELASTICSEARCH_URL`、uploads 卷和模型配置；
+确认 Worker、Indexer 与 API 使用相同 `DATABASE_URL`、`SEARCH_BACKEND`、uploads 卷和模型配置；
 同时查看 `GET /api/v1/index/status` 的 pending/dead outbox 数量。
 
 该接口还返回 `physical_index`、`embedding_fingerprint` 和 `missing_embeddings`。正式验收前
@@ -1095,11 +1102,11 @@ docker compose up -d --build api
 
 - 当前没有用户登录和生效的文档 ACL，不应直接公网部署。
 - 正式环境应接入公司身份系统、Secret Manager、TLS、审计日志和备份策略。
-- 生产环境应更换示例数据库密码，限制 PostgreSQL/Elasticsearch 网络访问。
+- 生产环境应更换示例数据库密码，并限制 PostgreSQL 网络访问。
 - 不记录 Qwen token、原文全文或供应商完整错误响应到公共日志。
 - `QWEN_API_KEY_FILE` 应保持只读 secret 文件方式。
 - 上传接口在上线前应增加认证、恶意文件检查、租户/项目权限和访问频率限制。
-- 本地 Compose 关闭 Elasticsearch 身份认证和 TLS，仅适合受控开发网络；生产必须开启安全功能。
+- 本地 Compose 使用开发数据库口令且不发布 5432 端口；生产必须使用 Secret Manager、TLS、最小权限账号和网络隔离。
 - 模型、Embedding、Prompt 或检索参数变化后，应运行同一套人工标注回归。
 
 ## 17. 推荐日常操作清单
@@ -1147,7 +1154,8 @@ docker compose run --rm api qwen-diagnostics
 
 ## 18. 相关文档
 
-- [PostgreSQL + Elasticsearch 系统设计文档](postgresql-elasticsearch-knowledge-base-design.md)
-- [Elasticsearch 实施与在线回测报告](elasticsearch-implementation-and-regression-report.md)
+- [PostgreSQL FTS + pgvector 系统设计文档](postgresql-pgvector-fulltext-design.md)
+- [pgvector 迁移与运维说明](pgvector-migration-and-operations.md)
+- [历史 Elasticsearch 实施与在线回测报告](elasticsearch-implementation-and-regression-report.md)
 - [历史 OpenSearch 千文档基准报告](benchmark-1k-report.md)
 - [项目 README](../README.md)
