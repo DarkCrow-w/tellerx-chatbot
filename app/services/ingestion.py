@@ -1,7 +1,7 @@
 """Durable document parsing, chunking, embedding, and outbox preparation.
 
 The ingestion worker writes PostgreSQL and immutable object artifacts first.
-Elasticsearch publication is delegated to the outbox-driven indexer so a
+Search projection publication is delegated to the outbox-driven indexer so a
 provider or cluster outage cannot lose accepted document uploads.
 """
 

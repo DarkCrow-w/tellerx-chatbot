@@ -89,8 +89,8 @@ class AnswerService:
     ) -> Message:
         retrieval_index = getattr(
             self.settings,
-            "elasticsearch_read_alias",
-            "knowledge-chunks-read",
+            "search_index_name",
+            "postgresql:chunk_search_index",
         )
         search_backend = getattr(self.retriever, "index", None)
         if search_backend and hasattr(search_backend, "trace_index_name"):

@@ -1,6 +1,8 @@
 import json
 
 import httpx
+import pytest
+from pydantic import ValidationError
 
 from app.core.config import Settings
 from app.integrations.qwen import QwenClient, parse_json_object
@@ -41,9 +43,18 @@ def test_default_embedding_model_uses_a_model_specific_index() -> None:
 
     assert configured.qwen_embedding_model == "qwen3.7-text-embedding"
     assert configured.qwen_embedding_dimensions == 1024
-    assert configured.search_index_name.startswith("knowledge-chunks-s3-e")
+    assert configured.search_index_name.startswith("postgresql-chunk_search_index-s1-e")
     assert configured.search_index_name.endswith("-000001")
     assert configured.embedding_fingerprint in configured.search_index_name
+
+
+def test_postgres_vector_dimension_mismatch_fails_during_configuration() -> None:
+    with pytest.raises(ValidationError, match="requires a new PostgreSQL vector schema"):
+        Settings(
+            _env_file=None,
+            database_url="postgresql+psycopg://knowledge:knowledge@postgres/knowledge",
+            qwen_embedding_dimensions=768,
+        )
 
 
 def test_parse_json_fence() -> None:

@@ -23,16 +23,10 @@ class Settings(BaseSettings):
     app_name: str = "TellerX Knowledge Chatbot"
     app_env: str = "development"
     database_url: str = "postgresql+psycopg://knowledge:knowledge@postgres:5432/knowledge"
-    elasticsearch_url: str = "http://elasticsearch:9200"
-    elasticsearch_read_alias: str = "knowledge-chunks-read"
-    elasticsearch_write_alias: str = "knowledge-chunks-write"
-    elasticsearch_index_prefix: str = "knowledge-chunks"
-    elasticsearch_schema_version: int = 3
-    elasticsearch_number_of_shards: int = 1
-    elasticsearch_number_of_replicas: int = 0
-    elasticsearch_verify_certs: bool = False
-    elasticsearch_username: str | None = None
-    elasticsearch_password_file: Path | None = None
+    search_backend: str = "postgresql-pgvector-fts"
+    postgres_search_table: str = "chunk_search_index"
+    postgres_search_schema_version: int = 1
+    pgvector_hnsw_ef_search: int = 200
     storage_root: Path = Path("/data/knowledge")
 
     qwen_api_key_file: Path = Path("/run/secrets/qwen_api_key")
@@ -59,7 +53,6 @@ class Settings(BaseSettings):
     retrieval_top_k: int = 50
     rerank_candidates: int = 30
     evidence_top_k: int = 8
-    vector_num_candidates: int = 400
     vector_min_similarity: float | None = 0.25
     query_embedding_cache_size: int = 500
     query_embedding_cache_ttl_seconds: int = 3600
@@ -69,25 +62,28 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_runtime_invariants(self) -> Settings:
-        """Reject unsafe or internally inconsistent settings before startup."""
+        """Reject unsafe, inconsistent, or schema-incompatible settings."""
 
+        if self.search_backend != "postgresql-pgvector-fts":
+            raise ValueError("SEARCH_BACKEND must be postgresql-pgvector-fts")
+        if self.postgres_search_table != "chunk_search_index":
+            raise ValueError("POSTGRES_SEARCH_TABLE is fixed to chunk_search_index")
+        if self.database_url.startswith("postgresql") and self.qwen_embedding_dimensions != 1024:
+            raise ValueError(
+                "QWEN_EMBEDDING_DIMENSIONS must be 1024 for migration 0004; "
+                "a dimension change requires a new PostgreSQL vector schema migration"
+            )
         if not 0 <= self.chunk_overlap_tokens < self.chunk_target_tokens <= self.chunk_max_tokens:
-            raise ValueError(
-                "chunk sizes must satisfy 0 <= overlap < target <= maximum"
-            )
+            raise ValueError("chunk sizes must satisfy 0 <= overlap < target <= maximum")
         if not 1 <= self.evidence_top_k <= self.rerank_candidates <= self.retrieval_top_k:
-            raise ValueError(
-                "retrieval sizes must satisfy evidence <= rerank <= retrieval"
-            )
-        if self.qwen_embedding_dimensions <= 0 or self.vector_num_candidates <= 0:
-            raise ValueError("embedding dimensions and vector candidates must be positive")
+            raise ValueError("retrieval sizes must satisfy evidence <= rerank <= retrieval")
+        if self.qwen_embedding_dimensions <= 0 or self.pgvector_hnsw_ef_search <= 0:
+            raise ValueError("embedding dimensions and HNSW ef_search must be positive")
         if self.qwen_max_retries < 0:
             raise ValueError("qwen_max_retries cannot be negative")
         if self.query_embedding_cache_size <= 0 or self.query_embedding_cache_ttl_seconds <= 0:
             raise ValueError("query embedding cache size and TTL must be positive")
 
-        # Development fallbacks are useful locally but silently weaken the
-        # formal production acceptance guarantees from the architecture design.
         if self.app_env.casefold() in {"prod", "production"}:
             if self.allow_bm25_only:
                 raise ValueError("production requires ALLOW_BM25_ONLY=false")
@@ -110,18 +106,6 @@ class Settings(BaseSettings):
         return value
 
     @property
-    def elasticsearch_password(self) -> str | None:
-        if not self.elasticsearch_password_file:
-            return None
-        try:
-            value = self.elasticsearch_password_file.read_text(encoding="utf-8").strip()
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Elasticsearch password file is missing: {self.elasticsearch_password_file}"
-            ) from exc
-        return value or None
-
-    @property
     def embedding_fingerprint(self) -> str:
         payload = ":".join(
             [
@@ -135,7 +119,7 @@ class Settings(BaseSettings):
     @property
     def search_index_name(self) -> str:
         return (
-            f"{self.elasticsearch_index_prefix}-s{self.elasticsearch_schema_version}"
+            f"postgresql-{self.postgres_search_table}-s{self.postgres_search_schema_version}"
             f"-e{self.embedding_fingerprint}-000001"
         )
 

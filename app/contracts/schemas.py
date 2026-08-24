@@ -57,10 +57,13 @@ class VersionOut(BaseModel):
 
 class IndexStatusOut(BaseModel):
     available: bool
-    cluster_status: str | None = None
-    read_alias: list[str] = Field(default_factory=list)
-    write_alias: list[str] = Field(default_factory=list)
+    backend: str | None = None
+    server_version: str | None = None
+    vector_version: str | None = None
+    trgm_version: str | None = None
+    table_ready: bool = False
     physical_index: str | None = None
+    indexed_chunks: int = 0
     embedding_fingerprint: str | None = None
     missing_embeddings: int = 0
     pending_events: int = 0

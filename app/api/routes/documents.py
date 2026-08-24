@@ -2,7 +2,7 @@
 
 PostgreSQL and original object storage remain authoritative.  Every lifecycle
 change that affects search visibility is published through the transactional
-outbox instead of writing Elasticsearch directly from the request handler.
+outbox instead of writing the PostgreSQL search projection from the request handler.
 """
 
 from __future__ import annotations

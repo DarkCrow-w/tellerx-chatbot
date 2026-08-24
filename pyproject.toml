@@ -16,7 +16,6 @@ dependencies = [
   "fastapi==0.141.1",
   "httpx==0.28.1",
   "openpyxl==3.1.5",
-  "elasticsearch==9.4.1",
   "psycopg[binary]==3.3.4",
   "pydantic-settings==2.15.0",
   "pypdf==6.15.0",
@@ -43,6 +42,7 @@ qwen-diagnostics = "app.commands.cli:diagnostics_main"
 knowledge-eval = "app.commands.cli:evaluate_main"
 knowledge-benchmark = "app.commands.benchmark:main"
 knowledge-reindex = "app.commands.reindex:main"
+knowledge-pgvector-smoke = "app.commands.pgvector_smoke:main"
 
 [tool.setuptools.packages.find]
 include = ["app*"]

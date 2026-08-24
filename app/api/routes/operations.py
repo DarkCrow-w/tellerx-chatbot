@@ -15,7 +15,7 @@ router = APIRouter(tags=["operations"])
 
 @router.get("/index/status", response_model=IndexStatusOut)
 def index_status(db: Session = Depends(get_db)) -> dict:
-    """Combine Elasticsearch health with PostgreSQL indexing invariants."""
+    """Combine PostgreSQL search health with durable indexing invariants."""
 
     settings = get_settings()
     state = search_index().status()
@@ -79,7 +79,7 @@ def index_status(db: Session = Depends(get_db)) -> dict:
 
 @router.post("/admin/indexes/reconcile")
 def reconcile_index(repair: bool = False, db: Session = Depends(get_db)) -> dict:
-    """Compare PostgreSQL truth with Elasticsearch and optionally repair drift."""
+    """Compare source tables with the PostgreSQL search projection and repair drift."""
 
     return indexing_service().reconcile(db, repair=repair)
 

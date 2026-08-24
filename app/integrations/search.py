@@ -1,43 +1,46 @@
-"""Elasticsearch index adapter for lexical and vector storage operations.
-
-This module owns mappings and provider-specific queries only. Hybrid ranking
-policy lives in :mod:`app.services.retrieval`. PostgreSQL is never mutated
-from this adapter.
-"""
-
 from __future__ import annotations
 
+import hashlib
+import logging
 import re
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Iterable
 from typing import Any
 
-from elasticsearch import Elasticsearch, helpers
-from elasticsearch.exceptions import ApiError, NotFoundError, TransportError
+from sqlalchemy import bindparam, create_engine, text
+from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import Settings
+
+logger = logging.getLogger(__name__)
 
 EXACT_IDENTIFIER = re.compile(
     r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]{1,12}-\d{2,}(?:-[A-Za-z0-9]+)*)",
     re.IGNORECASE,
 )
 ACRONYM = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{2,12}\d{2,})(?![A-Za-z0-9])")
+ASCII_TOKEN = re.compile(r"[a-z0-9][a-z0-9_.:/-]*", re.IGNORECASE)
+CJK_SPAN = re.compile(r"[\u3400-\u9fff]+")
 ZH_ENTITY = re.compile(r"([\u3400-\u9fff]{2,20})(?:业务|系统|项目|模块)")
 EN_ENTITY = re.compile(
-    r"\b(?i:for|about)\s+([A-Z][A-Za-z0-9-]*(?:\s+[A-Z][A-Za-z0-9-]*){0,4})(?=\s*[,?])",
+    r"\b(?i:for|about)\s+([A-Z][A-Za-z0-9-]*(?:\s+[A-Z][A-Za-z0-9-]*){0,4})(?=\s*[,?])"
 )
 
 
 def normalize_query(value: str) -> str:
+    """Normalize user input without destroying case-sensitive entity signals."""
+
     return " ".join(unicodedata.normalize("NFKC", value).split())
 
 
 def _lexical_signals(query: str) -> list[str]:
-    """Extract stable business identifiers and names without an LLM rewrite."""
-    query = normalize_query(query)
-    values = [*EXACT_IDENTIFIER.findall(query), *ACRONYM.findall(query)]
-    values.extend(match.group(1) for match in ZH_ENTITY.finditer(query))
-    values.extend(match.group(1) for match in EN_ENTITY.finditer(query))
+    """Extract stable identifiers and business entities without another model call."""
+
+    normalized = normalize_query(query)
+    values = [*EXACT_IDENTIFIER.findall(normalized), *ACRONYM.findall(normalized)]
+    values.extend(match.group(1) for match in ZH_ENTITY.finditer(normalized))
+    values.extend(match.group(1) for match in EN_ENTITY.finditer(normalized))
     return list(dict.fromkeys(value.strip() for value in values if value.strip()))
 
 
@@ -45,203 +48,213 @@ def _source_status(source: dict[str, Any]) -> str:
     return str(source.get("lifecycle_status") or source.get("document_status") or "")
 
 
-class SearchIndex:
-    """Elasticsearch-backed BM25 and dense-vector index.
+def normalize_search_text(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
 
-    PostgreSQL and object storage remain authoritative.  This class deliberately
-    uses separate read/write aliases so a fully validated generation can be
-    activated atomically without changing query code.
+
+def lexical_tokens(value: str, *, limit: int = 512) -> list[str]:
+    """Create deterministic mixed Chinese/English tokens for PostgreSQL FTS.
+
+    PostgreSQL's built-in parser does not segment Chinese business names.  The
+    application therefore stores ASCII words and overlapping CJK bigrams.  The
+    full CJK span is retained for short names so exact internal terminology is
+    still highly discriminative without a server-side tokenizer extension.
     """
 
-    def __init__(self, settings: Settings, client: Elasticsearch | Any | None = None):
+    normalized = normalize_search_text(value)
+    tokens: list[str] = []
+    tokens.extend(ASCII_TOKEN.findall(normalized))
+    for span in CJK_SPAN.findall(normalized):
+        if 2 <= len(span) <= 24:
+            tokens.append(span)
+        if len(span) == 1:
+            tokens.append(span)
+        else:
+            tokens.extend(span[index : index + 2] for index in range(len(span) - 1))
+    return list(dict.fromkeys(token for token in tokens if token))[:limit]
+
+
+def _vector_literal(vector: Iterable[float]) -> str:
+    return "[" + ",".join(format(float(value), ".9g") for value in vector) + "]"
+
+
+class SearchIndex:
+    """PostgreSQL full-text and pgvector implementation of the search port."""
+
+    table_name = "chunk_search_index"
+
+    def __init__(self, settings: Settings, engine: Engine | Any | None = None):
         self.settings = settings
-        self.client = client or self._build_client(settings)
+        self.table_name = settings.postgres_search_table
+        self.engine = engine or create_engine(settings.database_url, pool_pre_ping=True)
+
+    def close(self) -> None:
+        self.engine.dispose()
 
     @staticmethod
-    def _build_client(settings: Settings) -> Elasticsearch:
-        options: dict[str, Any] = {
-            "hosts": [settings.elasticsearch_url],
-            "verify_certs": settings.elasticsearch_verify_certs,
-        }
-        password = settings.elasticsearch_password
-        if settings.elasticsearch_username and password:
-            options["basic_auth"] = (settings.elasticsearch_username, password)
-        return Elasticsearch(**options)
+    def _source_select() -> str:
+        return """
+            s.chunk_id,
+            c.id AS source_chunk_id,
+            d.id AS document_id,
+            v.id AS version_id,
+            d.project_id,
+            d.filename,
+            v.lifecycle_status,
+            d.document_type,
+            d.visibility,
+            v.version_label,
+            v.effective_at AS effective_from,
+            v.effective_to,
+            v.is_current,
+            (v.technical_status = 'searchable' AND NOT d.is_deleted) AS is_searchable,
+            c.heading_path AS title_path,
+            c.page_number,
+            c.sheet_name,
+            c.cell_range,
+            c.ordinal AS chunk_ordinal,
+            c.parent_chunk_id,
+            c.previous_chunk_id,
+            c.next_chunk_id,
+            c.content,
+            c.content_hash,
+            c.record_hash
+        """
 
-    @property
-    def mapping(self) -> dict[str, Any]:
-        return {
-            "settings": {
-                "number_of_shards": self.settings.elasticsearch_number_of_shards,
-                "number_of_replicas": self.settings.elasticsearch_number_of_replicas,
-                "refresh_interval": "5s",
-                "analysis": {
-                    "normalizer": {
-                        "kb_keyword": {
-                            "type": "custom",
-                            "filter": ["lowercase", "asciifolding"],
-                        }
-                    }
-                },
-            },
-            "mappings": {
-                "dynamic": "strict",
-                "properties": {
-                    "chunk_id": {"type": "keyword"},
-                    "document_id": {"type": "keyword"},
-                    "version_id": {"type": "keyword"},
-                    "project_id": {"type": "keyword"},
-                    "document_type": {"type": "keyword"},
-                    "lifecycle_status": {"type": "keyword"},
-                    "version_label": {"type": "keyword"},
-                    "visibility": {"type": "keyword"},
-                    "acl_principals": {"type": "keyword"},
-                    "effective_from": {"type": "date"},
-                    "effective_to": {"type": "date"},
-                    "is_current": {"type": "boolean"},
-                    "is_searchable": {"type": "boolean"},
-                    "filename": {
-                        "type": "text",
-                        "analyzer": "cjk",
-                        "fields": {"raw": {"type": "keyword"}},
-                    },
-                    "title_path": {
-                        "type": "text",
-                        "analyzer": "cjk",
-                        "fields": {"raw": {"type": "keyword"}},
-                    },
-                    "exact_terms": {"type": "keyword", "normalizer": "kb_keyword"},
-                    "page_number": {"type": "integer"},
-                    "sheet_name": {"type": "keyword"},
-                    "cell_range": {"type": "keyword"},
-                    "chunk_ordinal": {"type": "integer"},
-                    "parent_chunk_id": {"type": "keyword"},
-                    "previous_chunk_id": {"type": "keyword"},
-                    "next_chunk_id": {"type": "keyword"},
-                    "content_hash": {"type": "keyword"},
-                    "record_hash": {"type": "keyword"},
-                    "schema_version": {"type": "keyword"},
-                    "embedding_fingerprint": {"type": "keyword"},
-                    "content": {
-                        "type": "text",
-                        "analyzer": "cjk",
-                        "fields": {"standard": {"type": "text", "analyzer": "standard"}},
-                    },
-                    "embedding": {
-                        "type": "dense_vector",
-                        "dims": self.settings.qwen_embedding_dimensions,
-                        "index": True,
-                        "similarity": "cosine",
-                    },
-                },
-            },
-        }
+    @staticmethod
+    def _joins() -> str:
+        return """
+            FROM chunk_search_index s
+            JOIN chunks c ON c.id = s.chunk_id
+            JOIN document_versions v ON v.id = c.version_id
+            JOIN documents d ON d.id = v.document_id
+        """
 
-    def _alias_indexes(self, alias: str) -> list[str]:
-        try:
-            aliases = self.client.indices.get_alias(name=alias)
-        except NotFoundError:
-            return []
-        aliases = getattr(aliases, "body", aliases)
-        if not isinstance(aliases, Mapping):
-            return []
-        return [
-            index
-            for index, payload in aliases.items()
-            if isinstance(payload, Mapping)
-            and isinstance(payload.get("aliases"), Mapping)
+    @staticmethod
+    def _hit(row: Any, score: float | None = None) -> dict[str, Any]:
+        mapping = dict(row._mapping if hasattr(row, "_mapping") else row)
+        mapping.pop("source_chunk_id", None)
+        raw_score = float(score if score is not None else mapping.pop("score", 0.0) or 0.0)
+        chunk_id = str(mapping.get("chunk_id") or "")
+        return {"_id": chunk_id, "_score": raw_score, "_source": mapping}
+
+    @staticmethod
+    def _status_clause(statuses: list[str], params: dict[str, Any]) -> str:
+        clauses: list[str] = []
+        if "approved" in statuses:
+            clauses.append("(v.lifecycle_status = 'approved' AND v.is_current IS TRUE)")
+        others = list(dict.fromkeys(status for status in statuses if status != "approved"))
+        if others:
+            params["other_statuses"] = others
+            clauses.append("v.lifecycle_status IN :other_statuses")
+        return "(" + " OR ".join(clauses or ["FALSE"]) + ")"
+
+    @classmethod
+    def _scope_clause(
+        cls,
+        project_ids: list[str],
+        statuses: list[str],
+        principal_ids: list[str] | None,
+        params: dict[str, Any],
+    ) -> tuple[str, list[str]]:
+        clauses = [
+            cls._status_clause(statuses, params),
+            "v.technical_status = 'searchable'",
+            "d.is_deleted IS FALSE",
         ]
+        expanding: list[str] = []
+        if "other_statuses" in params:
+            expanding.append("other_statuses")
+        if project_ids:
+            params["project_ids"] = list(dict.fromkeys(project_ids))
+            clauses.append("d.project_id IN :project_ids")
+            expanding.append("project_ids")
+        if principal_ids:
+            params["principal_ids"] = list(dict.fromkeys(principal_ids))
+            clauses.append(
+                "(d.visibility = 'public' OR EXISTS ("
+                "SELECT 1 FROM document_acl acl "
+                "WHERE acl.document_id = d.id AND acl.permission = 'read' "
+                "AND acl.principal_id IN :principal_ids))"
+            )
+            expanding.append("principal_ids")
+        else:
+            clauses.append("d.visibility = 'public'")
+        return " AND ".join(clauses), expanding
+
+    @staticmethod
+    def _statement(sql: str, expanding: list[str] | None = None):
+        statement = text(sql)
+        for name in expanding or []:
+            statement = statement.bindparams(bindparam(name, expanding=True))
+        return statement
 
     def current_write_index(self) -> str:
-        indexes = self._alias_indexes(self.settings.elasticsearch_write_alias)
-        return indexes[0] if indexes else self.settings.search_index_name
+        return f"postgresql:{self.table_name}:{self.settings.embedding_fingerprint}"
 
     def current_read_index(self) -> str:
-        indexes = self._alias_indexes(self.settings.elasticsearch_read_alias)
-        return indexes[0] if indexes else self.settings.search_index_name
+        return self.current_write_index()
 
     def trace_index_name(self) -> str:
-        try:
-            return self.current_read_index()
-        except (ApiError, TransportError):
-            return self.settings.elasticsearch_read_alias
+        return self.current_read_index()
 
     def ensure_index(self) -> None:
-        index = self.settings.search_index_name
-        self.create_index(index)
+        """Fail startup when migrations or required PostgreSQL extensions are missing."""
 
-        actions: list[dict[str, Any]] = []
-        if not self._alias_indexes(self.settings.elasticsearch_read_alias):
-            actions.append(
-                {
-                    "add": {
-                        "index": index,
-                        "alias": self.settings.elasticsearch_read_alias,
-                    }
-                }
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT to_regclass(:table_name) IS NOT NULL AS table_ready, "
+                    "EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') AS vector_ready, "
+                    "EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm') AS trgm_ready"
+                ),
+                {"table_name": self.table_name},
+            ).mappings().one()
+        missing = [
+            name
+            for name, ready in (
+                (self.table_name, row["table_ready"]),
+                ("vector extension", row["vector_ready"]),
+                ("pg_trgm extension", row["trgm_ready"]),
             )
-        if not self._alias_indexes(self.settings.elasticsearch_write_alias):
-            actions.append(
-                {
-                    "add": {
-                        "index": index,
-                        "alias": self.settings.elasticsearch_write_alias,
-                        "is_write_index": True,
-                    }
-                }
-            )
-        if actions:
-            self.client.indices.update_aliases(actions=actions)
-
-    def create_index(self, index: str) -> None:
-        if not self.client.indices.exists(index=index):
-            self.client.indices.create(index=index, **self.mapping)
-
-    def activate_alias(self, target_index: str | None = None) -> None:
-        """Atomically switch both aliases to a fully verified physical index."""
-        target = target_index or self.settings.search_index_name
-        if not self.client.indices.exists(index=target):
-            raise ValueError(f"Cannot activate missing Elasticsearch index: {target}")
-        actions: list[dict[str, Any]] = []
-        for alias in (
-            self.settings.elasticsearch_read_alias,
-            self.settings.elasticsearch_write_alias,
-        ):
-            for old_index in self._alias_indexes(alias):
-                if old_index != target:
-                    actions.append({"remove": {"index": old_index, "alias": alias}})
-            if target not in self._alias_indexes(alias):
-                add: dict[str, Any] = {"index": target, "alias": alias}
-                if alias == self.settings.elasticsearch_write_alias:
-                    add["is_write_index"] = True
-                actions.append({"add": add})
-        if actions:
-            self.client.indices.update_aliases(actions=actions)
-
-    def _normalize_document(self, document: dict[str, Any]) -> dict[str, Any]:
-        source = dict(document)
-        status = str(source.pop("document_status", source.get("lifecycle_status", "")))
-        source["lifecycle_status"] = status
-        source["title_path"] = source.pop("heading_path", source.get("title_path"))
-        supplied_terms = source.pop("identifiers", source.get("exact_terms", [])) or []
-        searchable = " ".join(
-            str(source.get(field) or "") for field in ("filename", "title_path", "content")
-        )
-        extracted = [
-            *EXACT_IDENTIFIER.findall(searchable),
-            *ACRONYM.findall(searchable),
+            if not ready
         ]
-        source["exact_terms"] = sorted(
-            {str(value).casefold() for value in [*supplied_terms, *extracted] if value}
+        if missing:
+            raise RuntimeError("PostgreSQL search schema is not ready: " + ", ".join(missing))
+
+    def create_index(self, _: str) -> None:
+        self.ensure_index()
+
+    def activate_alias(self, _: str | None = None) -> None:
+        # PostgreSQL updates are transactional; no external alias switch exists.
+        self.ensure_index()
+
+    @staticmethod
+    def _document_text(document: dict[str, Any]) -> tuple[str, str, list[str]]:
+        filename = str(document.get("filename") or "")
+        title = str(document.get("title_path") or document.get("heading_path") or "")
+        content = str(document.get("content") or "")
+        raw_text = normalize_search_text(f"{filename} {title} {content}")
+        # Preserve repetitions after tokenization. lexical_tokens intentionally
+        # deduplicates one field, so repeating the raw field before tokenizing
+        # would silently discard the intended filename/title weight.
+        filename_tokens = lexical_tokens(filename)
+        title_tokens = lexical_tokens(title)
+        content_tokens = lexical_tokens(content)
+        lexical_text = " ".join(
+            filename_tokens * 4 + title_tokens * 3 + content_tokens
         )
-        source.setdefault("visibility", "public")
-        source.setdefault("acl_principals", [])
-        source.setdefault("is_current", status == "approved")
-        source.setdefault("is_searchable", status != "deprecated")
-        source.setdefault("chunk_ordinal", 0)
-        source.setdefault("schema_version", str(self.settings.elasticsearch_schema_version))
-        source.setdefault("embedding_fingerprint", self.settings.embedding_fingerprint)
-        return source
+        supplied = document.get("exact_terms") or document.get("identifiers") or []
+        exact_terms = {
+            str(value).casefold()
+            for value in [
+                *supplied,
+                *EXACT_IDENTIFIER.findall(raw_text),
+                *ACRONYM.findall(raw_text),
+            ]
+            if value
+        }
+        return raw_text, lexical_text, sorted(exact_terms)
 
     def index_chunks(
         self,
@@ -249,104 +262,94 @@ class SearchIndex:
         *,
         target_index: str | None = None,
     ) -> None:
+        del target_index
         if not documents:
             return
-        target = target_index or self.settings.elasticsearch_write_alias
-        if target_index:
-            self.create_index(target)
-        else:
-            self.ensure_index()
-        actions = [
-            {
-                "_op_type": "index",
-                "_index": target,
-                "_id": document["chunk_id"],
-                "_source": self._normalize_document(document),
-            }
-            for document in documents
-        ]
-        helpers.bulk(
-            self.client,
-            actions,
-            request_timeout=120,
-            refresh="wait_for",
-            raise_on_error=True,
-            raise_on_exception=True,
+        sql = text(
+            """
+            INSERT INTO chunk_search_index (
+                chunk_id, embedding, embedding_fingerprint,
+                raw_text, lexical_text, exact_terms, record_hash, updated_at
+            ) VALUES (
+                :chunk_id, CAST(:embedding AS vector), :embedding_fingerprint,
+                :raw_text, :lexical_text, :exact_terms, :record_hash, now()
+            )
+            ON CONFLICT (chunk_id) DO UPDATE SET
+                embedding = EXCLUDED.embedding,
+                embedding_fingerprint = EXCLUDED.embedding_fingerprint,
+                raw_text = EXCLUDED.raw_text,
+                lexical_text = EXCLUDED.lexical_text,
+                exact_terms = EXCLUDED.exact_terms,
+                record_hash = EXCLUDED.record_hash,
+                updated_at = now()
+            """
         )
+        rows = []
+        for document in documents:
+            raw_text, lexical_text, exact_terms = self._document_text(document)
+            embedding = document.get("embedding")
+            rows.append(
+                {
+                    "chunk_id": document["chunk_id"],
+                    "embedding": _vector_literal(embedding) if embedding is not None else None,
+                    "embedding_fingerprint": (
+                        self.settings.embedding_fingerprint if embedding is not None else None
+                    ),
+                    "raw_text": raw_text,
+                    "lexical_text": lexical_text,
+                    "exact_terms": exact_terms,
+                    "record_hash": document.get("record_hash")
+                    or hashlib.sha256(raw_text.encode()).hexdigest(),
+                }
+            )
+        with self.engine.begin() as connection:
+            connection.execute(sql, rows)
 
     def delete_version(self, version_id: str) -> None:
-        target = self.settings.elasticsearch_write_alias
-        if self.client.indices.exists(index=target):
-            self.client.delete_by_query(
-                index=target,
-                query={"term": {"version_id": version_id}},
-                conflicts="proceed",
-                refresh=True,
+        with self.engine.begin() as connection:
+            connection.execute(
+                text(
+                    "DELETE FROM chunk_search_index s USING chunks c "
+                    "WHERE s.chunk_id = c.id AND c.version_id = :version_id"
+                ),
+                {"version_id": version_id},
             )
+
+    def clear(self) -> None:
+        with self.engine.begin() as connection:
+            connection.execute(text("DELETE FROM chunk_search_index"))
 
     def delete_stale_version_chunks(self, version_id: str, current_chunk_ids: list[str]) -> None:
-        target = self.settings.elasticsearch_write_alias
-        if not self.client.indices.exists(index=target):
-            return
-        query: dict[str, Any] = {"term": {"version_id": version_id}}
+        params: dict[str, Any] = {"version_id": version_id}
+        sql = (
+            "DELETE FROM chunk_search_index s USING chunks c "
+            "WHERE s.chunk_id = c.id AND c.version_id = :version_id"
+        )
+        expanding: list[str] = []
         if current_chunk_ids:
-            query = {
-                "bool": {
-                    "filter": [{"term": {"version_id": version_id}}],
-                    "must_not": [{"ids": {"values": current_chunk_ids}}],
-                }
-            }
-        self.client.delete_by_query(
-            index=target,
-            query=query,
-            conflicts="proceed",
-            refresh=True,
-        )
+            params["current_chunk_ids"] = current_chunk_ids
+            sql += " AND s.chunk_id NOT IN :current_chunk_ids"
+            expanding.append("current_chunk_ids")
+        with self.engine.begin() as connection:
+            connection.execute(self._statement(sql, expanding), params)
 
-    @staticmethod
-    def _filters(
-        project_ids: list[str],
-        statuses: list[str],
-        principal_ids: list[str] | None = None,
-    ) -> list[dict[str, Any]]:
-        status_options: list[dict[str, Any]] = []
-        if "approved" in statuses:
-            status_options.append(
-                {
-                    "bool": {
-                        "filter": [
-                            {"term": {"lifecycle_status": "approved"}},
-                            {"term": {"is_current": True}},
-                        ]
-                    }
-                }
+    def prune_ineligible(self) -> int:
+        """Remove rows whose source chunk is no longer an active searchable version."""
+
+        with self.engine.begin() as connection:
+            result = connection.execute(
+                text(
+                    "DELETE FROM chunk_search_index s WHERE NOT EXISTS ("
+                    "SELECT 1 FROM chunks c "
+                    "JOIN document_versions v ON v.id = c.version_id "
+                    "JOIN documents d ON d.id = v.document_id "
+                    "WHERE c.id = s.chunk_id AND NOT d.is_deleted "
+                    "AND v.technical_status = 'searchable' "
+                    "AND (v.lifecycle_status = 'draft' OR "
+                    "(v.lifecycle_status = 'approved' AND v.is_current IS TRUE)))"
+                )
             )
-        status_options.extend(
-            {"term": {"lifecycle_status": status}}
-            for status in statuses
-            if status != "approved"
-        )
-        filters: list[dict[str, Any]] = [
-            {"bool": {"should": status_options, "minimum_should_match": 1}},
-            {"term": {"is_searchable": True}},
-        ]
-        if project_ids:
-            filters.append({"terms": {"project_id": project_ids}})
-        if principal_ids:
-            filters.append(
-                {
-                    "bool": {
-                        "should": [
-                            {"term": {"visibility": "public"}},
-                            {"terms": {"acl_principals": principal_ids}},
-                        ],
-                        "minimum_should_match": 1,
-                    }
-                }
-            )
-        else:
-            filters.append({"term": {"visibility": "public"}})
-        return filters
+        return int(result.rowcount or 0)
 
     def lexical_search(
         self,
@@ -356,48 +359,69 @@ class SearchIndex:
         top_k: int,
         principal_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        index = self.settings.elasticsearch_read_alias
-        if not self.client.indices.exists(index=index):
+        normalized = normalize_search_text(query)
+        tokens = lexical_tokens(normalized, limit=64)
+        if not tokens:
             return []
-        query = normalize_query(query)
-        exact_terms = {match.casefold() for match in EXACT_IDENTIFIER.findall(query)}
-        exact_terms.update(match.casefold() for match in ACRONYM.findall(query))
-        should: list[dict[str, Any]] = [
-            {"term": {"exact_terms": {"value": term, "boost": 100.0}}}
-            for term in exact_terms
-        ]
-        for signal in _lexical_signals(query):
-            should.extend(
-                [
-                    {"match_phrase": {"filename": {"query": signal, "boost": 50.0}}},
-                    {"match_phrase": {"content": {"query": signal, "boost": 35.0}}},
-                    {"match_phrase": {"title_path": {"query": signal, "boost": 20.0}}},
-                ]
-            )
-        result = self.client.search(
-            index=index,
-            size=top_k,
-            query={
-                "bool": {
-                    "filter": self._filters(project_ids, statuses, principal_ids),
-                    "must": {
-                        "multi_match": {
-                            "query": query,
-                            "fields": [
-                                "filename^4",
-                                "title_path^3",
-                                "content^2",
-                                "content.standard^2.5",
-                            ],
-                            "type": "best_fields",
-                        }
-                    },
-                    "should": should,
-                }
-            },
-            source_excludes=["embedding"],
+        params: dict[str, Any] = {
+            # websearch_to_tsquery is deliberately used instead of to_tsquery:
+            # user-facing identifiers can contain '-' or '/', and malformed
+            # tsquery syntax must never turn a normal knowledge query into 500.
+            "ts_query": " OR ".join(f'"{token}"' for token in tokens),
+            "raw_query": normalized,
+            "top_k": top_k,
+        }
+        scope, expanding = self._scope_clause(
+            project_ids, statuses, principal_ids, params
         )
-        return result.get("hits", {}).get("hits", [])
+        exact_terms = sorted(
+            {
+                *[value.casefold() for value in EXACT_IDENTIFIER.findall(normalized)],
+                *[value.casefold() for value in ACRONYM.findall(normalized)],
+            }
+        )
+        exact_score = "0.0"
+        exact_match = "FALSE"
+        if exact_terms:
+            params["exact_terms"] = exact_terms
+            exact_score = "CASE WHEN s.exact_terms && CAST(:exact_terms AS text[]) THEN 100.0 ELSE 0.0 END"
+            exact_match = "s.exact_terms && CAST(:exact_terms AS text[])"
+        signals = [
+            signal
+            for signal in [*exact_terms, *lexical_tokens(normalized, limit=12)]
+            if len(signal) >= 2
+        ][:12]
+        signal_scores: list[str] = []
+        signal_matches: list[str] = []
+        for index, signal in enumerate(dict.fromkeys(signals)):
+            key = f"signal_{index}"
+            params[key] = signal
+            signal_scores.append(
+                f"CASE WHEN position(:{key} in s.raw_text) > 0 THEN 8.0 ELSE 0.0 END"
+            )
+            signal_matches.append(f"position(:{key} in s.raw_text) > 0")
+        signal_score = " + ".join(signal_scores) or "0.0"
+        candidate_match = " OR ".join(
+            ["s.search_vector @@ websearch.query", exact_match, *signal_matches]
+        )
+        sql = f"""
+            WITH websearch AS (
+                SELECT websearch_to_tsquery('simple', :ts_query) AS query
+            )
+            SELECT {self._source_select()},
+                   (ts_rank_cd(s.search_vector, websearch.query, 32) * 20.0
+                    + {exact_score} + {signal_score}
+                    + similarity(s.raw_text, :raw_query)) AS score
+            {self._joins()}
+            CROSS JOIN websearch
+            WHERE {scope}
+              AND ({candidate_match})
+            ORDER BY score DESC, s.chunk_id
+            LIMIT :top_k
+        """
+        with self.engine.connect() as connection:
+            rows = connection.execute(self._statement(sql, expanding), params).fetchall()
+        return [self._hit(row) for row in rows]
 
     def vector_search(
         self,
@@ -407,83 +431,144 @@ class SearchIndex:
         top_k: int,
         principal_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        index = self.settings.elasticsearch_read_alias
-        if not self.client.indices.exists(index=index):
-            return []
-        knn: dict[str, Any] = {
-            "field": "embedding",
-            "query_vector": vector,
-            "k": top_k,
-            "num_candidates": max(top_k, self.settings.vector_num_candidates),
-            "filter": {"bool": {"filter": self._filters(project_ids, statuses, principal_ids)}},
+        params: dict[str, Any] = {
+            "embedding": _vector_literal(vector),
+            "embedding_fingerprint": self.settings.embedding_fingerprint,
+            "top_k": top_k,
         }
-        if self.settings.vector_min_similarity is not None:
-            knn["similarity"] = self.settings.vector_min_similarity
-        result = self.client.search(
-            index=index,
-            size=top_k,
-            knn=knn,
-            source_excludes=["embedding"],
+        scope, expanding = self._scope_clause(
+            project_ids, statuses, principal_ids, params
         )
-        return result.get("hits", {}).get("hits", [])
+        threshold = ""
+        if self.settings.vector_min_similarity is not None:
+            params["minimum_similarity"] = self.settings.vector_min_similarity
+            threshold = (
+                "AND (1.0 - (s.embedding <=> CAST(:embedding AS vector))) "
+                ">= :minimum_similarity"
+            )
+        sql = f"""
+            SELECT {self._source_select()},
+                   (1.0 - (s.embedding <=> CAST(:embedding AS vector))) AS score
+            {self._joins()}
+            WHERE {scope}
+              AND s.embedding IS NOT NULL
+              AND s.embedding_fingerprint = :embedding_fingerprint
+              {threshold}
+            ORDER BY s.embedding <=> CAST(:embedding AS vector), s.chunk_id
+            LIMIT :top_k
+        """
+        with self.engine.begin() as connection:
+            self._configure_vector_scan(connection)
+            rows = connection.execute(self._statement(sql, expanding), params).fetchall()
+        return [self._hit(row) for row in rows]
+
+    def _configure_vector_scan(self, connection: Connection) -> None:
+        ef_search = max(40, int(self.settings.pgvector_hnsw_ef_search))
+        connection.execute(text(f"SET LOCAL hnsw.ef_search = {ef_search}"))
+        connection.execute(text("SET LOCAL hnsw.iterative_scan = strict_order"))
+
+    def document_chunks(
+        self,
+        document_ids: list[str],
+        project_ids: list[str],
+        statuses: list[str],
+        top_k: int,
+        principal_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        if not document_ids:
+            return []
+        params: dict[str, Any] = {
+            "document_ids": list(dict.fromkeys(document_ids)),
+            "top_k": top_k,
+        }
+        scope, expanding = self._scope_clause(
+            project_ids, statuses, principal_ids, params
+        )
+        expanding.append("document_ids")
+        sql = f"""
+            SELECT {self._source_select()}, 0.0 AS score
+            {self._joins()}
+            WHERE {scope} AND d.id IN :document_ids
+            ORDER BY d.id, c.ordinal
+            LIMIT :top_k
+        """
+        with self.engine.connect() as connection:
+            rows = connection.execute(self._statement(sql, expanding), params).fetchall()
+        return [self._hit(row) for row in rows]
 
     def count_version(self, version_id: str, *, target_index: str | None = None) -> int:
-        index = target_index or self.settings.elasticsearch_read_alias
-        if not self.client.indices.exists(index=index):
-            return 0
-        result = self.client.count(index=index, query={"term": {"version_id": version_id}})
-        return int(result.get("count", 0))
+        del target_index
+        with self.engine.connect() as connection:
+            return int(
+                connection.scalar(
+                    text(
+                        "SELECT count(*) FROM chunk_search_index s "
+                        "JOIN chunks c ON c.id = s.chunk_id WHERE c.version_id = :version_id"
+                    ),
+                    {"version_id": version_id},
+                )
+                or 0
+            )
 
     def count_all(self, *, target_index: str | None = None) -> int:
-        index = target_index or self.settings.elasticsearch_read_alias
-        if not self.client.indices.exists(index=index):
-            return 0
-        return int(self.client.count(index=index).get("count", 0))
+        del target_index
+        with self.engine.connect() as connection:
+            return int(connection.scalar(text("SELECT count(*) FROM chunk_search_index")) or 0)
 
     def version_records(self, version_id: str) -> list[tuple[int, str, str]]:
-        """Return the minimum immutable fields needed for manifest reconciliation."""
-        index = self.settings.elasticsearch_read_alias
-        if not self.client.indices.exists(index=index):
-            return []
-        records = []
-        for hit in helpers.scan(
-            self.client,
-            index=index,
-            query={
-                "query": {"term": {"version_id": version_id}},
-                "_source": ["chunk_id", "chunk_ordinal", "record_hash"],
-            },
-            request_timeout=120,
-        ):
-            source = hit.get("_source", {})
-            records.append(
-                (
-                    int(source.get("chunk_ordinal", 0)),
-                    str(source.get("chunk_id") or hit.get("_id") or ""),
-                    str(source.get("record_hash") or ""),
-                )
-            )
-        return sorted(records)
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT c.ordinal, s.chunk_id, s.record_hash "
+                    "FROM chunk_search_index s JOIN chunks c ON c.id = s.chunk_id "
+                    "WHERE c.version_id = :version_id ORDER BY c.ordinal, s.chunk_id"
+                ),
+                {"version_id": version_id},
+            ).fetchall()
+        return [(int(row[0]), str(row[1]), str(row[2])) for row in rows]
 
     def ping(self) -> bool:
         try:
-            return bool(self.client.ping())
-        except ApiError:
+            with self.engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+            return True
+        except SQLAlchemyError:
             return False
 
     def status(self) -> dict[str, Any]:
         try:
-            health = self.client.cluster.health()
-            read_indexes = self._alias_indexes(self.settings.elasticsearch_read_alias)
-            write_indexes = self._alias_indexes(self.settings.elasticsearch_write_alias)
+            with self.engine.connect() as connection:
+                row = connection.execute(
+                    text(
+                        "SELECT current_setting('server_version') AS server_version, "
+                        "(SELECT extversion FROM pg_extension WHERE extname = 'vector') "
+                        "AS vector_version, "
+                        "(SELECT extversion FROM pg_extension WHERE extname = 'pg_trgm') "
+                        "AS trgm_version, "
+                        "to_regclass(:table_name) IS NOT NULL AS table_ready"
+                    ),
+                    {"table_name": self.table_name},
+                ).mappings().one()
+                indexed_chunks = (
+                    int(connection.scalar(text("SELECT count(*) FROM chunk_search_index")) or 0)
+                    if row["table_ready"]
+                    else 0
+                )
+            ready = bool(row["table_ready"] and row["vector_version"] and row["trgm_version"])
             return {
-                "available": True,
-                "cluster_status": health.get("status"),
-                "read_alias": read_indexes,
-                "write_alias": write_indexes,
-                "physical_index": (
-                    read_indexes[0] if read_indexes else self.settings.search_index_name
-                ),
+                "available": ready,
+                "backend": "postgresql-pgvector-fts",
+                "server_version": row["server_version"],
+                "vector_version": row["vector_version"],
+                "trgm_version": row["trgm_version"],
+                "table_ready": bool(row["table_ready"]),
+                "physical_index": self.current_read_index(),
+                "indexed_chunks": indexed_chunks,
             }
-        except (ApiError, TransportError) as exc:
-            return {"available": False, "error_type": type(exc).__name__}
+        except SQLAlchemyError as exc:
+            logger.warning("PostgreSQL search status failed: %s", type(exc).__name__)
+            return {
+                "available": False,
+                "backend": "postgresql-pgvector-fts",
+                "error_type": type(exc).__name__,
+            }

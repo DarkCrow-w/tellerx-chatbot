@@ -74,7 +74,7 @@ class ApplicationContainer:
             qwen.close()
         index = self.__dict__.get("index")
         if index is not None:
-            index.client.close()
+            index.close()
 
 
 @lru_cache

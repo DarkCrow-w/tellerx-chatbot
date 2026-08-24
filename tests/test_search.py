@@ -1,111 +1,128 @@
-from collections import UserDict
 from types import SimpleNamespace
 
-from app.integrations.search import SearchIndex, _lexical_signals
+from app.integrations.search import SearchIndex, _lexical_signals, lexical_tokens
 from app.services.retrieval import Retriever
 
 
-class FakeIndices:
+class FakeResult:
+    rowcount = 0
+
+    @staticmethod
+    def fetchall():
+        return []
+
+
+class FakeConnection:
     def __init__(self):
-        self.actions = None
+        self.calls = []
 
-    def exists(self, *, index):
-        return True
+    def __enter__(self):
+        return self
 
-    def get_alias(self, *, name):
-        return {}
+    def __exit__(self, *_):
+        return None
 
-    def get_mapping(self, *, index):
-        return {index: {"mappings": {"properties": {"identifiers": {"type": "keyword"}}}}}
-
-    def update_aliases(self, *, actions):
-        self.actions = actions
+    def execute(self, statement, params=None):
+        self.calls.append((str(statement), params or {}))
+        return FakeResult()
 
 
-class FakeSearchClient:
+class FakeEngine:
     def __init__(self):
-        self.indices = SimpleNamespace(exists=lambda *, index: True)
-        self.searched_index = None
-        self.search_kwargs = None
+        self.connection = FakeConnection()
 
-    def search(self, *, index, **kwargs):
-        self.searched_index = index
-        self.search_kwargs = kwargs
-        return {"hits": {"hits": []}}
+    def connect(self):
+        return self.connection
+
+    def begin(self):
+        return self.connection
 
 
-def test_missing_alias_response_does_not_remove_status_as_index() -> None:
-    indices = FakeIndices()
-    client = SimpleNamespace(indices=indices)
-    settings = SimpleNamespace(
-        search_index_name="knowledge-chunks-model-1024-v1",
-        elasticsearch_read_alias="knowledge-chunks-read",
-        elasticsearch_write_alias="knowledge-chunks-write",
-        qwen_embedding_dimensions=1024,
-    )
-    SearchIndex(settings, client=client).ensure_index()
-    assert indices.actions == [
+def _postgres_settings(**overrides):
+    values = {
+        "embedding_fingerprint": "model-1024-v1",
+        "postgres_search_table": "chunk_search_index",
+        "vector_min_similarity": 0.25,
+        "pgvector_hnsw_ef_search": 200,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_mixed_language_lexicalization_keeps_ids_and_chinese_business_terms() -> None:
+    tokens = lexical_tokens("翠湖授信 Greenlake Credit CTL-4616 审批门槛")
+    assert "ctl-4616" in tokens
+    assert "greenlake" in tokens
+    assert "翠湖" in tokens
+    assert "授信" in tokens
+
+
+def test_postgres_document_text_persists_exact_business_identifiers() -> None:
+    index = SearchIndex(_postgres_settings(), engine=FakeEngine())
+    raw_text, lexical_text, exact_terms = index._document_text(
         {
-            "add": {
-                "index": "knowledge-chunks-model-1024-v1",
-                "alias": "knowledge-chunks-read",
-            }
-        },
+            "filename": "rule.md",
+            "title_path": "当前审批规则",
+            "content": "翠湖授信由 CTL-4616 管控，运行时是 CORE-6216。",
+        }
+    )
+    assert "翠湖授信" in raw_text
+    assert "翠湖" in lexical_text
+    assert exact_terms == ["core-6216", "ctl-4616"]
+
+
+def test_postgres_document_text_preserves_filename_and_title_weight() -> None:
+    index = SearchIndex(_postgres_settings(), engine=FakeEngine())
+    _, lexical_text, _ = index._document_text(
         {
-            "add": {
-                "index": "knowledge-chunks-model-1024-v1",
-                "alias": "knowledge-chunks-write",
-                "is_write_index": True,
-            }
-        },
-    ]
-
-
-def test_alias_response_accepts_mapping_wrapper_from_elasticsearch_client() -> None:
-    client = SimpleNamespace(
-        indices=SimpleNamespace(
-            get_alias=lambda *, name: UserDict(
-                {"physical-index": {"aliases": UserDict({name: {}})}}
-            )
-        )
+            "filename": "settlement.md",
+            "title_path": "Approval Policy",
+            "content": "queue timeout",
+        }
     )
-    settings = SimpleNamespace()
-    assert SearchIndex(settings, client=client)._alias_indexes("read-alias") == [
-        "physical-index"
-    ]
+    tokens = lexical_text.split()
+    assert tokens.count("settlement.md") == 4
+    assert tokens.count("approval") == 3
+    assert tokens.count("queue") == 1
 
 
-def test_alias_response_accepts_object_api_response_body() -> None:
-    response = SimpleNamespace(
-        body={"physical-index": {"aliases": {"read-alias": {}}}}
+def test_lexical_search_uses_safe_websearch_syntax_for_punctuated_ids() -> None:
+    engine = FakeEngine()
+    SearchIndex(_postgres_settings(), engine=engine).lexical_search(
+        "请查 CTL-4616 / API:v2", ["project-1"], ["approved"], 5
     )
-    client = SimpleNamespace(
-        indices=SimpleNamespace(get_alias=lambda *, name: response)
-    )
-    assert SearchIndex(SimpleNamespace(), client=client)._alias_indexes(
-        "read-alias"
-    ) == ["physical-index"]
+    sql, params = engine.connection.calls[-1]
+    assert "websearch_to_tsquery" in sql
+    assert "SELECT to_tsquery('simple'" not in sql
+    assert '"ctl-4616"' in params["ts_query"]
 
 
-def test_vector_search_uses_read_alias_and_pre_filters() -> None:
-    client = FakeSearchClient()
-    settings = SimpleNamespace(
-        search_index_name="knowledge-chunks-qwen3.7-text-embedding-1024-v1",
-        elasticsearch_read_alias="knowledge-chunks-read",
-        vector_num_candidates=400,
-        vector_min_similarity=0.25,
-    )
-
-    SearchIndex(settings, client=client).vector_search(
+def test_vector_search_uses_pgvector_and_pre_filters() -> None:
+    engine = FakeEngine()
+    SearchIndex(_postgres_settings(), engine=engine).vector_search(
         [0.1], ["project-1"], ["approved"], 5, ["group-1"]
     )
+    sql, params = engine.connection.calls[-1]
+    assert "s.embedding <=> CAST" in sql
+    assert "v.lifecycle_status = 'approved' AND v.is_current IS TRUE" in sql
+    assert "d.project_id IN" in sql
+    assert "document_acl" in sql
+    assert params["project_ids"] == ["project-1"]
+    assert params["principal_ids"] == ["group-1"]
+    assert params["minimum_similarity"] == 0.25
 
-    assert client.searched_index == settings.elasticsearch_read_alias
-    assert client.search_kwargs["knn"]["num_candidates"] == 400
-    assert client.search_kwargs["knn"]["similarity"] == 0.25
-    filters = client.search_kwargs["knn"]["filter"]["bool"]["filter"]
-    assert {"terms": {"project_id": ["project-1"]}} in filters
-    assert any("bool" in item for item in filters)
+
+def test_document_chunk_expansion_stays_inside_proven_documents() -> None:
+    engine = FakeEngine()
+    SearchIndex(_postgres_settings(), engine=engine).document_chunks(
+        ["doc-1", "doc-1", "doc-2"], ["project-1"], ["approved"], 50
+    )
+    sql, params = engine.connection.calls[-1]
+    assert "d.id IN" in sql
+    assert "d.project_id IN" in sql
+    assert params["document_ids"] == ["doc-1", "doc-2"]
+    assert params["project_ids"] == ["project-1"]
+    assert params["top_k"] == 50
 
 
 def test_exact_identifier_filter_keeps_complete_matching_identifier() -> None:

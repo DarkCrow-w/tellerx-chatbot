@@ -24,9 +24,8 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    # Create the immutable physical index and aliases before accepting traffic.
-    # Docker already waits for cluster health; any mapping incompatibility must
-    # fail startup rather than appearing later on the first upload.
+    # Migrations create the PostgreSQL FTS/pgvector storage. Verify extensions
+    # and indexes before accepting traffic so partial provisioning fails early.
     search_index().ensure_index()
     try:
         yield

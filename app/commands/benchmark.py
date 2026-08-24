@@ -657,8 +657,7 @@ def load_corpus(corpus_dir: Path, *, reset: bool, embedding: bool) -> dict[str, 
 
     with SessionLocal() as db:
         if reset:
-            if index.client.indices.exists(index=settings.search_index_name):
-                index.client.indices.delete(index=settings.search_index_name)
+            index.clear()
             for model in KNOWLEDGE_RESET_ORDER:
                 db.execute(delete(model))
             db.commit()
@@ -823,8 +822,7 @@ def load_via_production_pipeline_offline(corpus_dir: Path, *, reset: bool) -> di
     Base.metadata.create_all(engine)
     manifest = _read_jsonl(corpus_dir / "manifest.jsonl")
     if reset:
-        if index.client.indices.exists(index=settings.search_index_name):
-            index.client.indices.delete(index=settings.search_index_name)
+        index.clear()
         with SessionLocal() as db:
             for model in KNOWLEDGE_RESET_ORDER:
                 db.execute(delete(model))
@@ -1041,8 +1039,7 @@ def evaluate_api_smoke_offline(corpus_dir: Path) -> dict[str, Any]:
         finally:
             app.dependency_overrides.pop(get_settings, None)
 
-        if index.client.indices.exists(index=settings.search_index_name):
-            index.client.indices.delete(index=settings.search_index_name)
+        index.clear()
 
     document_ids = [item[1]["document_id"] for item in uploaded]
     version_ids = [item[1]["version_id"] for item in uploaded]
@@ -1124,8 +1121,7 @@ def index_existing(corpus_dir: Path, *, embedding: bool) -> dict[str, Any]:
                     item["embedding"] = vector
                     cache_file.write(json.dumps({"content_hash": content_hash, "embedding": vector}, separators=(",", ":")) + "\n")
                 cache_file.flush()
-    if index.client.indices.exists(index=settings.search_index_name):
-        index.client.indices.delete(index=settings.search_index_name)
+    index.clear()
     index.index_chunks(chunks_to_index, target_index=settings.search_index_name)
     index.activate_alias(settings.search_index_name)
     report = {
@@ -1174,13 +1170,12 @@ def index_offline_hybrid(corpus_dir: Path) -> dict[str, Any]:
                 "embedding": _offline_feature_vector(chunk.content),
             }
         )
-    if index.client.indices.exists(index=settings.search_index_name):
-        index.client.indices.delete(index=settings.search_index_name)
+    index.clear()
     index.index_chunks(documents, target_index=settings.search_index_name)
     index.activate_alias(settings.search_index_name)
     report = {
         "mode": "offline_feature_hash",
-        "disclaimer": "Validates Elasticsearch dense-vector mechanics; not Qwen embedding quality.",
+        "disclaimer": "Validates PostgreSQL pgvector mechanics; not Qwen embedding quality.",
         "chunks": len(documents),
         "dimensions": settings.qwen_embedding_dimensions,
         "elapsed_seconds": round(time.perf_counter() - started, 3),

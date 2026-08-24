@@ -1,4 +1,4 @@
-"""Transactional-outbox publisher and PostgreSQL/Elasticsearch reconciler."""
+"""Transactional PostgreSQL search-projection publisher and reconciler."""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ class IndexingService:
         if not generation:
             generation = IndexGeneration(
                 physical_index=physical,
-                schema_version=str(self.settings.elasticsearch_schema_version),
+                schema_version=str(self.settings.postgres_search_schema_version),
                 embedding_fingerprint=self.settings.embedding_fingerprint,
                 status="active",
                 activated_at=datetime.now(UTC),
@@ -262,7 +262,8 @@ class IndexingService:
         expected = len(documents)
         if actual != expected:
             raise RuntimeError(
-                f"Elasticsearch verification failed for {version.id}: expected={expected}, actual={actual}"
+                f"PostgreSQL search verification failed for {version.id}: "
+                f"expected={expected}, actual={actual}"
             )
 
         now = datetime.now(UTC)
@@ -392,7 +393,7 @@ class IndexingService:
                 sync.last_error = None
                 continue
             sync.status = "mismatch"
-            sync.last_error = "Elasticsearch count or record manifest differs from PostgreSQL"
+            sync.last_error = "PostgreSQL search row count or manifest differs from chunks"
             differences.append(
                 {
                     "version_id": version.id,

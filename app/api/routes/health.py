@@ -20,7 +20,7 @@ def live() -> dict:
 
 @router.get("/health/ready")
 def ready(db: Session = Depends(get_db)) -> dict:
-    """Fail readiness if PostgreSQL or required Elasticsearch aliases are unavailable."""
+    """Fail readiness unless PostgreSQL and its FTS/pgvector schema are available."""
 
     try:
         db.execute(text("SELECT 1"))
@@ -29,14 +29,9 @@ def ready(db: Session = Depends(get_db)) -> dict:
         database = False
 
     search_state = search_index().status()
-    elasticsearch = bool(
-        search_state.get("available")
-        and search_state.get("cluster_status") in {"green", "yellow"}
-        and search_state.get("read_alias")
-        and search_state.get("write_alias")
-    )
-    status = "ready" if database and elasticsearch else "not_ready"
-    payload = {"status": status, "database": database, "elasticsearch": elasticsearch}
+    search = bool(search_state.get("available") and search_state.get("table_ready"))
+    status = "ready" if database and search else "not_ready"
+    payload = {"status": status, "database": database, "search": search}
     if status != "ready":
         raise HTTPException(503, payload)
     return payload

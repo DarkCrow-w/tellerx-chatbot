@@ -61,7 +61,7 @@ def main() -> None:
 
 
 def reconcile_main() -> None:
-    parser = argparse.ArgumentParser(description="Compare PostgreSQL chunks with Elasticsearch")
+    parser = argparse.ArgumentParser(description="Verify PostgreSQL chunk search storage")
     parser.add_argument("--repair", action="store_true")
     args = parser.parse_args()
     with SessionLocal() as db:
