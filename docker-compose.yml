@@ -31,7 +31,9 @@ services:
       - elasticsearch-data:/usr/share/elasticsearch/data
 
   migrate:
-    build: .
+    build:
+      context: .
+      target: runtime
     env_file: .env
     command: ["alembic", "upgrade", "head"]
     depends_on:
@@ -39,7 +41,9 @@ services:
         condition: service_healthy
 
   api:
-    build: .
+    build:
+      context: .
+      target: runtime
     env_file: .env
     environment:
       QWEN_API_KEY_FILE: /run/secrets/qwen_api_key
@@ -57,7 +61,9 @@ services:
       - uploads:/data/knowledge
 
   worker:
-    build: .
+    build:
+      context: .
+      target: worker-runtime
     env_file: .env
     environment:
       QWEN_API_KEY_FILE: /run/secrets/qwen_api_key
@@ -73,7 +79,9 @@ services:
       - uploads:/data/knowledge
 
   indexer:
-    build: .
+    build:
+      context: .
+      target: runtime
     env_file: .env
     environment:
       QWEN_API_KEY_FILE: /run/secrets/qwen_api_key

@@ -2,8 +2,8 @@ import json
 
 import httpx
 
-from app.config import Settings
-from app.qwen import QwenClient, parse_json_object
+from app.core.config import Settings
+from app.integrations.qwen import QwenClient, parse_json_object
 
 
 def settings(tmp_path):

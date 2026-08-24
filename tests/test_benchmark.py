@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from app.benchmark import _offline_feature_vector, _retrieval_acceptance, generate_corpus
-from app.parsers import DocumentParser
+from app.commands.benchmark import _offline_feature_vector, _retrieval_acceptance, generate_corpus
+from app.knowledge.parsers import DocumentParser
 
 
 def test_generates_exact_document_count_and_ground_truth(tmp_path: Path) -> None:

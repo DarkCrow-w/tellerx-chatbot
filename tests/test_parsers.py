@@ -4,7 +4,7 @@ from docx import Document
 from openpyxl import Workbook
 from reportlab.pdfgen.canvas import Canvas
 
-from app.parsers import DocumentParser
+from app.knowledge.parsers import DocumentParser
 
 
 def test_docx_native_preserves_headings_and_tables(tmp_path: Path) -> None:

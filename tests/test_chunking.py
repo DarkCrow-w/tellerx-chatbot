@@ -1,4 +1,4 @@
-from app.chunking import ParsedUnit, chunk_units, estimate_tokens
+from app.knowledge.chunking import ParsedUnit, chunk_units, estimate_tokens
 
 
 def test_estimate_tokens_handles_mixed_language() -> None:
@@ -29,4 +29,3 @@ def test_long_text_is_split_below_limit() -> None:
     chunks = chunk_units([ParsedUnit(text=text)], max_tokens=100, overlap_tokens=10)
     assert len(chunks) > 1
     assert all(chunk.token_count <= 100 for chunk in chunks)
-

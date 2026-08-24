@@ -6,10 +6,9 @@ from types import SimpleNamespace
 from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import Session
 
-from app.config import Settings
+from app.core.config import Settings
 from app.db import Base
-from app.ingestion import IngestionService
-from app.models import (
+from app.db.models import (
     Chunk,
     Document,
     DocumentArtifact,
@@ -19,7 +18,8 @@ from app.models import (
     OutboxEvent,
     Project,
 )
-from app.parsers import DocumentParser
+from app.knowledge.parsers import DocumentParser
+from app.services.ingestion import IngestionService
 
 
 class CountingQwen:

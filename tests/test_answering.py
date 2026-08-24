@@ -4,11 +4,12 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from app.answering import AnswerService, AnswerValidationError, validate_answer
 from app.db import Base
-from app.model_router import NoModelAvailable
-from app.models import Chunk, Document, DocumentVersion, Project
-from app.search import Evidence
+from app.db.models import Chunk, Document, DocumentVersion, Project
+from app.integrations.qwen import ChatCallResult, Usage
+from app.knowledge.evidence import Evidence
+from app.services.answering import AnswerService, AnswerValidationError, validate_answer
+from app.services.model_router import NoModelAvailable
 
 
 def evidence() -> list[Evidence]:
@@ -158,3 +159,60 @@ def test_chat_api_strictly_abstains_when_all_qwen_models_are_unavailable() -> No
     assert response.claims == []
     assert response.sources == []
     assert "provider unavailable" not in response.answer
+    assert "生成模型当前不可用" in response.answer
+
+
+def test_complex_answer_degrades_to_plus_when_max_tier_is_unavailable() -> None:
+    """Provider entitlement failures must not make grounded answers unusable."""
+
+    class FakeRetriever:
+        def search(self, question: str, project_ids: list[str]) -> list[Evidence]:
+            return evidence()
+
+    class MaxUnavailableRouter:
+        def __init__(self) -> None:
+            self.tiers: list[str] = []
+
+        def call(self, *args: object, **kwargs: object) -> ChatCallResult:
+            tier = str(kwargs["tier"])
+            self.tiers.append(tier)
+            if tier == "max":
+                raise NoModelAvailable("max entitlement unavailable")
+            return ChatCallResult(
+                model_id="plus-fallback",
+                request_id="request-1",
+                content=(
+                    '{"status":"answered","answer":"ignored",'
+                    '"claims":[{"text":"订单取消需要主管审批。",'
+                    '"evidence":[{"id":"chunk-1",'
+                    '"quote":"订单取消必须由主管审批。"}]}]}'
+                ),
+                usage=Usage(),
+                latency_ms=1,
+            )
+
+    router = MaxUnavailableRouter()
+    service = AnswerService(
+        SimpleNamespace(
+            prompt_version="test-v1",
+            validate_citations_against_database=False,
+        ),
+        FakeRetriever(),  # type: ignore[arg-type]
+        router,  # type: ignore[arg-type]
+    )
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        response = service.answer(
+            db,
+            question="请比较订单取消规则。",
+            project_ids=[],
+            conversation_id=None,
+            pinned_model=None,
+        )
+
+    assert router.tiers == ["max", "plus"]
+    assert response.status == "answered"
+    assert response.model_id == "plus-fallback"
+    assert response.route_tier == "plus"
+    assert response.sources[0].chunk_id == "chunk-1"

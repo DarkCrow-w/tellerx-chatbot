@@ -1,5 +1,5 @@
-from app.cli import _safe_error
-from app.qwen import QwenAPIError
+from app.commands.cli import _safe_error
+from app.integrations.qwen import QwenAPIError
 
 
 def test_safe_error_contains_status_and_code_but_not_message() -> None:

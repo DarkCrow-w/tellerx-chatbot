@@ -27,7 +27,10 @@ TellerX 将业务文档解析、切块并写入 PostgreSQL 和 Elasticsearch，�
 - 在线同步 Microsoft 365、OneNote 或 Confluence
 - 自动执行排障操作的 Agent
 
-`.doc` 和 `.xls` 会通过 LibreOffice 转换；Docker 镜像已包含 LibreOffice。`.xlsm` 只读取内容，不执行宏。DOCX、Excel、HTML、Markdown 和文本型 PDF 使用确定性原生解析器，不安装 Docling 的本地 OCR/视觉模型、PyTorch 或 CUDA 运行时。
+`.doc` 和 `.xls` 会通过 LibreOffice 转换；只有 Docker 的解析 Worker 镜像包含
+LibreOffice Writer/Calc，API、Indexer 和迁移镜像不携带该大型依赖。`.xlsm` 只读取内容，
+不执行宏。DOCX、Excel、HTML、Markdown 和文本型 PDF 使用确定性原生解析器，不安装
+Docling 的本地 OCR/视觉模型、PyTorch 或 CUDA 运行时。
 
 ## 2. 系统架构与处理流程
 
@@ -76,28 +79,17 @@ flowchart LR
 TellerxChatBot/
 ├── app/                         Python 后端
 │   ├── main.py                  FastAPI 入口、CORS、静态页面
-│   ├── api.py                   HTTP API 和健康检查
-│   ├── schemas.py               API 请求/响应模型
-│   ├── config.py                环境变量和默认配置
-│   ├── db.py                    SQLAlchemy 引擎与会话
-│   ├── models.py                PostgreSQL 数据模型
-│   ├── storage.py               原文件存储、大小限制、SHA-256
-│   ├── parsers.py               Word/Excel/PDF/HTML 等解析
-│   ├── chunking.py              文本和表格切块
-│   ├── ingestion.py             导入状态机、持久向量缓存与事务 outbox
-│   ├── worker.py                后台解析与切块 Worker
-│   ├── indexing.py              Elasticsearch 发布、版本切换与 manifest 对账
-│   ├── indexer.py               单实例 outbox 消费与对账 CLI
-│   ├── search.py                BM25、向量、RRF、Rerank
-│   ├── answering.py             证据编排、回答和引用校验
-│   ├── model_router.py          Plus/Max 路由和额度统计
-│   ├── qwen.py                  Qwen API 客户端
-│   ├── dependencies.py          服务实例装配
-│   ├── cli.py                   诊断和业务评测命令
-│   ├── reindex.py               全量重新生成向量索引
-│   ├── benchmark.py             千文档基准工具
+│   ├── api/                     HTTP 路由和接口适配器
+│   ├── contracts/               请求、响应和应用 DTO
+│   ├── services/                问答、入库、索引和模型路由用例
+│   ├── knowledge/               解析、切块和证据值对象
+│   ├── integrations/            Qwen、Elasticsearch 和对象存储
+│   ├── db/                      SQLAlchemy 会话与 PostgreSQL 模型
+│   ├── core/                    配置和 ApplicationContainer 组合根
+│   ├── jobs/                    后台解析 Worker 与索引 Worker
+│   ├── commands/                诊断、评测、Reindex 和 Benchmark
 │   └── static/                  Vite 构建后的前端资源
-├── frontend/                    React 前端源码
+├── frontend/                    React 前端源码（API、状态、组件、存储分层）
 ├── alembic/                     数据库迁移
 ├── config/models.yaml           生成模型注册表和额度
 ├── docs/                        设计、测试和使用文档
@@ -120,20 +112,21 @@ TellerxChatBot/
 - 提供 `/static` 静态资源和生产页面 `/`。
 - 配置允许来源；生产 UI 与 API 默认同源。
 
-`app/api.py`
+`app/api/router.py` 与 `app/api/routes/`
 
-- 处理文档上传、任务查询、问答、来源查看、下载、软删除和反馈。
+- `router.py` 只组合路由；具体接口按 documents、chat、operations、health 分组。
+- HTTP 层处理参数、状态码和响应模型，不实现检索和模型调用算法。
 - 上传只负责保存文件和创建任务，耗时解析由 Worker 完成。
 - Qwen 付费诊断故意不通过 HTTP 开放，只允许本地 CLI 显式执行。
 
-`app/parsers.py` 与 `app/chunking.py`
+`app/knowledge/parsers.py` 与 `app/knowledge/chunking.py`
 
 - DOCX 使用 python-docx，HTML 使用 BeautifulSoup，Markdown 使用标题分段器。
 - 文本型 PDF 直接使用 pypdf，当前不安装或执行 OCR/视觉模型。
 - Excel 使用 openpyxl，保留工作表、表头、公式/缓存值和单元格坐标。
 - 普通文本带少量重叠；表格按逻辑行切分并重复表头。
 
-`app/ingestion.py` 与 `app/worker.py`
+`app/services/ingestion.py` 与 `app/jobs/ingestion_worker.py`
 
 - Worker 使用 `FOR UPDATE SKIP LOCKED` 并发安全领取任务，无需 Redis 或 Kafka。
 - Worker 只提交 PostgreSQL Chunk、向量清单和 Outbox，不直接发布搜索索引；单实例
@@ -142,24 +135,31 @@ TellerxChatBot/
 - 阶段包括 `starting`、`parsing`、`embedding`、`indexing`、`complete` 和 `failed`。
 - `ALLOW_BM25_ONLY=true` 时，Embedding 不可用仍可创建纯文本索引，但这不代表正式混合检索验收通过。
 
-`app/search.py`
+`app/services/retrieval.py` 与 `app/integrations/search.py`
 
+- `retrieval.py` 负责混合召回、RRF、标识符覆盖和 Rerank 排序策略。
+- `search.py` 只负责 Elasticsearch 映射、BM25/Vector 查询和索引读写。
 - 默认 BM25 与向量各召回 50 个块。
 - RRF 融合后将最多 30 个候选发送给 `qwen3-rerank`。
 - 默认选出 8 个证据块，并保留精确编号、缩写和中英文实体覆盖。
 - 优先检索 `approved`；证据过少时可补充并标记 `draft`；默认排除 `deprecated`。
 
-`app/answering.py` 与 `app/model_router.py`
+`app/services/answer_contract.py`、`app/services/answering.py` 与
+`app/services/model_router.py`
 
-- 单文档直接查询优先 Plus；跨文档、比较、冲突等复杂问题使用 Max。
+- Prompt 构造、证据预算和引用校验是无数据库/网络副作用的独立安全契约。
+- 单文档直接查询优先 Plus；跨文档、比较、冲突等复杂问题优先 Max。
+- 所有 Max 因额度、权限或服务故障不可用时，普通交互可受控降级到一次 Plus；响应中的
+  `route_tier` 和 `model_id` 始终显示实际选择。固定模型评测绝不跨模型或跨档位降级。
 - 固定模型评测时禁用自动切换。
 - 每项结论必须提供有效 chunk ID 和可在知识块中找到的原文短句。
 - 生成模型使用量、耗时、结果、Prompt 版本记录在 `model_usage`。
 - 本地估算使用量达到 90% 后，不再向该模型分配普通新请求。
 
-`app/qwen.py`
+`app/integrations/qwen.py`
 
 - 从文件读取 API Key，不从源码读取。
+- 使用进程级 HTTP 连接池，并在 API、Worker、Indexer 优雅退出时显式关闭。
 - Chat 使用兼容模式接口；Embedding 和 Rerank 使用百炼接口。
 - 对连接错误和部分临时 HTTP 状态做有限重试，不无限消耗额度。
 - 错误信息只暴露安全元数据，不打印 token 或完整供应商响应正文。
@@ -174,6 +174,9 @@ TellerxChatBot/
 PostgreSQL 和原始文件是事实来源，Elasticsearch 是派生索引。浏览器历史并不是服务端对话的完整管理界面，换浏览器后不会自动显示旧历史。
 
 ### 3.3 前端当前功能与边界
+
+前端源码按职责拆分为 `api.js`、`storage.js`、`components.jsx`、`App.jsx` 和最小
+`main.jsx`；UI 组件不直接发起 HTTP 请求。
 
 React 页面目前提供：
 
@@ -1057,13 +1060,15 @@ curl -sS http://localhost:8000/api/v1/models/usage
 - 400 且错误码为账户欠费/额度状态：到百炼控制台处理账户，而不是更换或打印 token。
 - 429：等待限流窗口，不要手工无限循环重试。
 - 模型参数错误：确认模型 ID、区域和账户权限，再决定是否在 `config/models.yaml` 启用。
-- Chat 不可用时系统应严格拒答；BM25-only 只解决检索降级，不能代替生成回答验收。
+- Chat 不可用时，复杂问题会先尝试受控 Plus 降级；若生成模型池仍不可用则严格拒答。
+  BM25-only 只解决检索降级，不能代替生成回答验收。
 
 ### 15.6 文档解析失败
 
 - 原生 `.one`：先从 OneNote 导出 DOCX、PDF 或 HTML。
 - 扫描 PDF：当前无 OCR，先使用受控 OCR 工具生成文本型 PDF。
-- `.doc`/`.xls`：确认在 Docker 内运行，镜像包含 LibreOffice。
+- `.doc`/`.xls`：确认解析任务由 Docker `worker` 执行；只有 `worker-runtime` 镜像包含
+  LibreOffice Writer/Calc。
 - 加密文件：先在合规环境解密为允许格式。
 - Excel 宏：不会执行，业务结果如果依赖运行宏，应先保存已计算值。
 

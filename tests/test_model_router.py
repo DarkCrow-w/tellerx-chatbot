@@ -4,9 +4,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.db import Base
-from app.model_router import ModelRegistry, NoModelAvailable, QwenModelRouter, route_tier
-from app.models import ModelUsage
-from app.qwen import QwenAPIError
+from app.db.models import ModelUsage
+from app.integrations.qwen import QwenAPIError
+from app.services.model_router import ModelRegistry, NoModelAvailable, QwenModelRouter, route_tier
 
 
 def test_deterministic_tier_routing() -> None:

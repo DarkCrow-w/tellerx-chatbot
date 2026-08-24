@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from app.storage import LocalObjectStorage
+from app.integrations.storage import LocalObjectStorage
 
 
 def test_vector_round_trip_and_checksum(tmp_path: Path) -> None:

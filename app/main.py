@@ -10,9 +10,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api import health_router, router
-from app.config import get_settings
-from app.dependencies import search_index
+from app.api.router import health_router, router
+from app.core.config import get_settings
+from app.core.container import application_container, search_index
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,7 +28,11 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # Docker already waits for cluster health; any mapping incompatibility must
     # fail startup rather than appearing later on the first upload.
     search_index().ensure_index()
-    yield
+    try:
+        yield
+    finally:
+        # Flush connection pools during SIGTERM-driven rolling deployments.
+        application_container().close()
 
 
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)

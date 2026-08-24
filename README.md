@@ -21,6 +21,8 @@ docker compose exec api knowledge-reindex
 
 完整文档：
 
+- [生产代码重构与 100 文档回归报告](docs/production-refactoring-regression-report.md)
+- [生产代码架构与维护约定](docs/production-code-architecture.md)
 - [使用、开发与运维手册](docs/usage-and-operations-guide.md)
 - [PostgreSQL + Elasticsearch 目标架构设计](docs/postgresql-elasticsearch-knowledge-base-design.md)
 - [Elasticsearch 实施与在线回测报告](docs/elasticsearch-implementation-and-regression-report.md)
@@ -90,6 +92,8 @@ docker compose run --rm api qwen-diagnostics
 - `qwen3.7-max`
 
 `qwen3.7-max-2026-05-17` 和 `qwen3.7-max-preview` 当前返回模型参数错误，已在注册表中保留但禁用。
+复杂问题优先 Max；若全部 Max 临时不可用，非固定评测请求会执行一次有完整证据约束的
+Plus 降级，响应会显示实际模型和档位。固定模型评测不会自动切换。
 
 2026-08-13 已重新验证 Chat、Embedding 和 Rerank 全部成功，并完成真实 Elasticsearch +
 Qwen 千文档混合检索以及 Plus/Max 固定快照回答回归。精确结果见实施与在线回测报告。

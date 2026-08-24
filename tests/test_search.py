@@ -1,7 +1,8 @@
 from collections import UserDict
 from types import SimpleNamespace
 
-from app.search import Retriever, SearchIndex, _lexical_signals
+from app.integrations.search import SearchIndex, _lexical_signals
+from app.services.retrieval import Retriever
 
 
 class FakeIndices:
