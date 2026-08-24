@@ -2,8 +2,19 @@ from pathlib import Path
 
 import pytest
 
-from app.benchmark import _offline_feature_vector, _retrieval_acceptance, generate_corpus
+from app.benchmark import (
+    _answer_contains,
+    _offline_feature_vector,
+    _retrieval_acceptance,
+    generate_corpus,
+)
 from app.parsers import DocumentParser
+
+
+def test_answer_content_matching_ignores_numeric_thousands_separators() -> None:
+    assert _answer_contains("门槛为 527,400 CNY", "527400")
+    assert _answer_contains("编号 E-7101", "E-7101")
+    assert not _answer_contains("门槛为 527,401 CNY", "527400")
 
 
 def test_generates_exact_document_count_and_ground_truth(tmp_path: Path) -> None:

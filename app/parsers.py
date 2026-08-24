@@ -29,7 +29,7 @@ class EmptyDocument(ValueError):
 
 
 class DocumentParser:
-    revision: ClassVar[str] = "v2"
+    revision: ClassVar[str] = "v3"
     allowed_suffixes: ClassVar[set[str]] = {
         ".docx",
         ".doc",
@@ -186,7 +186,12 @@ class DocumentParser:
                 units.append(ParsedUnit(text=html.unescape(text), heading_path=" > ".join(headings)))
             buffer.clear()
 
-        for element in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "table"]):
+        for element in soup.find_all(
+            [
+                "h1", "h2", "h3", "h4", "h5", "h6",
+                "p", "li", "dt", "dd", "aside", "pre", "blockquote", "table",
+            ]
+        ):
             if element.name.startswith("h"):
                 flush()
                 level = int(element.name[1])

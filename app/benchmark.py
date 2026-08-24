@@ -1201,6 +1201,17 @@ def _latency_stats(values: list[float]) -> dict[str, float]:
     }
 
 
+def _answer_contains(answer: str, expected: object) -> bool:
+    """Compare answer facts while ignoring numeric thousands separators."""
+    haystack = answer.casefold()
+    needle = str(expected).casefold()
+    if needle in haystack:
+        return True
+    compact_haystack = re.sub(r"(?<=\d)[,_\s](?=\d)", "", haystack)
+    compact_needle = re.sub(r"(?<=\d)[,_\s](?=\d)", "", needle)
+    return compact_needle in compact_haystack
+
+
 def _retrieval_acceptance(report: dict[str, Any]) -> dict[str, Any]:
     checks = {
         "recall_at_10_gte_90pct": report["recall_at_10"] >= 0.90,
@@ -1211,6 +1222,10 @@ def _retrieval_acceptance(report: dict[str, Any]) -> dict[str, Any]:
         "excel_location_gte_90pct": (
             report["excel_location_accuracy"] is None
             or report["excel_location_accuracy"] >= 0.90
+        ),
+        "answer_fact_coverage_gte_95pct": (
+            report.get("answer_fact_coverage") is None
+            or report["answer_fact_coverage"] >= 0.95
         ),
         "local_p95_lte_2000ms": report["latency_ms"]["p95"] <= 2000,
     }
@@ -1269,6 +1284,8 @@ def evaluate_retrieval(
     approved_precedence_pass = 0
     location_total = 0
     location_pass = 0
+    fact_coverage_total = 0
+    fact_coverage_pass = 0
     for position, row in enumerate(questions, start=1):
         started = time.perf_counter()
         evidence = retriever.search(row["question"], [])
@@ -1295,13 +1312,23 @@ def evaluate_retrieval(
             approved_precedence_total += 1
             first_expected = next(item for item in evidence if item.filename == expected)
             approved_precedence_pass += first_expected.version_label == row["expected_version_label"]
-        if row.get("expected_sheet") and any(item.filename == expected for item in evidence):
+        if row.get("expected_sheet"):
             location_total += 1
-            first_expected = next(item for item in evidence if item.filename == expected)
-            location_pass += (
-                first_expected.sheet_name == row["expected_sheet"]
-                and first_expected.cell_range == row["expected_cell_range"]
+            location_pass += any(
+                item.filename in expected_filenames
+                and item.sheet_name == row["expected_sheet"]
+                and item.cell_range == row["expected_cell_range"]
+                for item in evidence
             )
+        facts_covered = None
+        if row["expected_status"] == "answered":
+            fact_coverage_total += 1
+            evidence_text = "\n".join(item.content for item in evidence)
+            facts_covered = all(
+                _answer_contains(evidence_text, value)
+                for value in row.get("answer_contains", [])
+            )
+            fact_coverage_pass += facts_covered
         outcomes.append(
             {
                 "id": row["id"],
@@ -1309,6 +1336,7 @@ def evaluate_retrieval(
                 "expected_filename": expected,
                 "rank": rank,
                 "returned": filenames,
+                "facts_covered": facts_covered,
                 "latency_ms": round(latency, 3),
             }
         )
@@ -1339,6 +1367,9 @@ def evaluate_retrieval(
         "unanswerable_abstention_rate": round(correct_abstentions / missing_count, 4) if missing_count else None,
         "approved_precedence_rate": round(approved_precedence_pass / approved_precedence_total, 4) if approved_precedence_total else None,
         "excel_location_accuracy": round(location_pass / location_total, 4) if location_total else None,
+        "answer_fact_coverage": round(fact_coverage_pass / fact_coverage_total, 4)
+        if fact_coverage_total
+        else None,
         "latency_ms": _latency_stats(latencies),
         "by_kind": {
             kind: {
@@ -1347,7 +1378,12 @@ def evaluate_retrieval(
             }
             for kind, rows in by_kind.items()
         },
-        "failures": [row for row in outcomes if row["expected_filename"] and row["rank"] is None],
+        "failures": [
+            row
+            for row in outcomes
+            if (row["expected_filename"] and row["rank"] is None)
+            or row["facts_covered"] is False
+        ],
     }
     report["acceptance"] = _retrieval_acceptance(report)
     suffix = f"retrieval-v{'1' if use_vector else '0'}-r{'1' if use_rerank else '0'}"
@@ -1492,7 +1528,9 @@ def evaluate_answers(corpus_dir: Path, *, limit: int, model: str) -> dict[str, A
                 if expected_filenames
                 else not response.sources and not response.claims
             )
-            content_ok = all(value.casefold() in response.answer.casefold() for value in row["answer_contains"])
+            content_ok = all(
+                _answer_contains(response.answer, value) for value in row["answer_contains"]
+            )
             status_correct += status_ok
             citation_correct += citations_ok
             content_correct += content_ok
@@ -1506,6 +1544,7 @@ def evaluate_answers(corpus_dir: Path, *, limit: int, model: str) -> dict[str, A
                     "citation_correct": citations_ok,
                     "content_correct": content_ok,
                     "answer": response.answer,
+                    "source_filenames": sorted(source_filenames),
                     "model": response.model_id,
                     "latency_ms": round(latency, 3),
                 }
@@ -1578,8 +1617,7 @@ def evaluate_offline_answer_pipeline(corpus_dir: Path) -> dict[str, Any]:
                 citation_ok = not response.sources and not response.claims
                 lifecycle_ok = not response.sources
             content_ok = all(
-                str(value).casefold() in response.answer.casefold()
-                for value in row["answer_contains"]
+                _answer_contains(response.answer, value) for value in row["answer_contains"]
             )
             status_pass += status_ok
             citation_pass += citation_ok

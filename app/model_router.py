@@ -154,6 +154,7 @@ class QwenModelRouter:
         user_prompt: str,
         pinned_model: str | None = None,
         prompt_version: str | None = None,
+        max_tokens: int | None = None,
     ) -> ChatCallResult:
         if pinned_model:
             configured = self.registry.by_id(pinned_model)
@@ -173,6 +174,7 @@ class QwenModelRouter:
                     model_id=model.id,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
+                    **({"max_tokens": max_tokens} if max_tokens is not None else {}),
                 )
                 self._record(
                     db,

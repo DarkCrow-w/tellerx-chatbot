@@ -8,6 +8,7 @@ from app.indexing import IndexingService
 from app.ingestion import IngestionService
 from app.model_router import ModelRegistry, QwenModelRouter
 from app.parsers import DocumentParser
+from app.query_understanding import QueryUnderstandingService
 from app.qwen import QwenClient
 from app.search import Retriever, SearchIndex
 
@@ -44,8 +45,18 @@ def retriever() -> Retriever:
 
 
 @lru_cache
+def query_understanding() -> QueryUnderstandingService:
+    return QueryUnderstandingService(get_settings(), model_router())
+
+
+@lru_cache
 def answer_service() -> AnswerService:
-    return AnswerService(get_settings(), retriever(), model_router())
+    return AnswerService(
+        get_settings(),
+        retriever(),
+        model_router(),
+        query_understanding(),
+    )
 
 
 @lru_cache

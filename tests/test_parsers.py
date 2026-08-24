@@ -63,3 +63,18 @@ def test_pdf_parser_does_not_join_unrelated_ascii_lines(tmp_path: Path) -> None:
 
     units, _ = DocumentParser(backend="native").parse(path)
     assert "requirementThe" not in units[0].text
+
+
+def test_html_parser_preserves_definition_lists_and_asides(tmp_path: Path) -> None:
+    path = tmp_path / "api.html"
+    path.write_text(
+        "<h1>Routing API</h1><dl><dt>Endpoint</dt>"
+        "<dd>POST /api/v2/authorize</dd><dt>Rejection</dt><dd>E-7101</dd></dl>"
+        "<aside>Use the approved policy matrix.</aside>",
+        encoding="utf-8",
+    )
+    units, _ = DocumentParser(backend="native").parse(path)
+    text = "\n".join(unit.text for unit in units)
+    assert "POST /api/v2/authorize" in text
+    assert "E-7101" in text
+    assert "Use the approved policy matrix" in text

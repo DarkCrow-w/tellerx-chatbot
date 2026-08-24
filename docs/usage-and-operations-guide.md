@@ -525,6 +525,9 @@ curl -sS -X POST 'http://localhost:8000/api/v1/chat' \
 
 普通交互不建议固定模型，让路由器根据证据复杂度和额度选择。
 
+自然语言问法的主题抽取、聚焦检索、追踪与排障方式详见
+[多种问题表述识别机制](query-phrasing-handling.md)。
+
 ### 7.4 删除文档
 
 ```bash

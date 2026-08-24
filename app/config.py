@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     vector_min_similarity: float | None = 0.25
     query_embedding_cache_size: int = 500
     query_embedding_cache_ttl_seconds: int = 3600
+    semantic_query_understanding_enabled: bool = True
+    query_plan_cache_size: int = 500
+    query_plan_cache_ttl_seconds: int = 3600
     prompt_version: str = "grounded-qa-v1"
     validate_citations_against_database: bool = True
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:8000"])
