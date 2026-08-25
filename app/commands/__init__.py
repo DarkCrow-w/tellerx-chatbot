@@ -1,1 +1,1 @@
-"""Operator-facing diagnostics, maintenance, and benchmark commands."""
+"""Production-facing diagnostics and maintenance commands."""

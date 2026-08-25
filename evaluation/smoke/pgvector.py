@@ -165,9 +165,7 @@ def main() -> None:
                     str(hit.get("_source", {}).get("project_id")) == project_ids[1]
                     for hit in wrong_project
                 )
-                and chunk_ids[0] not in {
-                    str(hit.get("_id")) for hit in wrong_project
-                }
+                and chunk_ids[0] not in {str(hit.get("_id")) for hit in wrong_project}
             ),
             "version_count": index.count_version(version_ids[0]) == 1,
             "status_ready": bool(index.status().get("available")),

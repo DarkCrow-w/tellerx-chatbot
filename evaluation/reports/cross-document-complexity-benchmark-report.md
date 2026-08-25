@@ -95,13 +95,13 @@ PostgreSQL 保存原始事实、版本、生命周期和块内容；Elasticsearc
 生成语料：
 
 ```bash
-node scripts/generate-crossdoc-corpus.mjs --force
+node evaluation/scripts/generate-crossdoc-corpus.mjs --force
 ```
 
 通过公开 API 上传：
 
 ```bash
-python scripts/upload-evaluation-corpus.py \
+python evaluation/scripts/upload_evaluation_corpus.py \
   evaluation/generated/crossdoc-20 \
   --base-url http://localhost:8000
 ```
@@ -109,13 +109,13 @@ python scripts/upload-evaluation-corpus.py \
 运行全部检索问题：
 
 ```bash
-knowledge-benchmark retrieve evaluation/generated/crossdoc-20
+python -m evaluation.benchmark.cli retrieve evaluation/generated/crossdoc-20
 ```
 
 运行端到端回答样本：
 
 ```bash
-knowledge-benchmark answers evaluation/generated/crossdoc-20 \
+python -m evaluation.benchmark.cli answers evaluation/generated/crossdoc-20 \
   --limit 30 \
   --model qwen3.7-plus-2026-05-26
 ```

@@ -51,7 +51,9 @@ async def upload_one(
 
 
 async def main() -> None:
-    parser = argparse.ArgumentParser(description="Upload a benchmark manifest through the public document API")
+    parser = argparse.ArgumentParser(
+        description="Upload a benchmark manifest through the public document API"
+    )
     parser.add_argument("corpus", type=Path)
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument("--concurrency", type=int, default=8)
@@ -97,7 +99,9 @@ async def main() -> None:
                 if job["status"] in {"succeeded", "failed"}:
                     statuses[job["status"]] = statuses.get(job["status"], 0) + 1
                     if job["status"] == "failed":
-                        raise RuntimeError(f"Ingestion failed for {row['filename']}: {job.get('error_message')}")
+                        raise RuntimeError(
+                            f"Ingestion failed for {row['filename']}: {job.get('error_message')}"
+                        )
                     completed.append(job_id)
             for job_id in completed:
                 pending.pop(job_id, None)
@@ -113,7 +117,9 @@ async def main() -> None:
         "formats": args.formats or ["all"],
     }
     report_path = args.corpus / "upload-report.json"
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    report_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 

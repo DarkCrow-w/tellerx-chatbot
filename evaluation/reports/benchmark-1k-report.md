@@ -76,7 +76,7 @@ Recall@5 均为 100%。这是合成基准，不替代业务人员对 50–100 �
 
 ### 离线答案编排验证
 
-`knowledge-benchmark answers-offline` 使用确定性、禁止联网的证据响应器，仍经过正式
+`python -m evaluation.benchmark.cli answers-offline` 使用确定性、禁止联网的证据响应器，仍经过正式
 `AnswerService` 的检索、Plus/Max 规则路由、JSON 解析、引用 ID 校验、原文连续短句校验、
 状态治理、消息持久化和严格拒答代码。它验证系统编排，不评价 Qwen 的语言能力。
 
@@ -96,7 +96,7 @@ Recall@5 均为 100%。这是合成基准，不替代业务人员对 50–100 �
 
 ### 离线混合检索机械验证
 
-`knowledge-benchmark hybrid-offline` 为 2550 个块生成确定性的 1024 维特征哈希向量，
+`python -m evaluation.benchmark.cli hybrid-offline` 为 2550 个块生成确定性的 1024 维特征哈希向量，
 实际经过 OpenSearch k-NN、BM25、RRF 和本地二次排序。该模式只验证向量索引与混合编排，
 不能代替 Qwen Embedding/Rerank 的语义质量验收。
 
@@ -174,8 +174,8 @@ qwen-diagnostics
 然后建立真实 Qwen 向量索引并跑完整混合召回：
 
 ```bash
-knowledge-benchmark index-existing evaluation/generated/benchmark-1k
-knowledge-benchmark retrieve evaluation/generated/benchmark-1k
+python -m evaluation.benchmark.cli index-existing evaluation/generated/benchmark-1k
+python -m evaluation.benchmark.cli retrieve evaluation/generated/benchmark-1k
 ```
 
 混合检索必须维持 Recall@10 ≥ 90%、不可回答拒答率 ≥ 90%、Excel 定位 ≥ 90%。
@@ -184,9 +184,9 @@ Embedding 按内容 hash 持久缓存，若中途失败可断点续传，避免�
 最后分别固定 Plus 与 Max 快照进行答案验证：
 
 ```bash
-knowledge-benchmark answers evaluation/generated/benchmark-1k \
+python -m evaluation.benchmark.cli answers evaluation/generated/benchmark-1k \
   --limit 20 --model qwen3.7-plus-2026-05-26
-knowledge-benchmark answers evaluation/generated/benchmark-1k \
+python -m evaluation.benchmark.cli answers evaluation/generated/benchmark-1k \
   --limit 20 --model qwen3.7-max-2026-05-20
 ```
 
@@ -196,7 +196,7 @@ knowledge-benchmark answers evaluation/generated/benchmark-1k \
 上述步骤可合并为一条安全恢复命令；它会在诊断失败时立即停止：
 
 ```bash
-scripts/run-qwen-1k-gate.sh evaluation/generated/benchmark-1k
+evaluation/scripts/run-qwen-1k-gate.sh evaluation/generated/benchmark-1k
 ```
 
 ## 7. 原始结果

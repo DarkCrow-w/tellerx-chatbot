@@ -66,13 +66,27 @@ app/
 │   ├── config.py               配置与生产安全约束
 │   └── container.py            ApplicationContainer 组合根
 ├── jobs/                        Ingestion Worker 与 Indexer
-├── commands/                    CLI、Reindex 与 Benchmark
+├── commands/
+│   ├── diagnostics.py          Qwen 连接诊断
+│   └── reindex.py              检索投影重建与切换
 └── main.py                      ASGI 启动与资源释放
 ```
 
 `app/` 根目录只允许保留 `main.py` 和包声明。新增实现必须进入职责明确的子包。
-`app/commands/benchmark.py` 是评测工具，不参与在线请求；生产模块不能反向导入
+评测、Benchmark 和 Smoke 工具统一位于顶层 `evaluation/`，不进入生产镜像。依赖方向只能是
+`evaluation -> app`；`app` 不得导入 `evaluation` 或 `tests`。生产模块也不能反向导入
 `commands` 或 `jobs`。
+
+## 2.1 质量保障目录
+
+```text
+evaluation/
+├── benchmark/                  合成语料、离线替身、加载和评测
+├── datasets/                   固定业务题集与语义理解用例
+├── smoke/                      PostgreSQL FTS 与 pgvector 验证
+├── scripts/                    语料生成和一键质量门禁
+└── reports/                    历史验证结果
+```
 
 ## 3. 前端目录
 
@@ -137,7 +151,7 @@ frontend/src/
 ## 8. 必须通过的提交门禁
 
 ```bash
-.venv/bin/ruff check app tests
+.venv/bin/ruff check app evaluation tests
 .venv/bin/pytest -q
 npm run build
 docker compose config --quiet

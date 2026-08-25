@@ -228,9 +228,9 @@ Elasticsearch 和 Qwen Embedding：
 - `evaluation/generated/benchmark-1k/answer-report-qwen3.7-plus-2026-05-26.json`
 - `evaluation/generated/benchmark-1k/answer-report-qwen3.7-max-2026-05-20.json`
 
-常用复现命令见[使用、开发与运维手册](usage-and-operations-guide.md)。系统的数据模型、索引
+常用复现命令见[使用、开发与运维手册](../../docs/usage-and-operations-guide.md)。系统的数据模型、索引
 Mapping、同步协议、检索策略、备份恢复和容量规划见
-[PostgreSQL + Elasticsearch 知识库设计](postgresql-elasticsearch-knowledge-base-design.md)。
+[PostgreSQL + Elasticsearch 知识库设计](../../docs/postgresql-elasticsearch-knowledge-base-design.md)。
 
 ## 10. 官方依据
 

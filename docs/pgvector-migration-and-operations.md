@@ -48,7 +48,7 @@ docker compose exec -T postgres psql -U knowledge -d knowledge -c \
 数据库名上插入验证数据，并在结束时删除 `_verify` 数据库：
 
 ```bash
-scripts/run-pgvector-integration.sh
+evaluation/scripts/run-pgvector-integration.sh
 ```
 
 ## 3. 回填全文和向量

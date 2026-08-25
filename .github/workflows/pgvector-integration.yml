@@ -45,18 +45,18 @@ jobs:
           cache: npm
 
       - name: Install backend
-        run: python -m pip install -e '.[dev]'
+        run: python -m pip install -e '.[dev,quality]'
 
       - name: Static and unit verification
         run: |
-          ruff check app alembic tests scripts
+          ruff check app alembic evaluation tests
           pytest
 
       - name: Empty-database migration
         run: alembic upgrade head
 
       - name: Real PostgreSQL FTS and pgvector verification
-        run: knowledge-pgvector-smoke
+        run: python -m evaluation.smoke.pgvector
 
       - name: Frontend build
         run: |

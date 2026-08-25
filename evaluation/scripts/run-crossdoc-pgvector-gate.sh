@@ -31,6 +31,7 @@ trap on_exit EXIT
 trap 'exit 130' INT TERM HUP
 
 compose up -d --build postgres migrate api worker indexer
+compose build quality
 
 attempt=0
 until curl -fsS "$BASE_URL/health/ready" >/dev/null; do
@@ -44,19 +45,18 @@ done
 
 compose run --rm api qwen-diagnostics
 compose run --rm \
-  -v "$PWD/scripts:/app/scripts:ro" \
   -v "$PWD/evaluation:/app/evaluation" \
-  migrate python scripts/upload-evaluation-corpus.py "/app/$CORPUS" \
+  quality python -m evaluation.scripts.upload_evaluation_corpus "/app/$CORPUS" \
   --base-url "http://api:8000" --concurrency 8 --timeout-seconds 1800
 
 compose run --rm \
   -v "$PWD/evaluation:/app/evaluation" \
-  api knowledge-benchmark retrieve "/app/$CORPUS"
+  quality python -m evaluation.benchmark.cli retrieve "/app/$CORPUS"
 
 if [ "${RUN_ANSWER_GATE:-1}" = "1" ]; then
   compose run --rm \
     -v "$PWD/evaluation:/app/evaluation" \
-    api knowledge-benchmark answers "/app/$CORPUS" \
+    quality python -m evaluation.benchmark.cli answers "/app/$CORPUS" \
     --limit "${ANSWER_GATE_LIMIT:-20}" \
     --model "${ANSWER_GATE_MODEL:-qwen3.7-plus-2026-05-26}"
 fi

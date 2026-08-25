@@ -129,7 +129,7 @@
 ## 9. 复核命令
 
 ```bash
-.venv/bin/ruff check app tests
+.venv/bin/ruff check app evaluation tests
 .venv/bin/pytest -q
 npm run build
 docker compose config --quiet

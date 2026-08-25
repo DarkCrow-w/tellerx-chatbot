@@ -4,17 +4,17 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from app.commands import benchmark
-from app.commands.benchmark import (
+from app.db import Base
+from app.db.models import Project
+from app.knowledge.parsers import DocumentParser
+from evaluation.benchmark import cli as benchmark
+from evaluation.benchmark.cli import (
     _answer_contains,
     _offline_feature_vector,
     _resolve_project_ids,
     _retrieval_acceptance,
     generate_corpus,
 )
-from app.db import Base
-from app.db.models import Project
-from app.knowledge.parsers import DocumentParser
 
 
 def test_answer_content_matching_ignores_numeric_thousands_separators() -> None:
@@ -76,8 +76,6 @@ def test_benchmark_resolves_project_scope_and_fails_closed(monkeypatch) -> None:
 
     monkeypatch.setattr(benchmark, "SessionLocal", lambda: Session(engine))
 
-    assert _resolve_project_ids([{"project": "Corpus Project"}]) == {
-        "Corpus Project": "project-1"
-    }
+    assert _resolve_project_ids([{"project": "Corpus Project"}]) == {"Corpus Project": "project-1"}
     with pytest.raises(ValueError, match="Missing Project"):
         _resolve_project_ids([{"project": "Missing Project"}])

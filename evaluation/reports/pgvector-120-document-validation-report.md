@@ -112,12 +112,12 @@ export TELLERX_ENV_FILE=.env.example
 docker compose -p tellerx-pgvector-gate -f docker-compose.verify.yml up -d --build
 
 docker compose -p tellerx-pgvector-gate -f docker-compose.verify.yml run --rm \
-  -v "$PWD/evaluation:/app/evaluation" api \
-  knowledge-benchmark retrieve /app/evaluation/generated/crossdoc-20
+  -v "$PWD/evaluation:/app/evaluation" quality \
+  python -m evaluation.benchmark.cli retrieve /app/evaluation/generated/crossdoc-20
 
 docker compose -p tellerx-pgvector-gate -f docker-compose.verify.yml run --rm \
-  -v "$PWD/evaluation:/app/evaluation" api \
-  knowledge-benchmark answers /app/evaluation/generated/crossdoc-20 \
+  -v "$PWD/evaluation:/app/evaluation" quality \
+  python -m evaluation.benchmark.cli answers /app/evaluation/generated/crossdoc-20 \
   --limit 20 --model qwen3.7-plus-2026-05-26
 
 docker compose -p tellerx-pgvector-gate -f docker-compose.verify.yml stop

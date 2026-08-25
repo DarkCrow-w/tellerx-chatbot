@@ -1,4 +1,6 @@
-from app.commands.cli import _safe_error
+"""Tests for production-safe operator diagnostics."""
+
+from app.commands.diagnostics import _safe_error
 from app.integrations.qwen import QwenAPIError
 
 

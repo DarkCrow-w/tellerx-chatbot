@@ -7,7 +7,7 @@
     "dev": "vite --config frontend/vite.config.js",
     "build": "vite build --config frontend/vite.config.js",
     "preview": "vite preview --config frontend/vite.config.js",
-    "generate:chaos-corpus": "node scripts/generate-chaos-corpus.mjs"
+    "generate:chaos-corpus": "node evaluation/scripts/generate-chaos-corpus.mjs"
   },
   "dependencies": {
     "lucide-react": "latest",

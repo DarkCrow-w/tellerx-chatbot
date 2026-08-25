@@ -87,14 +87,13 @@ TellerxChatBot/
 │   ├── db/                      SQLAlchemy 会话与 PostgreSQL 模型
 │   ├── core/                    配置和 ApplicationContainer 组合根
 │   ├── jobs/                    后台解析 Worker 与索引 Worker
-│   ├── commands/                诊断、评测、Reindex 和 Benchmark
+│   ├── commands/                生产诊断与 Reindex
 │   └── static/                  Vite 构建后的前端资源
 ├── frontend/                    React 前端源码（API、状态、组件、存储分层）
 ├── alembic/                     数据库迁移
 ├── config/models.yaml           生成模型注册表和额度
-├── docs/                        设计、测试和使用文档
-├── evaluation/                  评测样例和本地生成语料
-├── scripts/                     一键评测脚本
+├── docs/                        架构、设计和运维文档
+├── evaluation/                  评测代码、数据集、脚本和报告
 ├── tests/                       Python 自动化测试
 ├── Dockerfile                   前端和后端多阶段镜像
 ├── docker-compose.yml           本地服务编排
@@ -384,7 +383,7 @@ docker compose -f docker-compose.yml -f docker-compose.local.yml up -d postgres
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e '.[dev]'
+python -m pip install -e '.[dev,quality]'
 ```
 
 为宿主机进程配置地址。注意这些值与容器内 `.env` 的主机名不同：
@@ -714,7 +713,7 @@ Worker 不负责生成模型路由，但如果同时修改了 Embedding/Rerank �
 
 ## 11. 项目可执行命令
 
-安装 Python 项目后，`pyproject.toml` 提供以下命令：
+生产命令由 `pyproject.toml` 安装；质量工具通过 `python -m evaluation...` 从源码树运行：
 
 | 命令 | 功能 |
 |---|---|
@@ -722,10 +721,10 @@ Worker 不负责生成模型路由，但如果同时修改了 Embedding/Rerank �
 | `knowledge-indexer` | 消费可靠索引 outbox |
 | `knowledge-reconcile` | 对账事实表与 PostgreSQL 检索投影；可加 `--repair` |
 | `qwen-diagnostics` | 显式检查 Chat、Embedding、Rerank |
-| `knowledge-eval` | 运行 JSONL 业务问答评测 |
-| `knowledge-benchmark` | 生成和运行千文档基准 |
+| `python -m evaluation.business` | 运行 JSONL 业务问答评测 |
+| `python -m evaluation.benchmark.cli` | 生成和运行千文档基准 |
 | `knowledge-reindex` | 从事实库和持久向量构建、验证并切换新索引代际 |
-| `knowledge-pgvector-smoke` | 验证 FTS、pgvector、项目过滤和版本状态 |
+| `python -m evaluation.smoke.pgvector` | 验证 FTS、pgvector、项目过滤和版本状态 |
 
 Docker 内执行一次性命令的一般形式：
 
@@ -800,7 +799,7 @@ Docker 镜像没有复制本地 `evaluation/`，运行时需要挂载：
 ```bash
 docker compose run --rm \
   -v "$PWD/evaluation:/app/evaluation" \
-  api knowledge-eval /app/evaluation/sample.jsonl \
+  api python -m evaluation.business /app/evaluation/datasets/business/sample.jsonl \
   --model qwen3.7-plus-2026-05-26 \
   --output /app/evaluation/plus-baseline.jsonl
 ```
@@ -809,10 +808,16 @@ docker compose run --rm \
 
 ### 11.5 千文档基准
 
+这里的中英文内容是固定的合成考卷，与实际上传的业务文档相互独立。业务文档发生变化时
+不需要修改这些模板；它们用于持续验证解析、检索、版本治理、拒答和引用能力有没有退化。
+如果要验证真实业务内容，应另外维护带标准答案的业务数据集，并使用
+`python -m evaluation.business` 运行。只有需要改变合成考卷覆盖的语言、字段或题型时，
+才修改 `evaluation/benchmark/corpus.py`。
+
 生成确定性语料：
 
 ```bash
-knowledge-benchmark generate \
+python -m evaluation.benchmark.cli generate \
   --output evaluation/generated/benchmark-1k \
   --count 1000 \
   --questions 200 \
@@ -836,17 +841,17 @@ knowledge-benchmark generate \
 完整 BM25-only 示例：
 
 ```bash
-knowledge-benchmark load evaluation/generated/benchmark-1k --reset --no-embedding
-knowledge-benchmark retrieve evaluation/generated/benchmark-1k --no-vector --no-rerank
-knowledge-benchmark answers-offline evaluation/generated/benchmark-1k
+python -m evaluation.benchmark.cli load evaluation/generated/benchmark-1k --reset --no-embedding
+python -m evaluation.benchmark.cli retrieve evaluation/generated/benchmark-1k --no-vector --no-rerank
+python -m evaluation.benchmark.cli answers-offline evaluation/generated/benchmark-1k
 ```
 
 在线混合检索示例：
 
 ```bash
-knowledge-benchmark index-existing evaluation/generated/benchmark-1k
-knowledge-benchmark retrieve evaluation/generated/benchmark-1k
-knowledge-benchmark answers evaluation/generated/benchmark-1k \
+python -m evaluation.benchmark.cli index-existing evaluation/generated/benchmark-1k
+python -m evaluation.benchmark.cli retrieve evaluation/generated/benchmark-1k
+python -m evaluation.benchmark.cli answers evaluation/generated/benchmark-1k \
   --limit 20 \
   --model qwen3.7-plus-2026-05-26
 ```
@@ -854,7 +859,7 @@ knowledge-benchmark answers evaluation/generated/benchmark-1k \
 一键 Qwen 门禁：
 
 ```bash
-scripts/run-qwen-1k-gate.sh evaluation/generated/benchmark-1k
+evaluation/scripts/run-qwen-1k-gate.sh evaluation/generated/benchmark-1k
 ```
 
 > 严重警告：基准命令的 `--reset` 会清空其当前配置所连接数据库中的项目、文档等数据，并可能重建索引。必须使用隔离的评测数据库和索引，绝不能指向业务/生产环境。
@@ -876,7 +881,7 @@ npm run preview    # 预览生产构建
 
 ```bash
 source .venv/bin/activate
-ruff check app tests
+ruff check app evaluation tests
 pytest -q
 pytest --cov=app --cov-report=term-missing
 ```
@@ -884,7 +889,7 @@ pytest --cov=app --cov-report=term-missing
 综合提交前检查：
 
 ```bash
-ruff check app tests
+ruff check app evaluation tests
 pytest -q
 npm run build
 docker compose config
@@ -1156,6 +1161,6 @@ docker compose run --rm api qwen-diagnostics
 
 - [PostgreSQL FTS + pgvector 系统设计文档](postgresql-pgvector-fulltext-design.md)
 - [pgvector 迁移与运维说明](pgvector-migration-and-operations.md)
-- [历史 Elasticsearch 实施与在线回测报告](elasticsearch-implementation-and-regression-report.md)
-- [历史 OpenSearch 千文档基准报告](benchmark-1k-report.md)
+- [历史 Elasticsearch 实施与在线回测报告](../evaluation/reports/elasticsearch-implementation-and-regression-report.md)
+- [历史 OpenSearch 千文档基准报告](../evaluation/reports/benchmark-1k-report.md)
 - [项目 README](../README.md)

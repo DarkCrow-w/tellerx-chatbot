@@ -570,7 +570,7 @@ knowledge-worker
 knowledge-indexer
 knowledge-reconcile [--repair]
 knowledge-reindex --generation <id> [--resume]
-knowledge-eval <dataset> --index-generation <id> --model <snapshot>
+python -m evaluation.business <dataset> --index-generation <id> --model <snapshot>
 knowledge-backup-check
 qwen-diagnostics
 ```

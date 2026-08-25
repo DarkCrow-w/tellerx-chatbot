@@ -27,6 +27,8 @@ trap cleanup EXIT INT TERM
 docker compose run --rm --no-deps --build \
   -e "DATABASE_URL=$VERIFY_URL" migrate alembic upgrade head
 docker compose run --rm --no-deps \
-  -e "DATABASE_URL=$VERIFY_URL" migrate knowledge-pgvector-smoke
+  -e "DATABASE_URL=$VERIFY_URL" \
+  -v "$PWD/evaluation:/app/evaluation:ro" \
+  migrate python -m evaluation.smoke.pgvector
 
 echo "PostgreSQL FTS and pgvector integration verification passed."

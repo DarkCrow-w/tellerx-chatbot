@@ -67,8 +67,8 @@
 ## 7. 评测命令
 
 ```bash
-.venv/bin/python scripts/evaluate-semantic-query-understanding.py \
-  --cases evaluation/semantic-query-understanding/cases.json \
+.venv/bin/python evaluation/scripts/evaluate_semantic_query_understanding.py \
+  --cases evaluation/datasets/semantic-query-understanding/cases.json \
   --output evaluation/semantic-query-understanding/report.json
 ```
 

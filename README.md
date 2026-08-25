@@ -21,14 +21,14 @@ docker compose exec api knowledge-reindex
 
 完整文档：
 
-- [生产代码重构与 100 文档回归报告](docs/production-refactoring-regression-report.md)
+- [生产代码重构与 100 文档回归报告](evaluation/reports/production-refactoring-regression-report.md)
 - [生产代码架构与维护约定](docs/production-code-architecture.md)
 - [使用、开发与运维手册](docs/usage-and-operations-guide.md)
 - [PostgreSQL + pgvector + 全文检索架构设计](docs/postgresql-pgvector-fulltext-design.md)
 - [pgvector 迁移与运行手册](docs/pgvector-migration-and-operations.md)
-- [历史 Elasticsearch 实施与在线回测报告](docs/elasticsearch-implementation-and-regression-report.md)
+- [历史 Elasticsearch 实施与在线回测报告](evaluation/reports/elasticsearch-implementation-and-regression-report.md)
 - [历史 PostgreSQL + OpenSearch 设计](docs/knowledge-base-chatbot-design.md)
-- [历史 OpenSearch 千文档基准报告](docs/benchmark-1k-report.md)
+- [历史 OpenSearch 千文档基准报告](evaluation/reports/benchmark-1k-report.md)
 
 ## 本地启动
 
@@ -102,49 +102,52 @@ pgvector 架构必须在目标机器完成迁移、`knowledge-reindex`、`knowle
 
 ## 评测
 
+评测代码与生产包严格分离，目录约定和入口见
+[`evaluation/README.md`](evaluation/README.md)。运行前安装 `.[dev,quality]` 依赖。
+
 项目内置可重复的 1000 份混合格式压力语料生成器，生成内容位于
 `evaluation/generated/`（不提交 Git）：
 
 ```bash
-knowledge-benchmark generate \
+python -m evaluation.benchmark.cli generate \
   --output evaluation/generated/benchmark-1k \
   --count 1000 --questions 200 --seed 20260812 --force
 
 # BM25-only 基线；即使 Qwen 暂时不可用也可验证解析、治理、检索和拒答
-knowledge-benchmark load evaluation/generated/benchmark-1k --reset --no-embedding
-knowledge-benchmark retrieve evaluation/generated/benchmark-1k --no-vector --no-rerank
-knowledge-benchmark answers-offline evaluation/generated/benchmark-1k
-knowledge-benchmark hybrid-offline evaluation/generated/benchmark-1k
-knowledge-benchmark load-production-offline evaluation/generated/benchmark-1k --reset
-knowledge-benchmark api-smoke-offline evaluation/generated/benchmark-1k
-knowledge-benchmark project-filter-offline evaluation/generated/benchmark-1k
+python -m evaluation.benchmark.cli load evaluation/generated/benchmark-1k --reset --no-embedding
+python -m evaluation.benchmark.cli retrieve evaluation/generated/benchmark-1k --no-vector --no-rerank
+python -m evaluation.benchmark.cli answers-offline evaluation/generated/benchmark-1k
+python -m evaluation.benchmark.cli hybrid-offline evaluation/generated/benchmark-1k
+python -m evaluation.benchmark.cli load-production-offline evaluation/generated/benchmark-1k --reset
+python -m evaluation.benchmark.cli api-smoke-offline evaluation/generated/benchmark-1k
+python -m evaluation.benchmark.cli project-filter-offline evaluation/generated/benchmark-1k
 
 # 正式混合检索与 Qwen 答案回归（先确保 qwen-diagnostics 全部成功）
-knowledge-benchmark index-existing evaluation/generated/benchmark-1k
-knowledge-benchmark retrieve evaluation/generated/benchmark-1k
-knowledge-benchmark answers evaluation/generated/benchmark-1k \
+python -m evaluation.benchmark.cli index-existing evaluation/generated/benchmark-1k
+python -m evaluation.benchmark.cli retrieve evaluation/generated/benchmark-1k
+python -m evaluation.benchmark.cli answers evaluation/generated/benchmark-1k \
   --limit 20 --model qwen3.7-plus-2026-05-26
 ```
 
 也可在账户恢复后使用一条命令执行全部 Qwen 门禁。诊断不通过时脚本会立即停止：
 
 ```bash
-scripts/run-qwen-1k-gate.sh evaluation/generated/benchmark-1k
+evaluation/scripts/run-qwen-1k-gate.sh evaluation/generated/benchmark-1k
 ```
 
 迁移前的千文档实测结果见
-[历史 Elasticsearch 回测报告](docs/elasticsearch-implementation-and-regression-report.md)；它不是当前
+[历史 Elasticsearch 回测报告](evaluation/reports/elasticsearch-implementation-and-regression-report.md)；它不是当前
 pgvector 后端的验收结果。
 
 ### 业务评测
 
-将 `evaluation/sample.jsonl` 替换为业务真实题目后，固定快照运行。Docker 镜像不包含
+将 `evaluation/datasets/business/sample.jsonl` 替换为业务真实题目后，固定快照运行。Docker 镜像不包含
 宿主机的 `evaluation/`，需要显式挂载：
 
 ```bash
 docker compose run --rm \
   -v "$PWD/evaluation:/app/evaluation" \
-  api knowledge-eval /app/evaluation/sample.jsonl \
+  api python -m evaluation.business /app/evaluation/datasets/business/sample.jsonl \
   --model qwen3.7-plus-2026-05-26 \
   --output /app/evaluation/plus-baseline.jsonl
 ```
@@ -154,17 +157,17 @@ docker compose run --rm \
 ## 开发测试
 
 ```bash
-python -m pip install -e '.[dev]'
+python -m pip install -e '.[dev,quality]'
 pytest
-ruff check app tests
+ruff check app evaluation tests
 npm run build
 
 # 专用临时库：空库迁移 + PostgreSQL FTS + pgvector HNSW 集成验证
-scripts/run-pgvector-integration.sh
+evaluation/scripts/run-pgvector-integration.sh
 
 # 独立 Compose 项目：120 份交叉文档、110 题、Qwen 与重启持久性门禁
 QWEN_API_KEY_SECRET_FILE='/path/to/Qwen token.txt' \
-  scripts/run-crossdoc-pgvector-gate.sh
+  evaluation/scripts/run-crossdoc-pgvector-gate.sh
 ```
 
 本地 Docker 不可用时，可用 SQLite 和 mock 服务运行单元测试；完整链路仍需安装 `vector` 和

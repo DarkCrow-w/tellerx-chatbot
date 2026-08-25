@@ -7,9 +7,11 @@ tests make the intended dependency direction part of the normal test suite.
 from __future__ import annotations
 
 import ast
+import tomllib
 from pathlib import Path
 
-APP_ROOT = Path(__file__).parents[1] / "app"
+PROJECT_ROOT = Path(__file__).parents[1]
+APP_ROOT = PROJECT_ROOT / "app"
 
 ALLOWED_APP_DEPENDENCIES = {
     "contracts": {"contracts"},
@@ -74,3 +76,41 @@ def test_entrypoint_packages_are_not_imported_by_runtime_layers() -> None:
                     f"{path.relative_to(APP_ROOT)} imports entrypoints: {sorted(forbidden)}"
                 )
     assert not violations, "\n".join(violations)
+
+
+def test_production_package_does_not_import_quality_code() -> None:
+    """Production code must never depend on evaluation or test packages."""
+
+    violations: list[str] = []
+    for path in APP_ROOT.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            names: list[str] = []
+            if isinstance(node, ast.ImportFrom) and node.module:
+                names.append(node.module)
+            elif isinstance(node, ast.Import):
+                names.extend(alias.name for alias in node.names)
+            forbidden = [
+                name
+                for name in names
+                if name in {"evaluation", "tests"} or name.startswith(("evaluation.", "tests."))
+            ]
+            if forbidden:
+                violations.append(
+                    f"{path.relative_to(APP_ROOT)} imports quality code: {sorted(forbidden)}"
+                )
+    assert not violations, "\n".join(violations)
+
+
+def test_production_distribution_excludes_quality_tooling() -> None:
+    """The production wheel and console scripts must contain only deployable code."""
+
+    config = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert config["tool"]["setuptools"]["packages"]["find"]["include"] == ["app*"]
+    assert all(
+        not target.startswith("evaluation.") for target in config["project"]["scripts"].values()
+    )
+    assert not any(
+        dependency.casefold().startswith("reportlab")
+        for dependency in config["project"]["dependencies"]
+    )

@@ -78,6 +78,22 @@ services:
     volumes:
       - verify-uploads:/data/knowledge
 
+  quality:
+    build:
+      context: .
+      target: quality-runtime
+    env_file: ${TELLERX_ENV_FILE:-.env}
+    environment:
+      DATABASE_URL: postgresql+psycopg://knowledge:knowledge@postgres:5432/knowledge_crossdoc_verify
+      QWEN_API_KEY_FILE: /run/secrets/qwen_api_key
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    secrets:
+      - qwen_api_key
+    volumes:
+      - verify-uploads:/data/knowledge
+
 secrets:
   qwen_api_key:
     file: "${QWEN_API_KEY_SECRET_FILE:-./Qwen/Qwen token.txt}"

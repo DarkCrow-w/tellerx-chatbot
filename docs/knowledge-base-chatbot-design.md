@@ -94,7 +94,7 @@ Qwen 生成模型关闭思考输出与工具调用，使用低温度 JSON 输出
 
 ## 8. 评测与发布门槛
 
-业务人员准备 50–100 个真实问题，覆盖直接事实、跨章节综合、Excel、中英文缩写、不可回答和版本冲突。评测可通过 `knowledge-eval dataset.jsonl --model <snapshot>` 固定模型运行。
+业务人员准备 50–100 个真实问题，覆盖直接事实、跨章节综合、Excel、中英文缩写、不可回答和版本冲突。评测可通过 `python -m evaluation.business dataset.jsonl --model <snapshot>` 固定模型运行。
 
 - 正确文档 Recall@10 ≥ 90%。
 - 引用准确率 ≥ 95%。

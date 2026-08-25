@@ -15,7 +15,6 @@ build/
 data/
 backup/
 evaluation/generated/
-evaluation/reports/
 evaluation/pipeline-storage/
 Qwen/Qwen token.txt
 node_modules/

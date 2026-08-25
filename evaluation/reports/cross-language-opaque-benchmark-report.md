@@ -97,23 +97,23 @@
 生成或刷新语料（固定种子，默认保留已有报告）：
 
 ```bash
-node scripts/generate-crosslang-opaque-corpus.mjs
+node evaluation/scripts/generate-crosslang-opaque-corpus.mjs
 ```
 
 全量检索基准：
 
 ```bash
-docker compose run --rm --no-deps \
-  -v "$PWD/evaluation/generated/crosslang-opaque-16:/app/evaluation/generated/crosslang-opaque-16" \
-  api knowledge-benchmark retrieve evaluation/generated/crosslang-opaque-16
+docker compose -f docker-compose.verify.yml run --rm --no-deps \
+  -v "$PWD/evaluation:/app/evaluation" \
+  quality python -m evaluation.benchmark.cli retrieve evaluation/generated/crosslang-opaque-16
 ```
 
 固定 Qwen 模型回答基准：
 
 ```bash
-docker compose run --rm --no-deps \
-  -v "$PWD/evaluation/generated/crosslang-opaque-16:/app/evaluation/generated/crosslang-opaque-16" \
-  api knowledge-benchmark answers evaluation/generated/crosslang-opaque-16 \
+docker compose -f docker-compose.verify.yml run --rm --no-deps \
+  -v "$PWD/evaluation:/app/evaluation" \
+  quality python -m evaluation.benchmark.cli answers evaluation/generated/crosslang-opaque-16 \
   --limit 6 --model qwen3.7-plus-2026-05-26
 ```
 

@@ -51,6 +51,19 @@ USER appuser
 CMD ["knowledge-worker"]
 
 
+# Evaluation tools are deliberately absent from production images. This target
+# is used only by local/CI quality gates and carries benchmark-only dependencies.
+FROM backend-base AS quality-runtime
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -c 'import subprocess, sys, tomllib; dependencies = tomllib.load(open("pyproject.toml", "rb"))["project"]["optional-dependencies"]["quality"]; subprocess.check_call([sys.executable, "-m", "pip", "install", *dependencies])'
+
+COPY evaluation ./evaluation
+
+USER appuser
+CMD ["python", "-m", "evaluation.benchmark.cli", "--help"]
+
+
 # Lightweight default runtime shared by API, migrations, and the indexer.
 FROM backend-base AS runtime
 

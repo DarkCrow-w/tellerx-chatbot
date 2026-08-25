@@ -15,9 +15,9 @@ fi
 # quota. qwen-diagnostics never prints the API key or provider response text.
 qwen-diagnostics
 
-knowledge-benchmark index-existing "$CORPUS_DIR"
-knowledge-benchmark retrieve "$CORPUS_DIR"
-knowledge-benchmark answers "$CORPUS_DIR" --limit "$ANSWER_LIMIT" --model "$PLUS_MODEL"
-knowledge-benchmark answers "$CORPUS_DIR" --limit "$ANSWER_LIMIT" --model "$MAX_MODEL"
+python -m evaluation.benchmark.cli index-existing "$CORPUS_DIR"
+python -m evaluation.benchmark.cli retrieve "$CORPUS_DIR"
+python -m evaluation.benchmark.cli answers "$CORPUS_DIR" --limit "$ANSWER_LIMIT" --model "$PLUS_MODEL"
+python -m evaluation.benchmark.cli answers "$CORPUS_DIR" --limit "$ANSWER_LIMIT" --model "$MAX_MODEL"
 
 echo "Qwen 1K gate completed successfully."

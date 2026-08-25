@@ -10,7 +10,6 @@ __pycache__
 *.db
 data
 evaluation/*.jsonl
-!evaluation/sample.jsonl
 evaluation/generated
 evaluation/reports
 Qwen

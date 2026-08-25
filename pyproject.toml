@@ -22,7 +22,6 @@ dependencies = [
   "python-docx==1.2.0",
   "python-multipart==0.0.32",
   "PyYAML==6.0.3",
-  "reportlab==4.5.1",
   "sqlalchemy==2.0.52",
   "uvicorn[standard]==0.52.1",
 ]
@@ -31,18 +30,19 @@ dependencies = [
 dev = [
   "pytest==8.4.2",
   "pytest-cov==7.1.0",
+  "reportlab==4.5.1",
   "ruff==0.16.2",
+]
+quality = [
+  "reportlab==4.5.1",
 ]
 
 [project.scripts]
 knowledge-worker = "app.jobs.ingestion_worker:main"
 knowledge-indexer = "app.jobs.index_worker:main"
 knowledge-reconcile = "app.jobs.index_worker:reconcile_main"
-qwen-diagnostics = "app.commands.cli:diagnostics_main"
-knowledge-eval = "app.commands.cli:evaluate_main"
-knowledge-benchmark = "app.commands.benchmark:main"
+qwen-diagnostics = "app.commands.diagnostics:diagnostics_main"
 knowledge-reindex = "app.commands.reindex:main"
-knowledge-pgvector-smoke = "app.commands.pgvector_smoke:main"
 
 [tool.setuptools.packages.find]
 include = ["app*"]
@@ -59,4 +59,4 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-extend-per-file-ignores = { "app/api/routes/*.py" = ["B008"], "app/jobs/*.py" = ["BLE001"], "app/commands/benchmark.py" = ["BLE001", "S112"] }
+extend-per-file-ignores = { "app/api/routes/*.py" = ["B008"], "app/jobs/*.py" = ["BLE001"] }
