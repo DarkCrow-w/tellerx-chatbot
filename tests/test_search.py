@@ -433,6 +433,59 @@ def test_short_selected_heading_attaches_adjacent_value_chunk() -> None:
     ]
 
 
+def test_provenance_bridge_retains_business_requirement_mapping() -> None:
+    selected = [
+        {
+            "hit": {
+                "_source": {
+                    "chunk_id": "matrix",
+                    "document_id": "matrix-doc",
+                    "document_type": "parameter-matrix",
+                    "lifecycle_status": "approved",
+                    "filename": "01-BIZ-1201-policy-matrix.xlsx",
+                    "content": "POL-4101 | APAC-N | 431 ms",
+                }
+            },
+            "score": 1.0,
+        }
+    ]
+    related_hits = [
+        {
+            "_source": {
+                "chunk_id": "change",
+                "document_id": "change-doc",
+                "document_type": "change-notice",
+                "lifecycle_status": "approved",
+                "filename": "01-BIZ-1201-approved-change.pdf",
+                "content": "CHG-8101 binds POL-4101",
+            }
+        },
+        {
+            "_source": {
+                "chunk_id": "requirement",
+                "document_id": "requirement-doc",
+                "document_type": "business-requirement",
+                "lifecycle_status": "approved",
+                "filename": "01-BIZ-1201-business-requirement.md",
+                "content": "BIZ-1201 的区域参数必须从 POL-4101 Policy Matrix v3 获取。",
+            }
+        },
+    ]
+
+    expanded = Retriever._attach_provenance_bridge_chunks(
+        "BIZ-1201 当前超时是多少？",
+        selected,
+        related_hits,
+        ["POL-4101", "CHG-8101"],
+        max_extra=1,
+    )
+
+    assert [row["hit"]["_source"]["chunk_id"] for row in expanded] == [
+        "matrix",
+        "requirement",
+    ]
+
+
 def test_document_diversification_selects_current_page_within_document() -> None:
     candidates = [
         {

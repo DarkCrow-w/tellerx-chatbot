@@ -91,11 +91,6 @@ def attach_cross_document_bridges(
     source_keys = {(source.chunk_id, source.quote) for source in validated.sources}
     for claim in validated.claims:
         cited = [by_id[citation] for citation in claim.citations if citation in by_id]
-        if any(
-            any(anchor in item.content.casefold() for anchor in subject_anchors)
-            for item in cited
-        ):
-            continue
         downstream_ids = {
             value.casefold()
             for item in cited
@@ -106,23 +101,45 @@ def attach_cross_document_bridges(
         }
         if not downstream_ids:
             continue
-        bridge = next(
-            (
-                item
-                for item in evidence
-                if item.chunk_id not in claim.citations
-                and any(
-                    anchor in item.filename.casefold()
-                    or anchor in item.content.casefold()
+        bridge_candidates = [
+            item
+            for item in evidence
+            if item.chunk_id not in claim.citations
+            and any(
+                anchor
+                in " ".join(
+                    [item.filename, item.heading_path or "", item.content]
+                ).casefold()
+                for anchor in subject_anchors
+            )
+            and any(
+                identifier
+                in " ".join([item.filename, item.heading_path or "", item.content]).casefold()
+                for identifier in downstream_ids
+            )
+        ]
+        preferred_bridge_types = {
+            "business-requirement",
+            "requirement",
+            "terminology-registry",
+            "mapping",
+            "reference-index",
+        }
+        bridge = max(
+            bridge_candidates,
+            key=lambda item: (
+                item.document_type.casefold() in preferred_bridge_types,
+                sum(
+                    anchor in " ".join([item.heading_path or "", item.content]).casefold()
                     for anchor in subject_anchors
-                )
-                and any(
+                ),
+                sum(
                     identifier
-                    in " ".join([item.filename, item.heading_path or "", item.content]).casefold()
+                    in " ".join([item.heading_path or "", item.content]).casefold()
                     for identifier in downstream_ids
-                )
+                ),
             ),
-            None,
+            default=None,
         )
         if bridge is None:
             continue

@@ -342,6 +342,92 @@ class Retriever:
         return cls._deduplicate_content([*selected, *extras])
 
     @classmethod
+    def _attach_provenance_bridge_chunks(
+        cls,
+        query: str,
+        selected: list[dict[str, Any]],
+        related_hits: list[dict[str, Any]],
+        linked_identifiers: list[str],
+        *,
+        max_extra: int = 2,
+    ) -> list[dict[str, Any]]:
+        """Keep subject-to-reference mappings alongside downstream facts.
+
+        Rerankers naturally favor chunks containing the final value.  In a
+        multi-document join that can drop the requirement/registry chunk that
+        proves why the downstream policy, matrix, or route belongs to the
+        subject in the question.  This deterministic pass retains that
+        provenance without inventing a relationship.
+        """
+
+        if max_extra <= 0 or not selected or not related_hits:
+            return selected
+        query_ids = {
+            value.casefold()
+            for pattern in (EXACT_IDENTIFIER, ACRONYM)
+            for value in pattern.findall(normalize_query(query))
+        }
+        subject_signals = query_ids or {
+            value.casefold()
+            for value in (*_query_subject_signals(query), *_lexical_signals(query))
+            if len(value.strip()) >= 2
+        }
+        downstream_ids = {
+            value.casefold()
+            for row in selected
+            for value in EXACT_IDENTIFIER.findall(cls._source_text(row))
+            if value.casefold() not in query_ids
+        }
+        downstream_ids.update(value.casefold() for value in linked_identifiers)
+        if not subject_signals or not downstream_ids:
+            return selected
+
+        seen = {
+            str(row.get("hit", {}).get("_source", {}).get("chunk_id") or "")
+            for row in selected
+        }
+        preferred_types = {
+            "business-requirement",
+            "requirement",
+            "terminology-registry",
+            "mapping",
+            "reference-index",
+        }
+        options: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
+        for position, hit in enumerate(related_hits):
+            source = hit.get("_source", {})
+            chunk_id = str(source.get("chunk_id") or "")
+            if not chunk_id or chunk_id in seen or _source_status(source) != "approved":
+                continue
+            wrapped = {"hit": hit}
+            text = cls._source_text(wrapped)
+            matched_subjects = sum(signal in text for signal in subject_signals)
+            matched_links = sum(identifier in text for identifier in downstream_ids)
+            if not matched_subjects or not matched_links:
+                continue
+            document_type = str(source.get("document_type") or "").casefold()
+            options.append(
+                (
+                    (
+                        int(document_type in preferred_types),
+                        matched_subjects,
+                        matched_links,
+                        -position,
+                    ),
+                    {
+                        "hit": hit,
+                        "score": 0.0,
+                        "channels": {"provenance_bridge"},
+                        "raw_scores": {},
+                    },
+                )
+            )
+        if not options:
+            return selected
+        extras = [row for _, row in sorted(options, key=lambda item: item[0], reverse=True)]
+        return cls._deduplicate_content([*selected, *extras[:max_extra]])
+
+    @classmethod
     def _prefer_complete_entity_matches(
         cls,
         query: str,
@@ -676,6 +762,13 @@ class Retriever:
                 related_hits,
                 max_extra=max(1, self.settings.evidence_top_k // 2),
             )
+            selected_rows = self._attach_provenance_bridge_chunks(
+                query,
+                selected_rows,
+                related_hits,
+                linked_identifiers,
+                max_extra=2,
+            )
             return [
                 self._to_evidence(row["hit"]["_source"], float(row.get("score") or 0.0))
                 for row in selected_rows
@@ -686,6 +779,13 @@ class Retriever:
                 candidates[: self.settings.evidence_top_k],
                 related_hits,
                 max_extra=max(1, self.settings.evidence_top_k // 2),
+            )
+            selected_rows = self._attach_provenance_bridge_chunks(
+                query,
+                selected_rows,
+                related_hits,
+                linked_identifiers,
+                max_extra=2,
             )
             return [
                 self._to_evidence(row["hit"]["_source"], row["score"])

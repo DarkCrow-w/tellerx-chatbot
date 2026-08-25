@@ -295,6 +295,64 @@ def test_server_adds_subject_to_downstream_provenance_bridge() -> None:
     }
 
 
+def test_server_prefers_requirement_over_incidental_change_bridge() -> None:
+    items = [
+        Evidence(
+            chunk_id="change",
+            document_id="change-doc",
+            version_id="v1",
+            project_id="p1",
+            filename="01-BIZ-1201-approved-change.pdf",
+            document_status="approved",
+            document_type="change-notice",
+            content="BIZ-1201 change CHG-8101 binds POL-4101.",
+        ),
+        Evidence(
+            chunk_id="requirement",
+            document_id="requirement-doc",
+            version_id="v1",
+            project_id="p1",
+            filename="01-BIZ-1201-business-requirement.md",
+            document_status="approved",
+            document_type="business-requirement",
+            content="BIZ-1201 的区域参数必须从 POL-4101 Policy Matrix v3 获取。",
+        ),
+        Evidence(
+            chunk_id="matrix",
+            document_id="matrix-doc",
+            version_id="v1",
+            project_id="p1",
+            filename="01-BIZ-1201-policy-matrix.xlsx",
+            document_status="approved",
+            document_type="parameter-matrix",
+            content="POL-4101 | APAC-N | timeout 431 ms",
+        ),
+    ]
+    validated = validate_answer(
+        {
+            "status": "answered",
+            "answer": "ignored",
+            "claims": [
+                {
+                    "text": "APAC-N 超时为 431 ms。",
+                    "evidence": [{"id": "matrix", "quote": "timeout 431 ms"}],
+                }
+            ],
+        },
+        items,
+    )
+
+    result = attach_cross_document_bridges(
+        "BIZ-1201 当前 APAC-N 超时是多少？", validated, items
+    )
+
+    assert result.claims[0].citations == ["matrix", "requirement"]
+    assert {source.filename for source in result.sources} == {
+        "01-BIZ-1201-policy-matrix.xlsx",
+        "01-BIZ-1201-business-requirement.md",
+    }
+
+
 def test_server_bridges_chinese_business_subject_without_explicit_id() -> None:
     items = [
         Evidence(
