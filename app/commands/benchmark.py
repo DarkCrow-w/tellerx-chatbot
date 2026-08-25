@@ -1232,6 +1232,23 @@ def _retrieval_acceptance(report: dict[str, Any]) -> dict[str, Any]:
     return {"passed": all(checks.values()), "checks": checks}
 
 
+def _resolve_project_ids(rows: list[dict[str, Any]]) -> dict[str, str]:
+    """Resolve corpus project names once and fail closed without isolation."""
+
+    required = {str(row["project"]) for row in rows if row.get("project")}
+    if not required:
+        return {}
+    with SessionLocal() as db:
+        resolved = {
+            project.name: project.id
+            for project in db.scalars(select(Project).where(Project.name.in_(required)))
+        }
+    missing = sorted(required - resolved.keys())
+    if missing:
+        raise ValueError("Benchmark projects are not loaded: " + ", ".join(missing))
+    return resolved
+
+
 def evaluate_retrieval(
     corpus_dir: Path,
     *,
@@ -1248,6 +1265,7 @@ def evaluate_retrieval(
         answerable = [row for row in questions if row["expected_status"] == "answered"][:limit]
         missing = [row for row in questions if row["expected_status"] != "answered"][: max(5, limit // 10)]
         questions = [*answerable, *missing]
+    project_ids = _resolve_project_ids(questions)
 
     original_embedding = retriever._query_embedding
     original_rerank = qwen.rerank
@@ -1286,7 +1304,8 @@ def evaluate_retrieval(
     fact_coverage_pass = 0
     for position, row in enumerate(questions, start=1):
         started = time.perf_counter()
-        evidence = retriever.search(row["question"], [])
+        project_filter = [project_ids[row["project"]]] if row.get("project") else []
+        evidence = retriever.search(row["question"], project_filter)
         latency = (time.perf_counter() - started) * 1000
         latencies.append(latency)
         filenames = [item.filename for item in evidence]
@@ -1502,6 +1521,7 @@ def evaluate_answers(corpus_dir: Path, *, limit: int, model: str) -> dict[str, A
     answerable = [row for row in rows if row["expected_status"] == "answered"][:limit]
     missing = [row for row in rows if row["expected_status"] == "insufficient_evidence"][: max(3, limit // 5)]
     selected = [*answerable, *missing]
+    project_ids = _resolve_project_ids(selected)
     service: AnswerService = answer_service()
     results = []
     latencies = []
@@ -1512,7 +1532,7 @@ def evaluate_answers(corpus_dir: Path, *, limit: int, model: str) -> dict[str, A
             response = service.answer(
                 db,
                 question=row["question"],
-                project_ids=[],
+                project_ids=[project_ids[row["project"]]] if row.get("project") else [],
                 conversation_id=None,
                 pinned_model=model,
             )

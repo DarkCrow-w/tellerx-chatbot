@@ -1,12 +1,13 @@
 """Evidence-bound chat and human feedback endpoints."""
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.contracts.schemas import ChatRequest, ChatResponse, FeedbackIn
 from app.core.container import answer_service
 from app.db import get_db
-from app.db.models import AnswerFeedback, Message
+from app.db.models import AnswerFeedback, Message, Project
 from app.services.answer_contract import AnswerValidationError
 from app.services.model_router import NoModelAvailable
 
@@ -17,11 +18,17 @@ router = APIRouter(tags=["chat"])
 def chat(request: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
     """Retrieve evidence, route one Qwen model, and return validated citations."""
 
+    project_ids = list(dict.fromkeys(request.project_ids))
+    if not project_ids:
+        available = list(db.scalars(select(Project.id).order_by(Project.name).limit(2)))
+        if len(available) > 1:
+            raise HTTPException(422, "存在多个知识库项目，请先选择一个项目再提问。")
+        project_ids = available
     try:
         return answer_service().answer(
             db,
             question=request.question.strip(),
-            project_ids=request.project_ids,
+            project_ids=project_ids,
             conversation_id=request.conversation_id,
             pinned_model=request.pinned_model,
         )

@@ -38,6 +38,31 @@ def test_qwen_client_does_not_require_key_in_payload(tmp_path) -> None:
     assert usage.total_tokens == 2
 
 
+def test_chat_json_uses_deterministic_structured_generation(tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["temperature"] == 0.0
+        assert body["response_format"] == {"type": "json_object"}
+        assert body["enable_thinking"] is False
+        return httpx.Response(
+            200,
+            json={
+                "id": "request-1",
+                "model": "test-model",
+                "choices": [{"message": {"content": '{"status":"ok"}'}}],
+            },
+        )
+
+    client = QwenClient(settings(tmp_path), transport=httpx.MockTransport(handler))
+    result = client.chat_json(
+        model_id="test-model",
+        system_prompt="system",
+        user_prompt="user",
+    )
+
+    assert result.content == '{"status":"ok"}'
+
+
 def test_default_embedding_model_uses_a_model_specific_index() -> None:
     configured = Settings(_env_file=None)
 

@@ -1,13 +1,17 @@
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+from app.api.routes import chat as chat_routes
+from app.contracts.schemas import ChatRequest
 from app.db import Base
 from app.db.models import Chunk, Document, DocumentVersion, Project
 from app.integrations.qwen import ChatCallResult, Usage
 from app.knowledge.evidence import Evidence
+from app.services.answer_contract import build_evidence_prompt
 from app.services.answering import (
     SYSTEM_PROMPT,
     AnswerService,
@@ -194,6 +198,42 @@ def test_anchored_repair_rejects_a_changed_identifier() -> None:
         )
 
 
+def test_anchored_repair_expands_omitted_lines_between_exact_anchors() -> None:
+    item = evidence()[0]
+    item.content = (
+        "English operational name: Mistbridge Credit\n"
+        "Chinese control name: 云杉锁\n"
+        "Cross-language bridge key: LNK-7302"
+    )
+    result = validate_answer(
+        {
+            "status": "answered",
+            "answer": "ignored",
+            "claims": [
+                {
+                    "text": "Mistbridge Credit uses LNK-7302.",
+                    "evidence": [
+                        {
+                            "id": "chunk-1",
+                            "quote": (
+                                "English operational name: Mistbridge Credit\n"
+                                "Cross-language bridge key: LNK-7302"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        },
+        [item],
+    )
+
+    repaired = result.sources[0].quote
+    assert repaired in item.content
+    assert "Mistbridge Credit" in repaired
+    assert "Chinese control name: 云杉锁" in repaired
+    assert "LNK-7302" in repaired
+
+
 def test_insufficient_evidence_needs_no_citation() -> None:
     result = validate_answer(
         {"status": "insufficient_evidence", "answer": "没有足够证据。", "claims": []},
@@ -248,6 +288,19 @@ def test_retry_adds_exact_quote_and_cross_document_correction() -> None:
     assert len(router.prompts) == 2
     assert "PREVIOUS_OUTPUT_REJECTED" in router.prompts[1]
     assert "at most 6 claims" in router.prompts[1]
+
+
+def test_answer_prompt_exposes_requested_facts_and_role_distinction() -> None:
+    prompt = build_evidence_prompt(
+        "Who owns the rule and who approves it?",
+        evidence(),
+        "test-v1",
+        ("governance owner", "approval role"),
+    )
+
+    assert "REQUESTED_FACTS:\n- governance owner\n- approval role" in prompt
+    assert "Never substitute one role for another" in SYSTEM_PROMPT
+    assert "include both exact language forms" in SYSTEM_PROMPT
 
 
 def test_server_adds_subject_to_downstream_provenance_bridge() -> None:
@@ -534,6 +587,20 @@ def test_chat_api_strictly_abstains_when_all_qwen_models_are_unavailable() -> No
     assert response.sources == []
     assert "provider unavailable" not in response.answer
     assert "生成模型当前不可用" in response.answer
+
+
+def test_chat_api_requires_project_scope_when_multiple_projects_exist() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add_all([Project(name="Project A"), Project(name="Project B")])
+        db.commit()
+
+        with pytest.raises(HTTPException) as caught:
+            chat_routes.chat(ChatRequest(question="当前规则是什么？"), db)
+
+    assert caught.value.status_code == 422
+    assert "选择一个项目" in str(caught.value.detail)
 
 
 def test_complex_answer_degrades_to_plus_when_max_tier_is_unavailable() -> None:

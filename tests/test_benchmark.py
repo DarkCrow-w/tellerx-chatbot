@@ -1,13 +1,19 @@
 from pathlib import Path
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
+from app.commands import benchmark
 from app.commands.benchmark import (
     _answer_contains,
     _offline_feature_vector,
+    _resolve_project_ids,
     _retrieval_acceptance,
     generate_corpus,
 )
+from app.db import Base
+from app.db.models import Project
 from app.knowledge.parsers import DocumentParser
 
 
@@ -59,3 +65,19 @@ def test_offline_feature_vector_is_deterministic_and_normalized() -> None:
     assert first == second
     assert len(first) == 1024
     assert sum(value * value for value in first) == pytest.approx(1.0)
+
+
+def test_benchmark_resolves_project_scope_and_fails_closed(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add(Project(id="project-1", name="Corpus Project"))
+        db.commit()
+
+    monkeypatch.setattr(benchmark, "SessionLocal", lambda: Session(engine))
+
+    assert _resolve_project_ids([{"project": "Corpus Project"}]) == {
+        "Corpus Project": "project-1"
+    }
+    with pytest.raises(ValueError, match="Missing Project"):
+        _resolve_project_ids([{"project": "Missing Project"}])

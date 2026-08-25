@@ -364,7 +364,12 @@ class AnswerService:
         has_conflict = any(len(versions) > 1 for versions in version_pairs.values())
         tier = route_tier(question, [item.document_id for item in evidence[:6]], has_conflict)
         evidence = fit_evidence_budget(evidence, 4000 if tier == "plus" else 7000)
-        user_prompt = build_evidence_prompt(question, evidence, self.settings.prompt_version)
+        user_prompt = build_evidence_prompt(
+            question,
+            evidence,
+            self.settings.prompt_version,
+            query_plan.requested_facts,
+        )
 
         model_id: str | None = None
         attempted_tier = tier

@@ -172,6 +172,24 @@ class Retriever:
                     merged[chunk_id]["score"] += float(row.get("score") or 0.0) * weight
         return sorted(merged.values(), key=lambda row: row["score"], reverse=True)
 
+    @staticmethod
+    def _merge_evidence_channels(
+        baseline: list[Evidence], planned: list[Evidence], *, limit: int
+    ) -> list[Evidence]:
+        """Preserve baseline recall while allowing semantic planning to add evidence."""
+
+        merged: list[Evidence] = []
+        seen: set[str] = set()
+        for channel in (baseline, planned):
+            for item in channel:
+                if item.chunk_id in seen:
+                    continue
+                seen.add(item.chunk_id)
+                merged.append(item)
+                if len(merged) >= limit:
+                    return merged
+        return merged
+
     @classmethod
     def _boost_anchor_matches(
         cls, rows: list[dict[str, Any]], anchor_signals: tuple[str, ...]
@@ -630,12 +648,64 @@ class Retriever:
             logger.warning("Vector retrieval unavailable; BM25-only fallback: %s", type(exc).__name__)
         return self._rrf(lexical, vector_hits)
 
+    def _retrieve_linked_identifier_rows(
+        self,
+        identifiers: list[str],
+        project_ids: list[str],
+        statuses: list[str],
+        principal_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Expand approved cross-document IDs independently using exact lexical search.
+
+        A single long semantic query can bury opaque English-only downstream
+        documents.  Exact IDs are company data already grounded in retrieved
+        evidence, so each can be expanded deterministically without another
+        model or embedding call.
+        """
+
+        channels: list[list[dict[str, Any]]] = []
+        seen: set[str] = set()
+        for identifier in identifiers:
+            normalized = identifier.upper()
+            if normalized.casefold() in seen or not EXACT_IDENTIFIER.fullmatch(normalized):
+                continue
+            seen.add(normalized.casefold())
+            hits = self.index.lexical_search(
+                normalized,
+                project_ids,
+                statuses,
+                max(4, self.settings.evidence_top_k),
+                principal_ids,
+            )
+            if hits:
+                channels.append(hits)
+            if len(channels) >= 10:
+                break
+        return self._rrf(*channels) if channels else []
+
     def search(
         self,
         query: str,
         project_ids: list[str],
         principal_ids: list[str] | None = None,
         query_plan: QueryPlan | None = None,
+    ) -> list[Evidence]:
+        if query_plan is None:
+            return self._search_once(query, project_ids, principal_ids, None)
+        baseline = self._search_once(query, project_ids, principal_ids, None)
+        planned = self._search_once(query, project_ids, principal_ids, query_plan)
+        return self._merge_evidence_channels(
+            baseline,
+            planned,
+            limit=max(self.settings.evidence_top_k * 2, self.settings.evidence_top_k + 4),
+        )
+
+    def _search_once(
+        self,
+        query: str,
+        project_ids: list[str],
+        principal_ids: list[str] | None,
+        query_plan: QueryPlan | None,
     ) -> list[Evidence]:
         query = normalize_query(query)
         fused = self._retrieve_for_statuses(query, project_ids, ["approved"], principal_ids)
@@ -670,6 +740,13 @@ class Retriever:
         )
         semantic_context = query_plan.rerank_context() if query_plan else ""
         if linked_identifiers:
+            exact_expansion = self._retrieve_linked_identifier_rows(
+                linked_identifiers,
+                project_ids,
+                ["approved"],
+                principal_ids,
+            )
+            fused = self._merge_fused(fused, exact_expansion)
             expanded_query = "\n".join(
                 part
                 for part in [

@@ -24,6 +24,8 @@ Respond in the same language as the question while retaining exact professional 
 Every factual claim must cite one or more evidence IDs and include an exact, contiguous quote copied from that evidence.
 Return at most 6 claims. Prefer the most important supported facts and keep every quote to the shortest exact span that proves its claim.
 Answer every field requested by the question and preserve exact API paths, error codes, identifiers, dates, roles, and numeric values.
+Treat governance owners, business responsible persons, approval roles, operators, and escalation contacts as different facts. Never substitute one role for another merely because both are people or roles.
+When evidence supplies bilingual names or roles, include both exact language forms. If a requested field names a language, include the exact localized value from the evidence even when the rest of the answer uses another language.
 For a cross-document join, when the downstream evidence does not name the question's business subject, cite both the bridge evidence that maps the subject to the downstream identifier and the downstream evidence that supplies the value.
 If evidence is insufficient, return insufficient_evidence. If authoritative sources conflict, return conflict and explain both sides without choosing one.
 Return exactly one JSON object with this shape:
@@ -122,7 +124,10 @@ def _repair_anchored_quote(quote: str, source: str) -> str | None:
         if normalized not in normalized_source:
             return None
     descriptive = [
-        *re.findall(r"\b[A-Z][A-Za-z0-9-]{2,}(?:\s+[A-Z][A-Za-z0-9-]{2,})+", quote),
+        *re.findall(
+            r"\b[A-Z][A-Za-z0-9-]{2,}(?:[ \t]+[A-Z][A-Za-z0-9-]{2,})+",
+            quote,
+        ),
         *re.findall(r"[\u3400-\u9fff]{2,20}", quote),
     ]
     descriptive = list(dict.fromkeys(descriptive))
@@ -181,7 +186,12 @@ def refusal_text(
     )
 
 
-def build_evidence_prompt(question: str, evidence: list[Evidence], prompt_version: str) -> str:
+def build_evidence_prompt(
+    question: str,
+    evidence: list[Evidence],
+    prompt_version: str,
+    requested_facts: tuple[str, ...] = (),
+) -> str:
     """Serialize only selected evidence and stable provenance into the model prompt."""
 
     blocks = []
@@ -209,9 +219,11 @@ def build_evidence_prompt(question: str, evidence: list[Evidence], prompt_versio
                 ]
             )
         )
+    requested_fact_block = "\n".join(f"- {fact}" for fact in requested_facts)
     return (
         f"PROMPT_VERSION: {prompt_version}\n"
         f"QUESTION:\n{question}\n\n"
+        f"REQUESTED_FACTS:\n{requested_fact_block or '- derive directly from QUESTION'}\n\n"
         f"EVIDENCE:\n" + "\n\n".join(blocks)
     )
 

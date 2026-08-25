@@ -26,7 +26,9 @@ export default function App() {
     return first ? first.slice(0, 28) : "新对话";
   }, [messages]);
   const selectedProject = projects.find((item) => item.id === projectId);
-  const scope = selectedProject ? `仅检索：${selectedProject.name}` : "检索全部项目";
+  const scope = selectedProject
+    ? `仅检索：${selectedProject.name}`
+    : projects.length > 1 ? "请先选择知识库项目" : "当前知识库";
 
   const newChat = useCallback(() => {
     setMessages([]);
@@ -42,7 +44,10 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
-    listProjects().then(setProjects).catch(() => setProjects([]));
+    listProjects().then((items) => {
+      setProjects(items);
+      if (items.length === 1) setProjectId(items[0].id);
+    }).catch(() => setProjects([]));
   }, []);
 
   useEffect(() => {
@@ -106,6 +111,10 @@ export default function App() {
     event?.preventDefault?.();
     const question = input.trim();
     if (!question || sending) return;
+    if (projects.length > 1 && !projectId) {
+      showToast("请先选择知识库项目");
+      return;
+    }
     const userMessage = { id: uid(), role: "user", content: question };
     const pendingMessages = [...messages, userMessage];
     setMessages(pendingMessages);
@@ -163,7 +172,7 @@ export default function App() {
             <label className="project-picker">
               <span>知识范围</span>
               <select value={projectId} onChange={(event) => setProjectId(event.target.value)} aria-label="选择知识库项目">
-                <option value="">全部项目</option>
+                <option value="">请选择项目</option>
                 {projects.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
               </select>
             </label>
@@ -191,4 +200,3 @@ export default function App() {
     </div>
   );
 }
-

@@ -61,12 +61,36 @@ def test_semantic_plan_extracts_keys_from_indirect_multi_part_wording() -> None:
             db,
             "我这边要把那套翠湖授信放到亚太北区跑大额操作，最后谁点头、卡多少钱、等多久算超时？",
         )
-    assert plan.strategy == "semantic-qwen-v1"
+    assert plan.strategy == "semantic-qwen-v2"
     assert plan.subjects == ("翠湖授信", "雪松门")
     assert plan.requested_facts == ("审批角色", "审批阈值", "超时时间")
     assert plan.constraints == ("亚太北区", "高金额授权")
     assert len(plan.retrieval_queries) >= 2
     assert router.calls[0]["max_tokens"] == 700
+
+
+def test_operational_scenario_is_not_allowed_to_become_a_subject_anchor() -> None:
+    router = PlanningRouter(
+        {
+            "language": "zh",
+            "intent": "lookup",
+            "subjects": ["岚桥授信", "高金额授权"],
+            "scenario_terms": ["高金额授权"],
+            "requested_facts": ["接口", "拒绝码", "降级队列"],
+            "constraints": ["高金额授权"],
+            "retrieval_queries": ["岚桥授信 高金额授权 接口 拒绝码 降级队列"],
+        }
+    )
+    service = QueryUnderstandingService(settings(), router)  # type: ignore[arg-type]
+    with session() as db:
+        plan = service.understand(
+            db,
+            "岚桥授信发生高金额授权时，正式调用哪个接口，失败后进入哪个队列？",
+        )
+
+    assert plan.subjects == ("岚桥授信",)
+    assert plan.subject_anchor_signals == ("岚桥授信",)
+    assert plan.scenario_terms == ("高金额授权",)
 
 
 def test_model_cannot_invent_identifiers() -> None:

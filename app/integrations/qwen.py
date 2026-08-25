@@ -160,7 +160,7 @@ class QwenClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "temperature": 0.1,
+            "temperature": 0.0,
             "max_tokens": max_tokens,
             "response_format": {"type": "json_object"},
             "enable_thinking": False,

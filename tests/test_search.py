@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from app.integrations.search import SearchIndex, _lexical_signals, lexical_tokens
+from app.knowledge.evidence import Evidence
 from app.services.query_understanding import QueryPlan
 from app.services.retrieval import Retriever
 
@@ -293,11 +294,86 @@ def test_semantic_query_plan_drives_multiple_retrieval_queries() -> None:
         model_id="plus-planner",
     )
     assert retriever.search("谁点头，卡多少钱，失败后去哪？", ["project-1"], query_plan=plan) == []
-    assert [query for query, _ in calls][:3] == [
-        "谁点头,卡多少钱,失败后去哪?",
-        "翠湖授信 亚太北区 高金额授权 审批角色 审批阈值",
-        "翠湖授信 高金额授权 失败队列",
-    ]
+    queries = [query for query, _ in calls]
+    assert queries.count("谁点头,卡多少钱,失败后去哪?") >= 2
+    assert "翠湖授信 亚太北区 高金额授权 审批角色 审批阈值" in queries
+    assert "翠湖授信 高金额授权 失败队列" in queries
+
+
+def test_semantic_plan_can_add_but_never_remove_baseline_evidence() -> None:
+    baseline = Evidence(
+        chunk_id="route",
+        document_id="route-doc",
+        version_id="v1",
+        project_id="p1",
+        filename="opaque-route.html",
+        document_status="approved",
+        document_type="route-contract-en",
+        content="POST /platform/v3/evaluate; rejection XR-6802",
+    )
+    planned = Evidence(
+        chunk_id="registry",
+        document_id="registry-doc",
+        version_id="v1",
+        project_id="p1",
+        filename="registry.txt",
+        document_status="approved",
+        document_type="terminology-registry-mixed",
+        content="岚桥授信 maps to GATE-8402",
+    )
+    retriever = Retriever.__new__(Retriever)
+    retriever.settings = SimpleNamespace(evidence_top_k=8)
+    retriever._search_once = (  # type: ignore[method-assign]
+        lambda query, project_ids, principal_ids, query_plan: [
+            planned if query_plan else baseline
+        ]
+    )
+    plan = QueryPlan(
+        strategy="semantic-qwen-v1",
+        language="zh",
+        intent="lookup",
+        subjects=("岚桥授信",),
+        identifiers=(),
+        requested_facts=("接口",),
+        constraints=(),
+        retrieval_queries=(),
+    )
+
+    result = retriever.search("岚桥授信调用什么接口？", ["p1"], query_plan=plan)
+
+    assert [item.chunk_id for item in result] == ["route", "registry"]
+
+
+def test_linked_identifiers_expand_as_independent_exact_queries() -> None:
+    class FakeIndex:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        def lexical_search(self, query, project_ids, statuses, top_k, principal_ids=None):
+            self.queries.append(query)
+            return [
+                {
+                    "_id": query,
+                    "_score": 1.0,
+                    "_source": {"chunk_id": query, "content": query},
+                }
+            ]
+
+    retriever = Retriever.__new__(Retriever)
+    retriever.settings = SimpleNamespace(evidence_top_k=8)
+    retriever.index = FakeIndex()
+
+    rows = retriever._retrieve_linked_identifier_rows(
+        ["CTL-4602", "GATE-8402", "Mistbridge Credit", "CTL-4602"],
+        ["p1"],
+        ["approved"],
+    )
+
+    assert retriever.index.queries == ["CTL-4602", "GATE-8402"]
+    assert {row["hit"]["_source"]["chunk_id"] for row in rows} == {
+        "CTL-4602",
+        "GATE-8402",
+    }
 
 
 def test_semantic_anchor_boost_keeps_cross_language_registry_competitive() -> None:
