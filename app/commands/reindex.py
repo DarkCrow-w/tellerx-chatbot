@@ -25,6 +25,8 @@ from app.services.ingestion import IngestionService
 
 
 def main() -> None:
+    """从数据库事实表离线重建全部词法与向量搜索投影。"""
+
     parser = argparse.ArgumentParser(
         description="Rebuild PostgreSQL full-text and pgvector search rows"
     )
@@ -67,9 +69,7 @@ def main() -> None:
         for version in versions:
             chunks = list(
                 db.scalars(
-                    select(Chunk)
-                    .where(Chunk.version_id == version.id)
-                    .order_by(Chunk.ordinal)
+                    select(Chunk).where(Chunk.version_id == version.id).order_by(Chunk.ordinal)
                 )
             )
             if not chunks:
@@ -82,8 +82,7 @@ def main() -> None:
                     if not db.scalar(
                         select(ChunkEmbedding).where(
                             ChunkEmbedding.chunk_id == chunk.id,
-                            ChunkEmbedding.embedding_fingerprint
-                            == settings.embedding_fingerprint,
+                            ChunkEmbedding.embedding_fingerprint == settings.embedding_fingerprint,
                         )
                     )
                 ]
@@ -129,8 +128,7 @@ def main() -> None:
         count = index.count_all()
         if count != expected_total:
             raise RuntimeError(
-                f"PostgreSQL search verification failed: "
-                f"expected={expected_total}, actual={count}"
+                f"PostgreSQL search verification failed: expected={expected_total}, actual={count}"
             )
         reconciliation = indexer.reconcile(db, repair=False)
         if reconciliation["difference_count"]:

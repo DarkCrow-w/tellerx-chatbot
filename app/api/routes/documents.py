@@ -28,7 +28,7 @@ router = APIRouter(tags=["documents"])
 
 
 def _run_job(job_id: str) -> None:
-    """Process one inline-development job in an isolated database session."""
+    """使用独立数据库会话执行一个仅供开发环境使用的内联任务。"""
 
     with SessionLocal() as db:
         ingestion_service().process(db, job_id)
@@ -36,6 +36,8 @@ def _run_job(job_id: str) -> None:
 
 @router.get("/projects", response_model=list[ProjectOut])
 def list_projects(db: Session = Depends(get_db)) -> list[Project]:
+    """按名称返回可供前端选择的知识库项目。"""
+
     return list(db.scalars(select(Project).order_by(Project.name)))
 
 
@@ -54,7 +56,7 @@ def upload_document(
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> UploadResponse:
-    """Persist an immutable file version and enqueue asynchronous ingestion."""
+    """持久化不可变文件版本，并创建异步入库任务。"""
 
     if lifecycle_status not in {"draft", "approved", "deprecated"}:
         raise HTTPException(422, "lifecycle_status must be draft, approved, or deprecated")
@@ -78,9 +80,8 @@ def upload_document(
                 db.add(project_row)
                 db.flush()
         except IntegrityError:
-            # Concurrent first uploads can both observe a missing project. The
-            # savepoint rolls back only the losing insert, then reuses the row
-            # committed by the winner instead of returning HTTP 500.
+            # 并发的首次上传可能都判断项目不存在；savepoint 仅回滚失败插入，随后
+            # 复用胜出事务提交的项目，避免把正常竞争返回为 HTTP 500。
             project_row = db.scalar(select(Project).where(Project.name == project_name))
             if not project_row:
                 raise
@@ -102,8 +103,7 @@ def upload_document(
         db.add(document)
         db.flush()
     elif document.is_deleted:
-        # Logical identity survives soft deletion. Re-upload restores the same
-        # document instead of producing an ambiguous duplicate logical key.
+        # 软删除不抹去逻辑身份；重新上传时恢复原文档，避免产生相同 logical_key 的歧义副本。
         document.is_deleted = False
         document.filename = Path(filename).name
         document.document_type = document_type.strip()
@@ -160,6 +160,8 @@ def upload_document(
 
 @router.get("/ingestion-jobs/{job_id}", response_model=JobOut)
 def get_job(job_id: str, db: Session = Depends(get_db)) -> IngestionJob:
+    """查询入库任务的阶段、进度和失败信息。"""
+
     job = db.get(IngestionJob, job_id)
     if not job:
         raise HTTPException(404, "Ingestion job not found")
@@ -168,7 +170,7 @@ def get_job(job_id: str, db: Session = Depends(get_db)) -> IngestionJob:
 
 @router.post("/ingestion-jobs/{job_id}/retry", response_model=JobOut, status_code=202)
 def retry_job(job_id: str, db: Session = Depends(get_db)) -> IngestionJob:
-    """Create a new immutable attempt instead of mutating job history."""
+    """创建新的不可变尝试记录，不覆盖原任务历史。"""
 
     job = db.get(IngestionJob, job_id)
     if not job:
@@ -182,7 +184,11 @@ def retry_job(job_id: str, db: Session = Depends(get_db)) -> IngestionJob:
 
 
 @router.get("/documents/{document_id}/versions", response_model=list[VersionOut])
-def list_document_versions(document_id: str, db: Session = Depends(get_db)) -> list[DocumentVersion]:
+def list_document_versions(
+    document_id: str, db: Session = Depends(get_db)
+) -> list[DocumentVersion]:
+    """按创建时间倒序返回未删除文档的全部版本。"""
+
     document = db.get(Document, document_id)
     if not document or document.is_deleted:
         raise HTTPException(404, "Document not found")
@@ -197,13 +203,14 @@ def list_document_versions(document_id: str, db: Session = Depends(get_db)) -> l
 
 @router.post("/document-versions/{version_id}/approve", response_model=VersionOut)
 def approve_document_version(version_id: str, db: Session = Depends(get_db)) -> DocumentVersion:
+    """请求批准已验证版本；实际 current 切换由索引 Worker 原子完成。"""
+
     version = db.get(DocumentVersion, version_id)
     if not version:
         raise HTTPException(404, "Document version not found")
     if version.technical_status != "searchable":
         raise HTTPException(409, "Only a fully indexed and verified version can be approved")
-    # The indexer switches is_current only after the replacement has been
-    # published and its expected chunk count has been verified.
+    # 只有替换版本发布完成且分块数量校验通过后，索引 Worker 才会切换 is_current。
     version.lifecycle_status = "approved"
     version.is_current = False
     db.add(OutboxEvent(aggregate_id=version.id, event_type="index_version", payload={}))
@@ -213,6 +220,8 @@ def approve_document_version(version_id: str, db: Session = Depends(get_db)) -> 
 
 @router.post("/document-versions/{version_id}/deprecate", response_model=VersionOut)
 def deprecate_document_version(version_id: str, db: Session = Depends(get_db)) -> DocumentVersion:
+    """废弃文档版本，并通过 Outbox 异步移除其搜索投影。"""
+
     version = db.get(DocumentVersion, version_id)
     if not version:
         raise HTTPException(404, "Document version not found")
@@ -226,6 +235,8 @@ def deprecate_document_version(version_id: str, db: Session = Depends(get_db)) -
 
 @router.get("/sources/{chunk_id}", response_model=SourceOut)
 def get_source(chunk_id: str, db: Session = Depends(get_db)) -> SourceOut:
+    """返回引用分块的原文与可定位来源信息。"""
+
     chunk = db.scalar(
         select(Chunk)
         .options(joinedload(Chunk.version).joinedload(DocumentVersion.document))
@@ -257,6 +268,8 @@ def download_document(
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> FileResponse:
+    """下载指定版本；未指定版本时返回最近上传版本。"""
+
     statement = (
         select(DocumentVersion)
         .options(joinedload(DocumentVersion.document))
@@ -278,7 +291,7 @@ def download_document(
 
 @router.delete("/documents/{document_id}", status_code=204)
 def delete_document(document_id: str, db: Session = Depends(get_db)) -> None:
-    """Soft-delete catalog data and asynchronously remove every indexed version."""
+    """软删除目录记录，并异步移除所有版本的搜索投影。"""
 
     document = db.scalar(
         select(Document)

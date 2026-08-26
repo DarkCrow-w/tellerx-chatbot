@@ -23,14 +23,20 @@ from app.db import Base
 
 
 def new_id() -> str:
+    """生成适合跨进程创建记录的 UUID 字符串主键。"""
+
     return str(uuid.uuid4())
 
 
 def utcnow() -> datetime:
+    """返回带 UTC 时区的当前时间，供 ORM 默认值复用。"""
+
     return datetime.now(UTC)
 
 
 class Project(Base):
+    """知识库项目，是文档检索范围的顶层边界。"""
+
     __tablename__ = "projects"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -41,6 +47,8 @@ class Project(Base):
 
 
 class Document(Base):
+    """文档的稳定逻辑身份；同一文档的内容变化由版本表示。"""
+
     __tablename__ = "documents"
     __table_args__ = (
         Index("ix_document_project_logical_key", "project_id", "logical_key", unique=True),
@@ -68,6 +76,8 @@ class Document(Base):
 
 
 class DocumentVersion(Base):
+    """不可变文件版本及其业务生命周期、技术处理状态。"""
+
     __tablename__ = "document_versions"
     __table_args__ = (
         Index("ix_document_version_hash", "document_id", "sha256", unique=True),
@@ -106,6 +116,8 @@ class DocumentVersion(Base):
 
 
 class Chunk(Base):
+    """带稳定来源位置和相邻关系的可引用文本分块。"""
+
     __tablename__ = "chunks"
     __table_args__ = (Index("ix_chunk_version_ordinal", "version_id", "ordinal", unique=True),)
 
@@ -129,6 +141,8 @@ class Chunk(Base):
 
 
 class IngestionJob(Base):
+    """一次可审计、带租约的文档入库尝试。"""
+
     __tablename__ = "ingestion_jobs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -147,6 +161,8 @@ class IngestionJob(Base):
 
 
 class Conversation(Base):
+    """问答消息的会话容器。"""
+
     __tablename__ = "conversations"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -154,6 +170,8 @@ class Conversation(Base):
 
 
 class Message(Base):
+    """持久化的用户或助手消息及其回答元数据。"""
+
     __tablename__ = "messages"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -168,6 +186,8 @@ class Message(Base):
 
 
 class AnswerFeedback(Base):
+    """关联到助手消息的人工质量反馈。"""
+
     __tablename__ = "answer_feedback"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -178,6 +198,8 @@ class AnswerFeedback(Base):
 
 
 class ModelUsage(Base):
+    """模型调用结果、Token 用量和延迟审计记录。"""
+
     __tablename__ = "model_usage"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -194,6 +216,8 @@ class ModelUsage(Base):
 
 
 class Principal(Base):
+    """可被授予文档权限的用户或用户组身份。"""
+
     __tablename__ = "principals"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -202,8 +226,12 @@ class Principal(Base):
 
 
 class DocumentAcl(Base):
+    """文档与主体之间的读取权限关联。"""
+
     __tablename__ = "document_acl"
-    __table_args__ = (Index("ix_acl_document_principal", "document_id", "principal_id", unique=True),)
+    __table_args__ = (
+        Index("ix_acl_document_principal", "document_id", "principal_id", unique=True),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     document_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), index=True)
@@ -212,9 +240,17 @@ class DocumentAcl(Base):
 
 
 class DocumentArtifact(Base):
+    """由文档版本派生的不可变解析或处理中间产物。"""
+
     __tablename__ = "document_artifacts"
     __table_args__ = (
-        Index("ix_artifact_version_type_fingerprint", "version_id", "artifact_type", "fingerprint", unique=True),
+        Index(
+            "ix_artifact_version_type_fingerprint",
+            "version_id",
+            "artifact_type",
+            "fingerprint",
+            unique=True,
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -228,6 +264,8 @@ class DocumentArtifact(Base):
 
 
 class EmbeddingModel(Base):
+    """由指纹标识的向量空间元数据。"""
+
     __tablename__ = "embedding_models"
 
     fingerprint: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -239,9 +277,13 @@ class EmbeddingModel(Base):
 
 
 class EmbeddingCache(Base):
+    """按内容哈希和向量空间复用的不可变向量对象引用。"""
+
     __tablename__ = "embedding_cache"
     __table_args__ = (
-        Index("ix_embedding_content_fingerprint", "content_hash", "embedding_fingerprint", unique=True),
+        Index(
+            "ix_embedding_content_fingerprint", "content_hash", "embedding_fingerprint", unique=True
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -256,6 +298,8 @@ class EmbeddingCache(Base):
 
 
 class ChunkEmbedding(Base):
+    """分块到指定向量空间缓存对象的关联。"""
+
     __tablename__ = "chunk_embeddings"
     __table_args__ = (
         Index("ix_chunk_embedding_unique", "chunk_id", "embedding_fingerprint", unique=True),
@@ -271,6 +315,8 @@ class ChunkEmbedding(Base):
 
 
 class OutboxEvent(Base):
+    """保证数据库事实变更最终发布到搜索投影的事务事件。"""
+
     __tablename__ = "outbox_events"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -279,7 +325,9 @@ class OutboxEvent(Base):
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
-    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
@@ -287,6 +335,8 @@ class OutboxEvent(Base):
 
 
 class IndexGeneration(Base):
+    """一个物理搜索结构代次及其整体同步统计。"""
+
     __tablename__ = "index_generations"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -302,6 +352,8 @@ class IndexGeneration(Base):
 
 
 class IndexSyncState(Base):
+    """文档版本在特定索引代次中的清单校验状态。"""
+
     __tablename__ = "index_sync_state"
     __table_args__ = (
         Index("ix_sync_version_generation", "version_id", "generation_id", unique=True),
@@ -319,6 +371,8 @@ class IndexSyncState(Base):
 
 
 class QueryTrace(Base):
+    """一次问答的检索计划、证据、模型和延迟追踪记录。"""
+
     __tablename__ = "query_traces"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)

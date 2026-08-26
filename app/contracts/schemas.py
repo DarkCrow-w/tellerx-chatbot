@@ -12,6 +12,8 @@ AnswerStatus = Literal["answered", "insufficient_evidence", "conflict"]
 
 
 class ProjectOut(BaseModel):
+    """知识库项目的公开摘要。"""
+
     id: str
     name: str
 
@@ -19,6 +21,8 @@ class ProjectOut(BaseModel):
 
 
 class UploadResponse(BaseModel):
+    """文档上传受理结果及对应异步任务标识。"""
+
     document_id: str
     version_id: str
     job_id: str
@@ -26,6 +30,8 @@ class UploadResponse(BaseModel):
 
 
 class JobOut(BaseModel):
+    """文档入库任务的进度和诊断信息。"""
+
     id: str
     document_id: str
     version_id: str
@@ -39,6 +45,8 @@ class JobOut(BaseModel):
 
 
 class VersionOut(BaseModel):
+    """文档版本的生命周期与技术处理状态。"""
+
     id: str
     document_id: str
     sha256: str
@@ -56,6 +64,8 @@ class VersionOut(BaseModel):
 
 
 class IndexStatusOut(BaseModel):
+    """搜索后端健康状态和一致性指标。"""
+
     available: bool
     backend: str | None = None
     server_version: str | None = None
@@ -72,6 +82,8 @@ class IndexStatusOut(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    """知识库问答请求及可选的会话、检索范围和固定模型。"""
+
     question: str = Field(min_length=2, max_length=4000)
     conversation_id: str | None = None
     project_ids: list[str] = Field(default_factory=list)
@@ -79,6 +91,8 @@ class ChatRequest(BaseModel):
 
 
 class CitationOut(BaseModel):
+    """可定位到原文的精确引用。"""
+
     chunk_id: str
     document_id: str
     filename: str
@@ -91,11 +105,15 @@ class CitationOut(BaseModel):
 
 
 class ClaimOut(BaseModel):
+    """回答中的单项事实声明及其引用分块。"""
+
     text: str
     citations: list[str]
 
 
 class ChatResponse(BaseModel):
+    """经过证据校验的回答、声明、来源和追踪标识。"""
+
     status: AnswerStatus
     answer: str
     claims: list[ClaimOut]
@@ -108,12 +126,16 @@ class ChatResponse(BaseModel):
 
 
 class FeedbackIn(BaseModel):
+    """对已保存助手消息的结构化反馈。"""
+
     message_id: str
     rating: Literal["correct", "incorrect", "missing_source", "irrelevant_source"]
     comment: str | None = Field(default=None, max_length=2000)
 
 
 class UsageOut(BaseModel):
+    """单个注册模型的本地配额用量概览。"""
+
     model_id: str
     tier: str
     quota_tokens: int
@@ -124,6 +146,8 @@ class UsageOut(BaseModel):
 
 
 class SourceOut(BaseModel):
+    """引用分块的完整内容、版本和来源位置。"""
+
     chunk_id: str
     document_id: str
     version_id: str

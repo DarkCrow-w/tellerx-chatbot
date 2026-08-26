@@ -42,7 +42,7 @@ Do not wrap JSON in Markdown. Do not cite evidence that does not directly suppor
 
 @dataclass(slots=True)
 class ValidatedAnswer:
-    """An answer whose claims and source quotes passed server-side checks."""
+    """声明和来源原文均已通过服务端校验的回答。"""
 
     status: str
     answer: str
@@ -51,17 +51,17 @@ class ValidatedAnswer:
 
 
 class AnswerValidationError(ValueError):
-    """Raised when model output violates the evidence response contract."""
+    """模型输出违反证据响应契约时抛出。"""
 
 
 def _normalize_for_quote(text: str) -> str:
-    """Normalize layout whitespace without weakening exact quote matching."""
+    """只规范化排版空白，不放宽原文引用的精确匹配要求。"""
 
     return re.sub(r"\s+", " ", text).strip()
 
 
 def _repair_ellipsis_quote(quote: str, source: str) -> str | None:
-    """Expand model ellipses only into a bounded exact source span."""
+    """仅在有界范围内把模型省略号恢复成连续的来源原文。"""
 
     parts = [
         _normalize_for_quote(part)
@@ -86,9 +86,11 @@ def _repair_ellipsis_quote(quote: str, source: str) -> str | None:
 
 
 def _repair_formatting_quote(quote: str, source: str) -> str | None:
-    """Recover an exact source span when only layout punctuation differs."""
+    """当差异仅来自排版标点时，恢复对应的精确来源片段。"""
 
     def compact(text: str) -> tuple[str, list[int]]:
+        """保留字母数字及其原始位置，供紧凑文本反向定位。"""
+
         characters: list[str] = []
         positions: list[int] = []
         for position, character in enumerate(text):
@@ -111,7 +113,7 @@ def _repair_formatting_quote(quote: str, source: str) -> str | None:
 
 
 def _repair_anchored_quote(quote: str, source: str) -> str | None:
-    """Recover exact source text around unchanged names, IDs, and values."""
+    """围绕未变化的名称、标识和值，尝试恢复精确来源文本。"""
 
     folded_source = source.casefold()
     precision = [
@@ -131,9 +133,7 @@ def _repair_anchored_quote(quote: str, source: str) -> str | None:
         *re.findall(r"[\u3400-\u9fff]{2,20}", quote),
     ]
     descriptive = list(dict.fromkeys(descriptive))
-    matched_descriptive = [
-        value for value in descriptive if value.casefold() in folded_source
-    ]
+    matched_descriptive = [value for value in descriptive if value.casefold() in folded_source]
     if descriptive and len(matched_descriptive) / len(descriptive) < 0.7:
         return None
     anchors = list(dict.fromkeys([*matched_descriptive, *precision]))
@@ -164,7 +164,7 @@ def refusal_text(
     validation_failed: bool = False,
     generation_unavailable: bool = False,
 ) -> str:
-    """Return a deterministic refusal without leaking provider diagnostics."""
+    """返回确定性拒答文案，同时不泄露模型供应商内部诊断信息。"""
 
     chinese = bool(re.search(r"[\u3400-\u9fff]", question))
     if generation_unavailable:
@@ -192,7 +192,7 @@ def build_evidence_prompt(
     prompt_version: str,
     requested_facts: tuple[str, ...] = (),
 ) -> str:
-    """Serialize only selected evidence and stable provenance into the model prompt."""
+    """只把已选证据和稳定来源信息序列化进模型提示词。"""
 
     blocks = []
     for item in evidence:
@@ -229,12 +229,12 @@ def build_evidence_prompt(
 
 
 def fit_evidence_budget(evidence: list[Evidence], max_tokens: int) -> list[Evidence]:
-    """Keep evidence order while fitting the configured context budget."""
+    """在上下文预算内按原顺序选择证据，避免重排语义被破坏。"""
 
     selected: list[Evidence] = []
     used = 0
     for item in evidence:
-        # The fixed overhead covers provenance labels around every content block.
+        # 固定开销用于估算每段内容外围的来源标签和结构标记。
         cost = estimate_tokens(item.content) + 40
         if selected and used + cost > max_tokens:
             continue
@@ -244,18 +244,21 @@ def fit_evidence_budget(evidence: list[Evidence], max_tokens: int) -> list[Evide
 
 
 def validate_answer(payload: dict[str, Any], evidence: list[Evidence]) -> ValidatedAnswer:
-    """Validate status, claims, evidence IDs, and verbatim source quotes.
+    """校验状态、声明、证据 ID 和逐字来源引用。
 
-    The free-form top-level model answer is never returned directly.  The final
-    answer is reconstructed from validated claim text so an uncited sentence
-    cannot bypass the citation gate.
+    顶层自由文本不会直接返回；最终答案由已校验声明重新拼装，确保未引用的句子
+    无法绕过证据门禁。
     """
 
     allowed_statuses = {"answered", "insufficient_evidence", "conflict"}
     status = payload.get("status")
     answer = payload.get("answer")
     raw_claims = payload.get("claims")
-    if status not in allowed_statuses or not isinstance(answer, str) or not isinstance(raw_claims, list):
+    if (
+        status not in allowed_statuses
+        or not isinstance(answer, str)
+        or not isinstance(raw_claims, list)
+    ):
         raise AnswerValidationError("Missing or invalid status, answer, or claims")
     if status == "insufficient_evidence":
         if raw_claims:

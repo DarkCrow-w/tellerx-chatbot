@@ -13,14 +13,14 @@ router = APIRouter(tags=["health"])
 
 @router.get("/health/live")
 def live() -> dict:
-    """Confirm only that the API process can serve requests."""
+    """仅确认 API 进程仍能处理请求，不检查外部依赖。"""
 
     return {"status": "ok"}
 
 
 @router.get("/health/ready")
 def ready(db: Session = Depends(get_db)) -> dict:
-    """Fail readiness unless PostgreSQL and its FTS/pgvector schema are available."""
+    """仅当 PostgreSQL 及其 FTS/pgvector 结构可用时才通过就绪检查。"""
 
     try:
         db.execute(text("SELECT 1"))

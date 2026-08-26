@@ -15,16 +15,12 @@ router = APIRouter(tags=["operations"])
 
 @router.get("/index/status", response_model=IndexStatusOut)
 def index_status(db: Session = Depends(get_db)) -> dict:
-    """Combine PostgreSQL search health with durable indexing invariants."""
+    """汇总 PostgreSQL 搜索健康状态和持久化索引一致性指标。"""
 
     settings = get_settings()
     state = search_index().status()
-    eligible = (
-        (DocumentVersion.lifecycle_status == "draft")
-        | (
-            (DocumentVersion.lifecycle_status == "approved")
-            & (DocumentVersion.is_current.is_(True))
-        )
+    eligible = (DocumentVersion.lifecycle_status == "draft") | (
+        (DocumentVersion.lifecycle_status == "approved") & (DocumentVersion.is_current.is_(True))
     )
     has_current_embedding = (
         select(ChunkEmbedding.id)
@@ -50,21 +46,21 @@ def index_status(db: Session = Depends(get_db)) -> dict:
     )
     state["pending_events"] = int(
         db.scalar(
-            select(func.count()).select_from(OutboxEvent).where(
-                OutboxEvent.status.in_(["pending", "processing"])
-            )
+            select(func.count())
+            .select_from(OutboxEvent)
+            .where(OutboxEvent.status.in_(["pending", "processing"]))
         )
         or 0
     )
     state["dead_events"] = int(
-        db.scalar(
-            select(func.count()).select_from(OutboxEvent).where(OutboxEvent.status == "dead")
-        )
+        db.scalar(select(func.count()).select_from(OutboxEvent).where(OutboxEvent.status == "dead"))
         or 0
     )
     state["sync_differences"] = int(
         db.scalar(
-            select(func.count()).select_from(IndexSyncState).where(
+            select(func.count())
+            .select_from(IndexSyncState)
+            .where(
                 (IndexSyncState.status.in_(["pending", "mismatch", "failed"]))
                 | (
                     (IndexSyncState.status == "verified")
@@ -79,21 +75,21 @@ def index_status(db: Session = Depends(get_db)) -> dict:
 
 @router.post("/admin/indexes/reconcile")
 def reconcile_index(repair: bool = False, db: Session = Depends(get_db)) -> dict:
-    """Compare source tables with the PostgreSQL search projection and repair drift."""
+    """比较事实表与 PostgreSQL 搜索投影，并按需修复漂移。"""
 
     return indexing_service().reconcile(db, repair=repair)
 
 
 @router.get("/models/usage", response_model=list[UsageOut])
 def model_usage(db: Session = Depends(get_db)) -> list[dict]:
-    """Return the local routing estimate; provider billing remains authoritative."""
+    """返回本地路由配额估算；最终账单仍以供应商统计为准。"""
 
     return model_router().usage_rows(db)
 
 
 @router.post("/internal/diagnostics/qwen")
 def diagnostics_notice() -> dict:
-    """Prevent paid credential diagnostics from being exposed over HTTP."""
+    """阻止带付费凭证的诊断能力经 HTTP 暴露。"""
 
     return {
         "status": "disabled-over-http",

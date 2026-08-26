@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 
 def version_manifest_hash(chunks: list[Chunk]) -> str:
+    """按分块顺序生成版本清单哈希，用于检测搜索投影缺失或内容漂移。"""
+
     digest = hashlib.sha256()
     for chunk in sorted(chunks, key=lambda item: item.ordinal):
         digest.update(f"{chunk.ordinal}:{chunk.id}:{chunk.record_hash}\n".encode())
@@ -43,11 +45,15 @@ class IndexingService:
         index: SearchIndex,
         storage: LocalObjectStorage | None = None,
     ):
+        """组装搜索投影与不可变向量对象的访问依赖。"""
+
         self.settings = settings
         self.index = index
         self.storage = storage or LocalObjectStorage(settings.storage_root)
 
     def ensure_generation(self, db: Session) -> IndexGeneration:
+        """确保当前物理搜索索引存在对应的代次审计记录。"""
+
         physical = self.index.current_write_index()
         generation = db.scalar(
             select(IndexGeneration).where(IndexGeneration.physical_index == physical)
@@ -65,6 +71,8 @@ class IndexingService:
         return generation
 
     def _refresh_generation_counts(self, db: Session) -> None:
+        """刷新数据库事实表与搜索投影的分块数量快照。"""
+
         generation = self.ensure_generation(db)
         generation.expected_chunks = int(
             db.scalar(
@@ -88,6 +96,8 @@ class IndexingService:
 
     @staticmethod
     def _retire_sync_states(db: Session, version_id: str) -> None:
+        """将已退出搜索范围的版本同步记录标记为退役。"""
+
         for sync in db.scalars(
             select(IndexSyncState).where(IndexSyncState.version_id == version_id)
         ):
@@ -95,6 +105,8 @@ class IndexingService:
             sync.indexed_chunks = 0
 
     def claim_next_event(self, db: Session) -> str | None:
+        """用行锁和短租约领取一个待发布 Outbox 事件。"""
+
         now = datetime.now(UTC)
         event = db.scalar(
             select(OutboxEvent)
@@ -116,6 +128,8 @@ class IndexingService:
         return event.id
 
     def recover_expired_leases(self, db: Session) -> int:
+        """把因 Worker 异常退出而过期的发布事件放回待处理队列。"""
+
         now = datetime.now(UTC)
         events = list(
             db.scalars(
@@ -132,7 +146,11 @@ class IndexingService:
             db.commit()
         return len(events)
 
-    def _documents_for_version(self, db: Session, version_id: str) -> tuple[DocumentVersion, list[dict]]:
+    def _documents_for_version(
+        self, db: Session, version_id: str
+    ) -> tuple[DocumentVersion, list[dict]]:
+        """将数据库中的版本事实与向量对象组装成搜索投影记录。"""
+
         version = db.scalar(
             select(DocumentVersion)
             .options(joinedload(DocumentVersion.document).joinedload(Document.project))
@@ -144,17 +162,21 @@ class IndexingService:
         chunks = list(
             db.scalars(select(Chunk).where(Chunk.version_id == version_id).order_by(Chunk.ordinal))
         )
-        cache_by_chunk = {
-            chunk_id: cache
-            for chunk_id, cache in db.execute(
-                select(ChunkEmbedding.chunk_id, EmbeddingCache)
-                .join(EmbeddingCache, ChunkEmbedding.cache_id == EmbeddingCache.id)
-                .where(
-                    ChunkEmbedding.chunk_id.in_([chunk.id for chunk in chunks]),
-                    ChunkEmbedding.embedding_fingerprint == self.settings.embedding_fingerprint,
-                )
-            ).all()
-        } if chunks else {}
+        cache_by_chunk = (
+            {
+                chunk_id: cache
+                for chunk_id, cache in db.execute(
+                    select(ChunkEmbedding.chunk_id, EmbeddingCache)
+                    .join(EmbeddingCache, ChunkEmbedding.cache_id == EmbeddingCache.id)
+                    .where(
+                        ChunkEmbedding.chunk_id.in_([chunk.id for chunk in chunks]),
+                        ChunkEmbedding.embedding_fingerprint == self.settings.embedding_fingerprint,
+                    )
+                ).all()
+            }
+            if chunks
+            else {}
+        )
         rows = []
         for chunk in chunks:
             row = {
@@ -192,6 +214,8 @@ class IndexingService:
         return version, rows
 
     def publish_event(self, db: Session, event_id: str) -> bool:
+        """幂等发布 Outbox 事件，并用退避策略记录可重试或最终失败。"""
+
         event = db.get(OutboxEvent, event_id)
         if not event:
             raise ValueError(f"Unknown outbox event: {event_id}")
@@ -234,6 +258,7 @@ class IndexingService:
             db.rollback()
             event = db.get(OutboxEvent, event_id)
             if event:
+                # 前四次失败采用指数退避；达到上限后进入 dead，避免无限热重试。
                 event.status = "dead" if event.attempts >= 5 else "pending"
                 event.available_at = datetime.now(UTC) + timedelta(
                     seconds=min(300, 2 ** min(event.attempts, 8))
@@ -251,6 +276,8 @@ class IndexingService:
             return False
 
     def _publish_version(self, db: Session, event: OutboxEvent) -> None:
+        """发布并校验完整版本，校验通过后再原子切换当前批准版本。"""
+
         version, documents = self._documents_for_version(db, event.aggregate_id)
         if not documents:
             raise ValueError(f"Version {version.id} has no chunks")
@@ -260,6 +287,7 @@ class IndexingService:
         )
         actual = self.index.count_version(version.id)
         expected = len(documents)
+        # 搜索投影未完整写入时绝不能切换 current，否则查询会看到半个版本。
         if actual != expected:
             raise RuntimeError(
                 f"PostgreSQL search verification failed for {version.id}: "
@@ -309,8 +337,8 @@ class IndexingService:
                 old_version.lifecycle_status = "deprecated"
                 old_version.effective_to = now
                 old_version.technical_status = "superseded"
-            # Release the partial unique slot before setting the replacement
-            # current, while keeping the whole switch in one DB transaction.
+            # partial unique 约束要求同一文档只能有一个 current；先在同一事务中
+            # 释放旧版本占位，再设置新版本，外部不会观察到切换的中间态。
             db.flush()
 
         version.indexed_at = now
@@ -333,6 +361,8 @@ class IndexingService:
             job.finished_at = now
 
     def reconcile(self, db: Session, *, repair: bool = False) -> dict[str, object]:
+        """比对事实表与搜索投影；可选地为不一致版本触发重建。"""
+
         generation = self.ensure_generation(db)
         versions = list(
             db.scalars(
@@ -367,9 +397,7 @@ class IndexingService:
             actual = len(records)
             actual_manifest_digest = hashlib.sha256()
             for ordinal, chunk_id, record_hash in records:
-                actual_manifest_digest.update(
-                    f"{ordinal}:{chunk_id}:{record_hash}\n".encode()
-                )
+                actual_manifest_digest.update(f"{ordinal}:{chunk_id}:{record_hash}\n".encode())
             actual_manifest = actual_manifest_digest.hexdigest()
             sync = db.scalar(
                 select(IndexSyncState).where(

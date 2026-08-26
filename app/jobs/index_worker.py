@@ -16,11 +16,15 @@ running = True
 
 
 def _stop(*_: object) -> None:
+    """收到终止信号后停止 Worker 主循环。"""
+
     global running
     running = False
 
 
 def main() -> None:
+    """持续发布 Outbox 事件，并定期校验、修复搜索投影。"""
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
@@ -30,10 +34,7 @@ def main() -> None:
     with SessionLocal() as db:
         service.recover_expired_leases(db)
     while running:
-        if (
-            settings.index_reconcile_interval_seconds > 0
-            and time.monotonic() >= next_reconcile
-        ):
+        if settings.index_reconcile_interval_seconds > 0 and time.monotonic() >= next_reconcile:
             with SessionLocal() as db:
                 try:
                     report = service.reconcile(db, repair=True)
@@ -44,12 +45,8 @@ def main() -> None:
                         report["repaired"],
                     )
                 except Exception:
-                    logging.getLogger(__name__).exception(
-                        "Scheduled index reconciliation failed"
-                    )
-            next_reconcile = (
-                time.monotonic() + settings.index_reconcile_interval_seconds
-            )
+                    logging.getLogger(__name__).exception("Scheduled index reconciliation failed")
+            next_reconcile = time.monotonic() + settings.index_reconcile_interval_seconds
         with SessionLocal() as db:
             event_id = service.claim_next_event(db)
         if not event_id:
@@ -61,6 +58,8 @@ def main() -> None:
 
 
 def reconcile_main() -> None:
+    """提供一次性索引一致性检查命令，可显式开启修复。"""
+
     parser = argparse.ArgumentParser(description="Verify PostgreSQL chunk search storage")
     parser.add_argument("--repair", action="store_true")
     args = parser.parse_args()

@@ -63,18 +63,33 @@ ZH_DEFINITION_SUBJECT = re.compile(
     r"如何定义|怎么样|有什么作用|如何使用)"
 )
 ZH_BARE_BLOCKERS = (
-    "当前", "最新", "发生", "执行", "需要", "使用", "如果", "怎么办",
-    "如何", "为什么", "什么", "多少", "哪个", "比较", "区别", "是否",
-    "门槛", "接口", "审批", "超时",
+    "当前",
+    "最新",
+    "发生",
+    "执行",
+    "需要",
+    "使用",
+    "如果",
+    "怎么办",
+    "如何",
+    "为什么",
+    "什么",
+    "多少",
+    "哪个",
+    "比较",
+    "区别",
+    "是否",
+    "门槛",
+    "接口",
+    "审批",
+    "超时",
 )
 ZH_DEFINITION_TAIL = re.compile(
     r"(?:的)?(?:当前|最新|正式)?(?:中文控制规则|控制规则|治理责任人|业务负责人|审批角色|"
     r"审批阈值|失败队列|接口路径|策略|规则|门槛|阈值|接口|状态|责任人|负责人|超时)$"
 )
 ZH_POLITE_PREFIXES = (
-    re.compile(
-        r"^(?:请问|请|麻烦(?:你)?|烦请|劳驾|能否|可否|你能(?:否)?|可以(?:请)?|是否可以)\s*"
-    ),
+    re.compile(r"^(?:请问|请|麻烦(?:你)?|烦请|劳驾|能否|可否|你能(?:否)?|可以(?:请)?|是否可以)\s*"),
     re.compile(
         r"^(?:(?:你)?帮我|为我|给我|我想(?:要|知道|了解)?(?:一下|下)?|"
         r"想(?:要|知道|了解)?(?:一下|下)?)\s*"
@@ -88,13 +103,13 @@ ZH_POLITE_PREFIXES = (
 
 
 def normalize_query(value: str) -> str:
-    """Normalize user input without destroying case-sensitive entity signals."""
+    """规范化用户输入，同时保留大小写敏感的实体信号。"""
 
     return " ".join(unicodedata.normalize("NFKC", value).split())
 
 
 def _strip_polite_prefixes(query: str) -> str:
-    """Remove request scaffolding while preserving the business phrase."""
+    """移除中文请求套话，但保留真正的业务短语。"""
 
     value = query.strip(" \t\r\n，,。.!！?？；;：:")
     changed = True
@@ -109,7 +124,7 @@ def _strip_polite_prefixes(query: str) -> str:
 
 
 def _query_subject_signals(query: str) -> list[str]:
-    """Extract high-confidence subjects from common Chinese and English phrasing."""
+    """从常见中英文问法中提取高置信业务主题。"""
 
     normalized = normalize_query(query)
     cleaned = _strip_polite_prefixes(normalized)
@@ -159,7 +174,7 @@ def _query_subject_signals(query: str) -> list[str]:
 
 
 def _lexical_signals(query: str) -> list[str]:
-    """Extract stable identifiers and business entities without another model call."""
+    """无需模型调用，确定性提取稳定标识和业务实体。"""
 
     normalized = normalize_query(query)
     values = [*EXACT_IDENTIFIER.findall(normalized), *ACRONYM.findall(normalized)]
@@ -169,20 +184,22 @@ def _lexical_signals(query: str) -> list[str]:
 
 
 def _source_status(source: dict[str, Any]) -> str:
+    """兼容搜索投影与业务对象的状态字段名。"""
+
     return str(source.get("lifecycle_status") or source.get("document_status") or "")
 
 
 def normalize_search_text(value: str) -> str:
+    """生成适合索引比较的 NFKC、大小写不敏感文本。"""
+
     return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
 
 
 def lexical_tokens(value: str, *, limit: int = 512) -> list[str]:
-    """Create deterministic mixed Chinese/English tokens for PostgreSQL FTS.
+    """为 PostgreSQL 全文检索生成确定性的中英文混合 Token。
 
-    PostgreSQL's built-in parser does not segment Chinese business names.  The
-    application therefore stores ASCII words and overlapping CJK bigrams.  The
-    full CJK span is retained for short names so exact internal terminology is
-    still highly discriminative without a server-side tokenizer extension.
+    PostgreSQL 内置解析器不会切分中文业务名，因此应用侧保存英文单词、重叠的
+    中文二元组以及较短的完整中文短语，无需服务端分词扩展也能区分内部术语。
     """
 
     normalized = normalize_search_text(value)
@@ -199,24 +216,32 @@ def lexical_tokens(value: str, *, limit: int = 512) -> list[str]:
 
 
 def _vector_literal(vector: Iterable[float]) -> str:
+    """将向量编码为 pgvector 可解析且精度稳定的文本字面量。"""
+
     return "[" + ",".join(format(float(value), ".9g") for value in vector) + "]"
 
 
 class SearchIndex:
-    """PostgreSQL full-text and pgvector implementation of the search port."""
+    """基于 PostgreSQL 全文检索与 pgvector 的搜索端口实现。"""
 
     table_name = "chunk_search_index"
 
     def __init__(self, settings: Settings, engine: Engine | Any | None = None):
+        """初始化搜索表配置，并允许测试注入数据库引擎。"""
+
         self.settings = settings
         self.table_name = settings.postgres_search_table
         self.engine = engine or create_engine(settings.database_url, pool_pre_ping=True)
 
     def close(self) -> None:
+        """释放搜索数据库连接池。"""
+
         self.engine.dispose()
 
     @staticmethod
     def _source_select() -> str:
+        """返回各检索通道共用的来源字段投影。"""
+
         return """
             s.chunk_id,
             c.id AS source_chunk_id,
@@ -247,6 +272,8 @@ class SearchIndex:
 
     @staticmethod
     def _joins() -> str:
+        """返回搜索投影关联事实表的公共 JOIN 片段。"""
+
         return """
             FROM chunk_search_index s
             JOIN chunks c ON c.id = s.chunk_id
@@ -256,6 +283,8 @@ class SearchIndex:
 
     @staticmethod
     def _hit(row: Any, score: float | None = None) -> dict[str, Any]:
+        """将 SQL 行转换成检索服务使用的统一命中结构。"""
+
         mapping = dict(row._mapping if hasattr(row, "_mapping") else row)
         mapping.pop("source_chunk_id", None)
         raw_score = float(score if score is not None else mapping.pop("score", 0.0) or 0.0)
@@ -264,6 +293,8 @@ class SearchIndex:
 
     @staticmethod
     def _status_clause(statuses: list[str], params: dict[str, Any]) -> str:
+        """构造版本生命周期过滤；approved 只允许当前版本。"""
+
         clauses: list[str] = []
         if "approved" in statuses:
             clauses.append("(v.lifecycle_status = 'approved' AND v.is_current IS TRUE)")
@@ -281,6 +312,8 @@ class SearchIndex:
         principal_ids: list[str] | None,
         params: dict[str, Any],
     ) -> tuple[str, list[str]]:
+        """统一拼装项目、状态、可搜索性和 ACL 数据权限范围。"""
+
         clauses = [
             cls._status_clause(statuses, params),
             "v.technical_status = 'searchable'",
@@ -308,32 +341,44 @@ class SearchIndex:
 
     @staticmethod
     def _statement(sql: str, expanding: list[str] | None = None):
+        """为 SQLAlchemy IN 参数绑定 expanding 语义。"""
+
         statement = text(sql)
         for name in expanding or []:
             statement = statement.bindparams(bindparam(name, expanding=True))
         return statement
 
     def current_write_index(self) -> str:
+        """返回包含向量指纹的当前写入目标标识。"""
+
         return f"postgresql:{self.table_name}:{self.settings.embedding_fingerprint}"
 
     def current_read_index(self) -> str:
+        """返回当前读取目标；PostgreSQL 实现与写入目标相同。"""
+
         return self.current_write_index()
 
     def trace_index_name(self) -> str:
+        """返回写入查询追踪记录的搜索目标名称。"""
+
         return self.current_read_index()
 
     def ensure_index(self) -> None:
-        """Fail startup when migrations or required PostgreSQL extensions are missing."""
+        """迁移表或必要 PostgreSQL 扩展缺失时让应用启动失败。"""
 
         with self.engine.connect() as connection:
-            row = connection.execute(
-                text(
-                    "SELECT to_regclass(:table_name) IS NOT NULL AS table_ready, "
-                    "EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') AS vector_ready, "
-                    "EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm') AS trgm_ready"
-                ),
-                {"table_name": self.table_name},
-            ).mappings().one()
+            row = (
+                connection.execute(
+                    text(
+                        "SELECT to_regclass(:table_name) IS NOT NULL AS table_ready, "
+                        "EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') AS vector_ready, "
+                        "EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm') AS trgm_ready"
+                    ),
+                    {"table_name": self.table_name},
+                )
+                .mappings()
+                .one()
+            )
         missing = [
             name
             for name, ready in (
@@ -347,27 +392,30 @@ class SearchIndex:
             raise RuntimeError("PostgreSQL search schema is not ready: " + ", ".join(missing))
 
     def create_index(self, _: str) -> None:
+        """兼容搜索端口的建索引入口；实际结构由数据库迁移创建。"""
+
         self.ensure_index()
 
     def activate_alias(self, _: str | None = None) -> None:
-        # PostgreSQL updates are transactional; no external alias switch exists.
+        """兼容别名切换端口；PostgreSQL 实现只需验证结构。"""
+
+        # PostgreSQL 更新本身具备事务性，不存在外部搜索引擎的别名切换步骤。
         self.ensure_index()
 
     @staticmethod
     def _document_text(document: dict[str, Any]) -> tuple[str, str, list[str]]:
+        """生成原文、带字段权重的词法文本及精确标识集合。"""
+
         filename = str(document.get("filename") or "")
         title = str(document.get("title_path") or document.get("heading_path") or "")
         content = str(document.get("content") or "")
         raw_text = normalize_search_text(f"{filename} {title} {content}")
-        # Preserve repetitions after tokenization. lexical_tokens intentionally
-        # deduplicates one field, so repeating the raw field before tokenizing
-        # would silently discard the intended filename/title weight.
+        # lexical_tokens 会在单字段内去重，因此必须先分别分词再重复 Token，才能
+        # 真正保留文件名和标题的权重。
         filename_tokens = lexical_tokens(filename)
         title_tokens = lexical_tokens(title)
         content_tokens = lexical_tokens(content)
-        lexical_text = " ".join(
-            filename_tokens * 4 + title_tokens * 3 + content_tokens
-        )
+        lexical_text = " ".join(filename_tokens * 4 + title_tokens * 3 + content_tokens)
         supplied = document.get("exact_terms") or document.get("identifiers") or []
         exact_terms = {
             str(value).casefold()
@@ -386,6 +434,8 @@ class SearchIndex:
         *,
         target_index: str | None = None,
     ) -> None:
+        """批量 UPSERT 分块搜索投影；无向量记录仍可参与词法检索。"""
+
         del target_index
         if not documents:
             return
@@ -430,6 +480,8 @@ class SearchIndex:
             connection.execute(sql, rows)
 
     def delete_version(self, version_id: str) -> None:
+        """删除指定文档版本的全部搜索投影。"""
+
         with self.engine.begin() as connection:
             connection.execute(
                 text(
@@ -440,10 +492,14 @@ class SearchIndex:
             )
 
     def clear(self) -> None:
+        """清空全部搜索投影，供受控的离线重建使用。"""
+
         with self.engine.begin() as connection:
             connection.execute(text("DELETE FROM chunk_search_index"))
 
     def delete_stale_version_chunks(self, version_id: str, current_chunk_ids: list[str]) -> None:
+        """删除重建后不再属于当前版本清单的陈旧分块投影。"""
+
         params: dict[str, Any] = {"version_id": version_id}
         sql = (
             "DELETE FROM chunk_search_index s USING chunks c "
@@ -458,7 +514,7 @@ class SearchIndex:
             connection.execute(self._statement(sql, expanding), params)
 
     def prune_ineligible(self) -> int:
-        """Remove rows whose source chunk is no longer an active searchable version."""
+        """移除来源版本已不再有效可搜索的孤立投影。"""
 
         with self.engine.begin() as connection:
             result = connection.execute(
@@ -483,21 +539,20 @@ class SearchIndex:
         top_k: int,
         principal_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        """执行带精确标识提升、中文信号匹配和 ACL 过滤的词法检索。"""
+
         normalized = normalize_search_text(query)
         tokens = lexical_tokens(normalized, limit=64)
         if not tokens:
             return []
         params: dict[str, Any] = {
-            # websearch_to_tsquery is deliberately used instead of to_tsquery:
-            # user-facing identifiers can contain '-' or '/', and malformed
-            # tsquery syntax must never turn a normal knowledge query into 500.
+            # 使用 websearch_to_tsquery 是为了容忍含 -、/ 的业务标识；用户输入的
+            # 非法 tsquery 语法不能让普通知识查询变成 500 错误。
             "ts_query": " OR ".join(f'"{token}"' for token in tokens),
             "raw_query": normalized,
             "top_k": top_k,
         }
-        scope, expanding = self._scope_clause(
-            project_ids, statuses, principal_ids, params
-        )
+        scope, expanding = self._scope_clause(project_ids, statuses, principal_ids, params)
         exact_terms = sorted(
             {
                 *[value.casefold() for value in EXACT_IDENTIFIER.findall(normalized)],
@@ -508,7 +563,9 @@ class SearchIndex:
         exact_match = "FALSE"
         if exact_terms:
             params["exact_terms"] = exact_terms
-            exact_score = "CASE WHEN s.exact_terms && CAST(:exact_terms AS text[]) THEN 100.0 ELSE 0.0 END"
+            exact_score = (
+                "CASE WHEN s.exact_terms && CAST(:exact_terms AS text[]) THEN 100.0 ELSE 0.0 END"
+            )
             exact_match = "s.exact_terms && CAST(:exact_terms AS text[])"
         signals = [
             signal
@@ -555,20 +612,19 @@ class SearchIndex:
         top_k: int,
         principal_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        """在同一数据权限范围内执行余弦相似度向量检索。"""
+
         params: dict[str, Any] = {
             "embedding": _vector_literal(vector),
             "embedding_fingerprint": self.settings.embedding_fingerprint,
             "top_k": top_k,
         }
-        scope, expanding = self._scope_clause(
-            project_ids, statuses, principal_ids, params
-        )
+        scope, expanding = self._scope_clause(project_ids, statuses, principal_ids, params)
         threshold = ""
         if self.settings.vector_min_similarity is not None:
             params["minimum_similarity"] = self.settings.vector_min_similarity
             threshold = (
-                "AND (1.0 - (s.embedding <=> CAST(:embedding AS vector))) "
-                ">= :minimum_similarity"
+                "AND (1.0 - (s.embedding <=> CAST(:embedding AS vector))) >= :minimum_similarity"
             )
         sql = f"""
             SELECT {self._source_select()},
@@ -587,6 +643,8 @@ class SearchIndex:
         return [self._hit(row) for row in rows]
 
     def _configure_vector_scan(self, connection: Connection) -> None:
+        """为当前事务配置 HNSW 搜索深度和严格有序的迭代扫描。"""
+
         ef_search = max(40, int(self.settings.pgvector_hnsw_ef_search))
         connection.execute(text(f"SET LOCAL hnsw.ef_search = {ef_search}"))
         connection.execute(text("SET LOCAL hnsw.iterative_scan = strict_order"))
@@ -599,15 +657,15 @@ class SearchIndex:
         top_k: int,
         principal_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        """按文档批量取回有序分块，用于相邻内容和跨文档关系扩展。"""
+
         if not document_ids:
             return []
         params: dict[str, Any] = {
             "document_ids": list(dict.fromkeys(document_ids)),
             "top_k": top_k,
         }
-        scope, expanding = self._scope_clause(
-            project_ids, statuses, principal_ids, params
-        )
+        scope, expanding = self._scope_clause(project_ids, statuses, principal_ids, params)
         expanding.append("document_ids")
         sql = f"""
             SELECT {self._source_select()}, 0.0 AS score
@@ -621,6 +679,8 @@ class SearchIndex:
         return [self._hit(row) for row in rows]
 
     def count_version(self, version_id: str, *, target_index: str | None = None) -> int:
+        """统计指定文档版本已发布的分块数量。"""
+
         del target_index
         with self.engine.connect() as connection:
             return int(
@@ -635,11 +695,15 @@ class SearchIndex:
             )
 
     def count_all(self, *, target_index: str | None = None) -> int:
+        """统计当前搜索投影中的全部分块。"""
+
         del target_index
         with self.engine.connect() as connection:
             return int(connection.scalar(text("SELECT count(*) FROM chunk_search_index")) or 0)
 
     def version_records(self, version_id: str) -> list[tuple[int, str, str]]:
+        """返回构建版本清单哈希所需的有序投影元组。"""
+
         with self.engine.connect() as connection:
             rows = connection.execute(
                 text(
@@ -652,6 +716,8 @@ class SearchIndex:
         return [(int(row[0]), str(row[1]), str(row[2])) for row in rows]
 
     def ping(self) -> bool:
+        """执行轻量连通性检查，不向调用方泄露数据库异常。"""
+
         try:
             with self.engine.connect() as connection:
                 connection.execute(text("SELECT 1"))
@@ -660,19 +726,25 @@ class SearchIndex:
             return False
 
     def status(self) -> dict[str, Any]:
+        """返回数据库、扩展、投影表和已索引数量的运维状态。"""
+
         try:
             with self.engine.connect() as connection:
-                row = connection.execute(
-                    text(
-                        "SELECT current_setting('server_version') AS server_version, "
-                        "(SELECT extversion FROM pg_extension WHERE extname = 'vector') "
-                        "AS vector_version, "
-                        "(SELECT extversion FROM pg_extension WHERE extname = 'pg_trgm') "
-                        "AS trgm_version, "
-                        "to_regclass(:table_name) IS NOT NULL AS table_ready"
-                    ),
-                    {"table_name": self.table_name},
-                ).mappings().one()
+                row = (
+                    connection.execute(
+                        text(
+                            "SELECT current_setting('server_version') AS server_version, "
+                            "(SELECT extversion FROM pg_extension WHERE extname = 'vector') "
+                            "AS vector_version, "
+                            "(SELECT extversion FROM pg_extension WHERE extname = 'pg_trgm') "
+                            "AS trgm_version, "
+                            "to_regclass(:table_name) IS NOT NULL AS table_ready"
+                        ),
+                        {"table_name": self.table_name},
+                    )
+                    .mappings()
+                    .one()
+                )
                 indexed_chunks = (
                     int(connection.scalar(text("SELECT count(*) FROM chunk_search_index")) or 0)
                     if row["table_ready"]

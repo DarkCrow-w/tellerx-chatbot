@@ -9,6 +9,8 @@ from dataclasses import dataclass
 
 @dataclass(slots=True)
 class ParsedUnit:
+    """解析器输出的最小逻辑单元，保留原文位置和表格属性。"""
+
     text: str
     heading_path: str | None = None
     page_number: int | None = None
@@ -19,6 +21,8 @@ class ParsedUnit:
 
 @dataclass(slots=True)
 class TextChunk:
+    """可索引文本分块及其稳定内容哈希、顺序和来源位置。"""
+
     ordinal: int
     content: str
     content_hash: str
@@ -34,6 +38,8 @@ _WORD = re.compile(r"[A-Za-z0-9_./:+#-]+")
 
 
 def estimate_tokens(text: str) -> int:
+    """用中英文混合启发式快速估算 Token，避免依赖特定模型分词器。"""
+
     cjk = len(_CJK.findall(text))
     words = len(_WORD.findall(text))
     punctuation = max(0, len(text) - cjk - sum(len(x) for x in _WORD.findall(text)))
@@ -41,6 +47,8 @@ def estimate_tokens(text: str) -> int:
 
 
 def _split_long_text(text: str, max_tokens: int) -> list[str]:
+    """优先按段落和句子切分，超长单句才退化为字符窗口。"""
+
     paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
     if not paragraphs:
         return []
@@ -50,7 +58,9 @@ def _split_long_text(text: str, max_tokens: int) -> list[str]:
     for paragraph in paragraphs:
         paragraph_tokens = estimate_tokens(paragraph)
         if paragraph_tokens > max_tokens:
-            sentences = [s.strip() for s in re.split(r"(?<=[。！？.!?；;])\s*", paragraph) if s.strip()]
+            sentences = [
+                s.strip() for s in re.split(r"(?<=[。！？.!?；;])\s*", paragraph) if s.strip()
+            ]
         else:
             sentences = [paragraph]
         for sentence in sentences:
@@ -80,7 +90,12 @@ def chunk_units(
     max_tokens: int = 650,
     overlap_tokens: int = 60,
 ) -> list[TextChunk]:
-    del target_tokens  # max size is the hard invariant; source structure controls natural boundaries.
+    """按来源结构生成稳定分块，并为非表格正文保留有限上下文重叠。"""
+
+    # 最大尺寸是硬约束；自然边界由解析器保留的文档结构决定。
+    del (
+        target_tokens
+    )  # max size is the hard invariant; source structure controls natural boundaries.
     chunks: list[TextChunk] = []
     ordinal = 0
     for unit in units:
@@ -89,6 +104,7 @@ def chunk_units(
         for index, part in enumerate(parts):
             content = part
             if index > 0 and not unit.is_table and previous_tail:
+                # 表格行不能机械重叠，否则单元格坐标与内容会重复并误导引用。
                 content = f"{previous_tail}\n\n{part}"
                 if estimate_tokens(content) > max_tokens:
                     content = part

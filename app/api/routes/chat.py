@@ -16,7 +16,7 @@ router = APIRouter(tags=["chat"])
 
 @router.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
-    """Retrieve evidence, route one Qwen model, and return validated citations."""
+    """检索证据、路由千问模型，并只返回通过校验的引用。"""
 
     project_ids = list(dict.fromkeys(request.project_ids))
     if not project_ids:
@@ -40,7 +40,7 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
 
 @router.post("/feedback", status_code=201)
 def submit_feedback(payload: FeedbackIn, db: Session = Depends(get_db)) -> dict:
-    """Attach human feedback to a persisted assistant message."""
+    """把人工反馈关联到已持久化的助手消息。"""
 
     message = db.get(Message, payload.message_id)
     if not message or message.role != "assistant":

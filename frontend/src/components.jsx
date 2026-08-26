@@ -49,6 +49,7 @@ const STATUS = {
 };
 
 function SourceList({ sources }) {
+  /** 按需展开引用原文，避免长证据列表压过回答主体。 */
   const [open, setOpen] = useState(false);
   if (!sources?.length) return null;
 
@@ -89,9 +90,11 @@ function SourceList({ sources }) {
 }
 
 function AnswerActions({ answer, onToast }) {
+  /** 提供回答复制和本地即时反馈状态。 */
   const [vote, setVote] = useState(null);
 
   async function copyAnswer() {
+    /** 使用浏览器剪贴板 API，并为权限失败提供可理解提示。 */
     try {
       await navigator.clipboard.writeText(answer);
       onToast("回答已复制");
@@ -115,6 +118,7 @@ function AnswerActions({ answer, onToast }) {
 }
 
 export function Message({ message, onToast }) {
+  /** 根据消息角色和证据状态渲染用户气泡或助手回答。 */
   if (message.role === "user") {
     return (
       <article className="message user-message">
@@ -141,6 +145,7 @@ export function Message({ message, onToast }) {
 }
 
 export function Sidebar({ open, onClose, chats, activeId, onNew, onOpenChat, theme, onToggleTheme }) {
+  /** 渲染最近对话导航、知识库状态和主题切换。 */
   return (
     <>
       <aside className={`sidebar ${open ? "open" : ""}`} aria-label="对话导航">
@@ -192,6 +197,7 @@ export function Sidebar({ open, onClose, chats, activeId, onNew, onOpenChat, the
 }
 
 export function EmptyState({ onPrompt }) {
+  /** 展示新会话引导，并把示例问题填入编辑器而非直接发送。 */
   return (
     <section className="empty-state">
       <div className="assistant-orb"><Sparkles size={18} /><span>T</span></div>
@@ -213,6 +219,7 @@ export function EmptyState({ onPrompt }) {
 }
 
 export function Composer({ value, onChange, onSubmit, disabled, scope }) {
+  /** 自动调整输入框高度，并处理 Enter 发送与输入法组合态。 */
   const textareaRef = useRef(null);
 
   useEffect(() => {
@@ -223,6 +230,7 @@ export function Composer({ value, onChange, onSubmit, disabled, scope }) {
   }, [value]);
 
   function onKeyDown(event) {
+    // 中文输入法合成过程中按 Enter 只用于选词，不能误触发送。
     if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault();
       onSubmit(event);

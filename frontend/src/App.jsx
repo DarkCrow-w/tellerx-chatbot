@@ -5,7 +5,7 @@ import { askKnowledgeBase, listProjects } from "./api";
 import { Composer, EmptyState, Message, Sidebar } from "./components";
 import { getSavedChats, getSavedTheme, saveChats, saveTheme, uid } from "./storage";
 
-/** Top-level page state and use-case orchestration; visual details live in components.jsx. */
+/** 页面顶层状态与用例编排；纯视觉细节集中在 components.jsx。 */
 export default function App() {
   const [theme, setTheme] = useState(getSavedTheme);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -31,6 +31,7 @@ export default function App() {
     : projects.length > 1 ? "请先选择知识库项目" : "当前知识库";
 
   const newChat = useCallback(() => {
+    // 本地会话 ID 与服务端 conversationId 分离，新对话必须同时重置二者。
     setMessages([]);
     setConversationId(null);
     setLocalChatId(uid());
@@ -69,12 +70,14 @@ export default function App() {
   useEffect(() => () => clearTimeout(toastTimer.current), []);
 
   function showToast(message) {
+    /** 显示短暂提示，并覆盖尚未结束的上一次计时器。 */
     setToast(message);
     clearTimeout(toastTimer.current);
     toastTimer.current = setTimeout(() => setToast(""), 1800);
   }
 
   function persist(nextMessages, nextConversationId = conversationId) {
+    /** 把当前服务端会话的前端快照提升到最近列表首位。 */
     if (!nextMessages.length) return;
     const firstQuestion = nextMessages.find((message) => message.role === "user")?.content || "新对话";
     const nextChat = {
@@ -90,6 +93,7 @@ export default function App() {
   }
 
   function openChat(id) {
+    /** 恢复本地消息及对应服务端会话 ID，确保后续提问延续上下文。 */
     const chat = chats.find((item) => item.id === id);
     if (!chat) return;
     setLocalChatId(chat.id);
@@ -99,6 +103,7 @@ export default function App() {
   }
 
   function clearChat() {
+    /** 只清理浏览器中的当前快照，不删除服务端审计消息。 */
     if (!messages.length) return;
     const nextChats = chats.filter((chat) => chat.id !== localChatId);
     setChats(nextChats);
@@ -108,6 +113,7 @@ export default function App() {
   }
 
   async function submit(event) {
+    /** 乐观加入用户消息，等待服务端返回经过证据校验的回答。 */
     event?.preventDefault?.();
     const question = input.trim();
     if (!question || sending) return;

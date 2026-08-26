@@ -14,17 +14,25 @@ from typing import BinaryIO
 
 
 def safe_filename(name: str) -> str:
+    """移除目录与危险字符，生成仅用于展示的安全文件名。"""
+
     base = Path(name).name
     clean = re.sub(r"[^\w.()\-\u4e00-\u9fff ]+", "_", base, flags=re.UNICODE).strip()
     return clean[:240] or "document"
 
 
 class LocalObjectStorage:
+    """基于本地文件系统的不可变、内容寻址对象存储。"""
+
     def __init__(self, root: Path):
+        """初始化并确保对象存储根目录存在。"""
+
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
 
     def save(self, stream: BinaryIO, filename: str, max_bytes: int) -> tuple[Path, str, int]:
+        """流式保存上传文件，边读取边校验大小并计算内容哈希。"""
+
         name = safe_filename(filename)
         temp_path = self.root / f".{os.getpid()}-{uuid.uuid4().hex}-{name}.upload"
         digest = hashlib.sha256()
@@ -42,6 +50,7 @@ class LocalObjectStorage:
             target_dir.mkdir(parents=True, exist_ok=True)
             target = target_dir / f"{sha}-{name}"
             try:
+                # 硬链接提供“目标存在则不覆盖”的原子提交语义。
                 os.link(temp_path, target)
             except FileExistsError:
                 pass
@@ -52,6 +61,8 @@ class LocalObjectStorage:
             raise
 
     def resolve(self, storage_path: str) -> Path:
+        """解析对象路径，并阻止相对路径逃逸存储根目录。"""
+
         supplied = Path(storage_path)
         path = (supplied if supplied.is_absolute() else self.root / supplied).resolve()
         root = self.root.resolve()
@@ -60,6 +71,8 @@ class LocalObjectStorage:
         return path
 
     def save_bytes(self, relative_path: str, data: bytes) -> tuple[str, str, int]:
+        """以不可覆盖语义保存字节；同路径不同内容视为对象碰撞。"""
+
         target = self.resolve(relative_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256(data).hexdigest()
@@ -77,15 +90,21 @@ class LocalObjectStorage:
         return str(target.relative_to(self.root.resolve())), digest, len(data)
 
     def save_json(self, relative_path: str, value: object) -> tuple[str, str, int]:
+        """紧凑序列化并压缩 JSON 对象。"""
+
         data = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         return self.save_bytes(relative_path, zlib.compress(data, level=6))
 
     def load_json(self, object_uri: str) -> object:
+        """读取、解压并解析 JSON 对象。"""
+
         return json.loads(zlib.decompress(self.resolve(object_uri).read_bytes()))
 
     def save_vector(
         self, embedding_fingerprint: str, content_hash: str, vector: list[float]
     ) -> tuple[str, str, int]:
+        """按小端 float32 序列化并压缩向量。"""
+
         payload = struct.pack(f"<{len(vector)}f", *vector)
         return self.save_bytes(
             f"embeddings/{embedding_fingerprint}/{content_hash}.f32.zlib",
@@ -93,6 +112,8 @@ class LocalObjectStorage:
         )
 
     def load_vector(self, object_uri: str, dimensions: int, checksum: str) -> list[float]:
+        """校验校验和与维度后加载 float32 向量。"""
+
         compressed = self.resolve(object_uri).read_bytes()
         if hashlib.sha256(compressed).hexdigest() != checksum:
             raise ValueError(f"Embedding checksum mismatch for {object_uri}")

@@ -10,7 +10,7 @@ from app.integrations.qwen import QwenAPIError
 
 
 def _safe_error(component: str, exc: QwenAPIError, **fields: object) -> str:
-    """Expose actionable API metadata without logging credentials or response text."""
+    """只输出可操作的 API 元数据，不记录凭证或供应商响应正文。"""
     return json.dumps(
         {
             "component": component,
@@ -24,6 +24,8 @@ def _safe_error(component: str, exc: QwenAPIError, **fields: object) -> str:
 
 
 def diagnostics_main() -> None:
+    """显式探测向量、重排和聊天接口，并以退出码汇总失败。"""
+
     parser = argparse.ArgumentParser(description="Run minimal, explicit Qwen API diagnostics")
     parser.add_argument("--chat-model", default="qwen3.7-plus-2026-05-26")
     parser.add_argument("--skip-chat", action="store_true")

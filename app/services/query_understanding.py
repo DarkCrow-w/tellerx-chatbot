@@ -62,6 +62,8 @@ Do not wrap JSON in Markdown.
 
 
 class QueryModelRouter(Protocol):
+    """查询理解只依赖的最小模型路由接口。"""
+
     def call(
         self,
         db: Session,
@@ -72,11 +74,16 @@ class QueryModelRouter(Protocol):
         pinned_model: str | None = None,
         prompt_version: str | None = None,
         max_tokens: int | None = None,
-    ) -> ChatCallResult: ...
+    ) -> ChatCallResult:
+        """调用结构化查询规划模型。"""
+
+        ...
 
 
 @dataclass(frozen=True, slots=True)
 class QueryPlan:
+    """经过清洗、可审计且可直接驱动检索的语义查询计划。"""
+
     strategy: str
     language: str
     intent: str
@@ -91,29 +98,33 @@ class QueryPlan:
 
     @property
     def anchor_terms(self) -> tuple[str, ...]:
+        """返回主题与精确标识组成的去重锚点。"""
+
         return tuple(dict.fromkeys((*self.subjects, *self.identifiers)))
 
     @property
     def subject_anchor_signals(self) -> tuple[str, ...]:
+        """生成主题匹配信号，并移除英文主题中的泛化业务词。"""
+
         signals: list[str] = [*self.subjects]
         for subject in self.subjects:
             words = re.findall(r"[A-Za-z0-9-]+", subject)
             reduced = [
-                word
-                for word in words
-                if word.casefold() not in GENERIC_ENGLISH_SUBJECT_WORDS
+                word for word in words if word.casefold() not in GENERIC_ENGLISH_SUBJECT_WORDS
             ]
             if reduced and reduced != words:
                 signals.append(" ".join(reduced))
-        return tuple(
-            dict.fromkeys(signal for signal in signals if len(signal.strip()) >= 2)
-        )
+        return tuple(dict.fromkeys(signal for signal in signals if len(signal.strip()) >= 2))
 
     @property
     def anchor_signals(self) -> tuple[str, ...]:
+        """组合可用于候选提升的主题信号与精确标识。"""
+
         return tuple(dict.fromkeys((*self.subject_anchor_signals, *self.identifiers)))
 
     def rerank_context(self) -> str:
+        """将结构化意图压缩成重排模型可读的辅助上下文。"""
+
         rows = [
             ("Business subjects", self.subjects),
             ("Exact identifiers", self.identifiers),
@@ -121,11 +132,11 @@ class QueryPlan:
             ("Operational scenarios", self.scenario_terms),
             ("Constraints", self.constraints),
         ]
-        return "\n".join(
-            f"{label}: {' | '.join(values)}" for label, values in rows if values
-        )
+        return "\n".join(f"{label}: {' | '.join(values)}" for label, values in rows if values)
 
     def as_trace_dict(self) -> dict[str, Any]:
+        """转换为可写入查询追踪记录的 JSON 结构。"""
+
         return {
             "strategy": self.strategy,
             "language": self.language,
@@ -142,6 +153,8 @@ class QueryPlan:
 
 
 def _unique_strings(value: Any, *, limit: int, max_length: int) -> tuple[str, ...]:
+    """清洗模型返回的字符串数组，并限制数量、长度和重复项。"""
+
     if not isinstance(value, list):
         return ()
     result: list[str] = []
@@ -159,11 +172,15 @@ def _unique_strings(value: Any, *, limit: int, max_length: int) -> tuple[str, ..
 
 
 def _query_identifiers(question: str) -> tuple[str, ...]:
+    """仅从原问题提取精确标识，防止模型虚构企业内部 ID。"""
+
     values = [*EXACT_IDENTIFIER.findall(question), *ACRONYM.findall(question)]
     return tuple(dict.fromkeys(value.upper() for value in values))
 
 
 def fallback_query_plan(question: str, reason: str) -> QueryPlan:
+    """模型不可用或不适用时，用确定性规则生成最小检索计划。"""
+
     normalized = normalize_query(question)
     subjects = tuple(_query_subject_signals(normalized))
     identifiers = _query_identifiers(normalized)
@@ -182,12 +199,16 @@ def fallback_query_plan(question: str, reason: str) -> QueryPlan:
 
 
 def _is_bare_lookup(question: str, fallback: QueryPlan) -> bool:
+    """识别只有一个实体名的简单查找，此类问题无需额外模型规划。"""
+
     stripped = normalize_query(question).strip(" \t\r\n，,。.!！?？；;：:\"'“”「」『』")
     anchors = fallback.anchor_terms
     return len(anchors) == 1 and stripped.casefold() == anchors[0].casefold()
 
 
 def _semantic_plan(question: str, payload: dict[str, Any], model_id: str) -> QueryPlan:
+    """校验模型 JSON，并把可能混淆的主题、场景和约束重新归类。"""
+
     normalized = normalize_query(question)
     language = str(payload.get("language") or "other").casefold()
     if language not in {"zh", "en", "mixed", "other"}:
@@ -198,16 +219,11 @@ def _semantic_plan(question: str, payload: dict[str, Any], model_id: str) -> Que
     raw_subjects = _unique_strings(payload.get("subjects"), limit=6, max_length=80)
     requested_facts = _unique_strings(payload.get("requested_facts"), limit=8, max_length=80)
     constraints = _unique_strings(payload.get("constraints"), limit=8, max_length=100)
-    explicit_scenarios = _unique_strings(
-        payload.get("scenario_terms"), limit=8, max_length=100
-    )
+    explicit_scenarios = _unique_strings(payload.get("scenario_terms"), limit=8, max_length=100)
     non_subjects = {
-        value.casefold()
-        for value in (*requested_facts, *constraints, *explicit_scenarios)
+        value.casefold() for value in (*requested_facts, *constraints, *explicit_scenarios)
     }
-    subjects = tuple(
-        subject for subject in raw_subjects if subject.casefold() not in non_subjects
-    )
+    subjects = tuple(subject for subject in raw_subjects if subject.casefold() not in non_subjects)
     demoted_subjects = tuple(
         subject for subject in raw_subjects if subject.casefold() in non_subjects
     )
@@ -215,15 +231,15 @@ def _semantic_plan(question: str, payload: dict[str, Any], model_id: str) -> Que
     identifiers = _query_identifiers(normalized)
     model_queries = _unique_strings(payload.get("retrieval_queries"), limit=4, max_length=220)
     keyword_query = " ".join(
-        dict.fromkeys(
-            (*subjects, *identifiers, *requested_facts, *scenario_terms, *constraints)
-        )
+        dict.fromkeys((*subjects, *identifiers, *requested_facts, *scenario_terms, *constraints))
     ).strip()
     queries: list[str] = []
     for value in (keyword_query, *model_queries):
-        if value and value.casefold() != normalized.casefold() and value.casefold() not in {
-            item.casefold() for item in queries
-        }:
+        if (
+            value
+            and value.casefold() != normalized.casefold()
+            and value.casefold() not in {item.casefold() for item in queries}
+        ):
             queries.append(value)
         if len(queries) >= 4:
             break
@@ -244,7 +260,11 @@ def _semantic_plan(question: str, payload: dict[str, Any], model_id: str) -> Que
 
 
 class QueryUnderstandingService:
+    """以缓存和确定性降级封装语义查询规划。"""
+
     def __init__(self, settings: Any, router: QueryModelRouter):
+        """注入查询规划配置和受配额保护的模型路由器。"""
+
         self.settings = settings
         self.router = router
         self._cache: OrderedDict[str, tuple[float, QueryPlan]] = OrderedDict()
@@ -256,6 +276,8 @@ class QueryUnderstandingService:
         *,
         pinned_model: str | None = None,
     ) -> QueryPlan:
+        """理解自然语言问题；简单查找直返，复杂问题才调用模型。"""
+
         fallback = fallback_query_plan(question, "simple-query")
         if _is_bare_lookup(question, fallback):
             return fallback

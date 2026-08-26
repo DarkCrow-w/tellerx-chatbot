@@ -42,6 +42,8 @@ CHUNK_NAMESPACE = uuid.UUID("73ac24df-296f-4532-9dc8-e5890e877564")
 
 
 def _record_hash(chunk: TextChunk) -> str:
+    """计算搜索记录的稳定哈希，用于后续校验索引内容是否发生漂移。"""
+
     payload = json.dumps(
         {
             "content": chunk.content,
@@ -69,6 +71,8 @@ class IngestionService:
         indexer: IndexingService | None = None,
         storage: LocalObjectStorage | None = None,
     ):
+        """组装解析、向量化、对象存储和索引发布所需的依赖。"""
+
         self.settings = settings
         self.parser = parser
         self.qwen = qwen
@@ -77,6 +81,8 @@ class IngestionService:
         self.indexer = indexer or IndexingService(settings, index, self.storage)
 
     def claim_next_job(self, db: Session) -> str | None:
+        """以数据库租约领取一个任务，允许多个 Worker 安全并发消费。"""
+
         now = datetime.now(UTC)
         statement = (
             select(IngestionJob)
@@ -108,6 +114,8 @@ class IngestionService:
         return job.id
 
     def _ensure_embedding_model(self, db: Session) -> None:
+        """登记当前向量空间；相同指纹代表向量可以安全复用。"""
+
         fingerprint = self.settings.embedding_fingerprint
         if not db.get(EmbeddingModel, fingerprint):
             try:
@@ -122,7 +130,7 @@ class IngestionService:
                     )
                     db.flush()
             except IntegrityError:
-                # Another worker registered the same immutable vector space.
+                # 并发 Worker 可能已登记同一个不可变向量空间，此时直接复用即可。
                 pass
             db.commit()
 
@@ -132,6 +140,8 @@ class IngestionService:
         chunks: list[TextChunk],
         warnings: list[str],
     ) -> dict[str, EmbeddingCache]:
+        """优先复用内容寻址的向量缓存，仅为缺失内容批量请求新向量。"""
+
         self._ensure_embedding_model(db)
         fingerprint = self.settings.embedding_fingerprint
         hashes = list(dict.fromkeys(chunk.content_hash for chunk in chunks))
@@ -151,6 +161,7 @@ class IngestionService:
                 missing_chunks.append(chunk)
                 seen.add(chunk.content_hash)
         try:
+            # 控制单批大小，避免大文档一次请求触发供应商的载荷或限流上限。
             for start in range(0, len(missing_chunks), 10):
                 batch = missing_chunks[start : start + 10]
                 vectors, _ = self.qwen.embeddings([chunk.content for chunk in batch])
@@ -178,9 +189,8 @@ class IngestionService:
                             db.flush()
                         cache = new_cache
                     except IntegrityError:
-                        # A concurrent worker won the unique
-                        # (content_hash, embedding_fingerprint) insert. The
-                        # object URI is content-addressed, so reuse its row.
+                        # 唯一键冲突说明其他 Worker 已写入同一内容的向量；对象地址按
+                        # 内容寻址，因此读取胜出记录不会造成向量版本混用。
                         cache = db.scalar(
                             select(EmbeddingCache).where(
                                 EmbeddingCache.content_hash == chunk.content_hash,
@@ -195,9 +205,8 @@ class IngestionService:
             db.rollback()
             if not self.settings.allow_bm25_only:
                 raise
-            warnings.append(
-                f"Embedding unavailable; indexed for BM25 only ({type(exc).__name__})"
-            )
+            # 开启降级时保留词法索引能力，避免向量服务故障阻塞整个入库链路。
+            warnings.append(f"Embedding unavailable; indexed for BM25 only ({type(exc).__name__})")
         return cached
 
     def _save_normalized_artifact(
@@ -207,6 +216,8 @@ class IngestionService:
         units: list[object],
         warnings: list[str],
     ) -> None:
+        """保存规范化解析产物，供审计、排障和不重新解析的重建流程使用。"""
+
         payload = {
             "schema_version": 1,
             "parser_fingerprint": version.parser_fingerprint,
@@ -252,9 +263,9 @@ class IngestionService:
         cache: dict[str, EmbeddingCache],
         warnings: list[str],
     ) -> str:
-        old_ids = list(
-            db.scalars(select(Chunk.id).where(Chunk.version_id == version.id))
-        )
+        """原子写入分块、向量关联和 Outbox 事件，并推进任务状态。"""
+
+        old_ids = list(db.scalars(select(Chunk.id).where(Chunk.version_id == version.id)))
         if old_ids:
             db.execute(delete(ChunkEmbedding).where(ChunkEmbedding.chunk_id.in_(old_ids)))
             db.execute(delete(Chunk).where(Chunk.id.in_(old_ids)))
@@ -288,9 +299,8 @@ class IngestionService:
             embedding = cache.get(text_chunk.content_hash)
             if embedding:
                 embedding_links.append((chunk_id, embedding))
-        # ChunkEmbedding stores scalar foreign keys rather than ORM
-        # relationships, so SQLAlchemy cannot infer insert ordering.  Flush
-        # parent chunks explicitly before inserting their vector links.
+        # ChunkEmbedding 只保存标量外键、没有 ORM relationship，SQLAlchemy 无法推断
+        # 插入顺序；先 flush 父 Chunk，才能安全写入向量关联。
         db.flush()
         for chunk_id, embedding in embedding_links:
             db.add(
@@ -303,9 +313,7 @@ class IngestionService:
         event = OutboxEvent(
             aggregate_id=version.id,
             event_type=(
-                "delete_version"
-                if version.lifecycle_status == "deprecated"
-                else "index_version"
+                "delete_version" if version.lifecycle_status == "deprecated" else "index_version"
             ),
             payload={"job_id": job.id},
         )
@@ -321,6 +329,8 @@ class IngestionService:
         return event.id
 
     def process(self, db: Session, job_id: str) -> str:
+        """执行可重试的解析→切块→向量化流程，并生成待发布索引事件。"""
+
         job = db.get(IngestionJob, job_id)
         if not job:
             raise ValueError(f"Unknown ingestion job: {job_id}")
@@ -332,13 +342,12 @@ class IngestionService:
         if not version:
             raise ValueError(f"Unknown document version: {job.version_id}")
         try:
+            # 每个阶段先持久化状态，进程异常退出后运维端仍能定位失败位置。
             job.status = "running"
             job.stage, job.progress = "parsing", 10
             job.lease_until = datetime.now(UTC) + timedelta(minutes=15)
             version.technical_status = "parsing"
-            version.parser_fingerprint = (
-                f"{self.settings.parser_backend}-{DocumentParser.revision}"
-            )
+            version.parser_fingerprint = f"{self.settings.parser_backend}-{DocumentParser.revision}"
             version.chunker_fingerprint = (
                 f"structure-v1-t{self.settings.chunk_target_tokens}"
                 f"-m{self.settings.chunk_max_tokens}-o{self.settings.chunk_overlap_tokens}"
@@ -360,9 +369,11 @@ class IngestionService:
             job.warnings = warnings
             db.commit()
             cache = self._embeddings(db, text_chunks, warnings)
-            version.technical_status = "embedded" if len(cache) == len(
-                {item.content_hash for item in text_chunks}
-            ) else "bm25_only"
+            version.technical_status = (
+                "embedded"
+                if len(cache) == len({item.content_hash for item in text_chunks})
+                else "bm25_only"
+            )
             event_id = self._persist_chunks_and_event(
                 db, job, version, text_chunks, cache, warnings
             )

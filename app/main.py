@@ -24,13 +24,14 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    # Migrations create the PostgreSQL FTS/pgvector storage. Verify extensions
-    # and indexes before accepting traffic so partial provisioning fails early.
+    """启动时验证搜索结构，退出时释放进程级基础设施资源。"""
+
+    # 迁移负责创建 FTS/pgvector 结构；接收流量前验证扩展与索引，让不完整部署尽早失败。
     search_index().ensure_index()
     try:
         yield
     finally:
-        # Flush connection pools during SIGTERM-driven rolling deployments.
+        # 滚动部署收到 SIGTERM 时主动释放连接池。
         application_container().close()
 
 
@@ -51,4 +52,6 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 @app.get("/", include_in_schema=False)
 def index() -> FileResponse:
+    """返回单页应用入口，其余前端资源由 /static 提供。"""
+
     return FileResponse(static_dir / "index.html")

@@ -11,7 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Validated process configuration loaded from environment and secret files."""
+    """从环境变量和 Secret 文件加载并校验的进程配置。"""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -65,7 +65,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_runtime_invariants(self) -> Settings:
-        """Reject unsafe, inconsistent, or schema-incompatible settings."""
+        """拒绝不安全、相互矛盾或与数据库结构不兼容的配置。"""
 
         if self.search_backend != "postgresql-pgvector-fts":
             raise ValueError("SEARCH_BACKEND must be postgresql-pgvector-fts")
@@ -98,18 +98,20 @@ class Settings(BaseSettings):
 
     @property
     def qwen_api_key(self) -> str:
+        """按需读取千问密钥，避免把 Secret 内容常驻配置序列化结果。"""
+
         try:
             value = self.qwen_api_key_file.read_text(encoding="utf-8").strip()
         except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Qwen API key file is missing: {self.qwen_api_key_file}"
-            ) from exc
+            raise RuntimeError(f"Qwen API key file is missing: {self.qwen_api_key_file}") from exc
         if not value:
             raise RuntimeError("Qwen API key file is empty")
         return value
 
     @property
     def embedding_fingerprint(self) -> str:
+        """为模型、维度和预处理版本生成稳定向量空间指纹。"""
+
         payload = ":".join(
             [
                 self.qwen_embedding_model,
@@ -121,6 +123,8 @@ class Settings(BaseSettings):
 
     @property
     def search_index_name(self) -> str:
+        """生成用于查询追踪的可读搜索索引标识。"""
+
         return (
             f"postgresql-{self.postgres_search_table}-s{self.postgres_search_schema_version}"
             f"-e{self.embedding_fingerprint}-000001"
@@ -129,4 +133,6 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
+    """返回当前进程缓存的已校验配置。"""
+
     return Settings()

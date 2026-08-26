@@ -25,40 +25,56 @@ from app.services.retrieval import Retriever
 
 @dataclass
 class ApplicationContainer:
-    """Lazily construct one process-local instance of every shared service."""
+    """惰性构造每项共享服务在当前进程内的唯一实例。"""
 
     settings: Settings
 
     @cached_property
     def qwen(self) -> QwenClient:
+        """返回复用连接池的千问客户端。"""
+
         return QwenClient(self.settings)
 
     @cached_property
     def index(self) -> SearchIndex:
+        """返回 PostgreSQL 搜索适配器。"""
+
         return SearchIndex(self.settings)
 
     @cached_property
     def indexing(self) -> IndexingService:
+        """返回搜索投影发布与校验服务。"""
+
         return IndexingService(self.settings, self.index)
 
     @cached_property
     def registry(self) -> ModelRegistry:
+        """首次访问时从配置加载模型注册表。"""
+
         return ModelRegistry.load(self.settings.model_registry_path)
 
     @cached_property
     def router(self) -> QwenModelRouter:
+        """返回带配额与故障转移策略的模型路由器。"""
+
         return QwenModelRouter(self.registry, self.qwen)
 
     @cached_property
     def retrieval(self) -> Retriever:
+        """返回混合检索服务。"""
+
         return Retriever(self.settings, self.index, self.qwen)
 
     @cached_property
     def query_understanding(self) -> QueryUnderstandingService:
+        """返回语义查询理解服务。"""
+
         return QueryUnderstandingService(self.settings, self.router)
 
     @cached_property
     def answering(self) -> AnswerService:
+        """返回完整的证据约束回答服务。"""
+
         return AnswerService(
             self.settings,
             self.retrieval,
@@ -68,6 +84,8 @@ class ApplicationContainer:
 
     @cached_property
     def ingestion(self) -> IngestionService:
+        """返回文档解析、切块和向量化服务。"""
+
         return IngestionService(
             self.settings,
             DocumentParser(self.settings.parser_backend),
@@ -77,7 +95,7 @@ class ApplicationContainer:
         )
 
     def close(self) -> None:
-        """Close only infrastructure clients that were actually initialized."""
+        """只关闭实际初始化过的基础设施客户端。"""
 
         qwen = self.__dict__.get("qwen")
         if qwen is not None:
@@ -89,44 +107,58 @@ class ApplicationContainer:
 
 @lru_cache
 def application_container() -> ApplicationContainer:
-    """Return the process-wide composition root.
+    """返回当前进程的组合根。
 
-    Worker, indexer, CLI, and API processes each get their own container.  No
-    network client or database session is shared across process boundaries.
+    Worker、索引器、CLI 和 API 各自拥有容器，不跨进程共享网络客户端或数据库会话。
     """
 
     return ApplicationContainer(get_settings())
 
 
-# Compatibility functions keep call sites concise and provide stable FastAPI
-# dependency targets while all construction remains centralized above.
+# 这些薄函数让调用点保持简洁，也为 FastAPI 提供稳定依赖目标；对象构造仍集中在上方。
 def qwen_client() -> QwenClient:
+    """获取进程级千问客户端。"""
+
     return application_container().qwen
 
 
 def search_index() -> SearchIndex:
+    """获取进程级搜索适配器。"""
+
     return application_container().index
 
 
 def indexing_service() -> IndexingService:
+    """获取索引发布服务。"""
+
     return application_container().indexing
 
 
 def model_registry() -> ModelRegistry:
+    """获取模型注册表。"""
+
     return application_container().registry
 
 
 def model_router() -> QwenModelRouter:
+    """获取模型路由器。"""
+
     return application_container().router
 
 
 def retriever() -> Retriever:
+    """获取混合检索服务。"""
+
     return application_container().retrieval
 
 
 def answer_service() -> AnswerService:
+    """获取证据约束回答服务。"""
+
     return application_container().answering
 
 
 def ingestion_service() -> IngestionService:
+    """获取文档入库服务。"""
+
     return application_container().ingestion

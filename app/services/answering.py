@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 class EvidenceRetriever(Protocol):
-    """Minimal retrieval port required by the answer use case."""
+    """回答用例所需的最小证据检索接口。"""
 
     def search(
         self,
@@ -46,11 +46,14 @@ class EvidenceRetriever(Protocol):
         project_ids: list[str],
         principal_ids: list[str] | None = None,
         query_plan: QueryPlan | None = None,
-    ) -> list[Evidence]: ...
+    ) -> list[Evidence]:
+        """在指定项目和数据权限范围内返回排序后的证据。"""
+
+        ...
 
 
 class AnswerModelRouter(Protocol):
-    """Model routing port; concrete quota and failover policy lives elsewhere."""
+    """回答服务依赖的模型路由接口；配额和故障转移策略由实现层负责。"""
 
     def call(
         self,
@@ -62,7 +65,11 @@ class AnswerModelRouter(Protocol):
         pinned_model: str | None = None,
         prompt_version: str | None = None,
         max_tokens: int | None = None,
-    ) -> ChatCallResult: ...
+    ) -> ChatCallResult:
+        """按指定层级调用回答模型并返回标准化结果。"""
+
+        ...
+
 
 BRIDGE_IDENTIFIER = re.compile(
     r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]{1,12}-\d{2,}(?:-[A-Za-z0-9]+)*)",
@@ -76,7 +83,8 @@ ZH_BRIDGE_SUBJECT = re.compile(
 def attach_cross_document_bridges(
     question: str, validated: ValidatedAnswer, evidence: list[Evidence]
 ) -> ValidatedAnswer:
-    """Add deterministic provenance bridges without adding or changing claims."""
+    """为跨文档声明补充确定性的来源桥接，但不新增或改写事实。"""
+
     if validated.status not in {"answered", "conflict"}:
         return validated
     query_ids = {value.casefold() for value in BRIDGE_IDENTIFIER.findall(question)}
@@ -107,9 +115,7 @@ def attach_cross_document_bridges(
             if item.chunk_id not in claim.citations
             and any(
                 anchor
-                in " ".join(
-                    [item.filename, item.heading_path or "", item.content]
-                ).casefold()
+                in " ".join([item.filename, item.heading_path or "", item.content]).casefold()
                 for anchor in subject_anchors
             )
             and any(
@@ -134,8 +140,7 @@ def attach_cross_document_bridges(
                     for anchor in subject_anchors
                 ),
                 sum(
-                    identifier
-                    in " ".join([item.heading_path or "", item.content]).casefold()
+                    identifier in " ".join([item.heading_path or "", item.content]).casefold()
                     for identifier in downstream_ids
                 ),
             ),
@@ -179,6 +184,8 @@ def attach_cross_document_bridges(
 
 
 class AnswerService:
+    """编排查询理解、证据检索、受约束生成、校验和会话持久化。"""
+
     def __init__(
         self,
         settings: Settings,
@@ -186,6 +193,8 @@ class AnswerService:
         router: AnswerModelRouter,
         query_understanding: QueryUnderstandingService | None = None,
     ):
+        """注入回答链路所需的策略配置和端口实现。"""
+
         self.settings = settings
         self.retriever = retriever
         self.router = router
@@ -193,6 +202,8 @@ class AnswerService:
 
     @staticmethod
     def _get_conversation(db: Session, conversation_id: str | None) -> Conversation:
+        """返回已有会话，或为无会话请求创建并立即取得主键。"""
+
         conversation = db.get(Conversation, conversation_id) if conversation_id else None
         if not conversation:
             conversation = Conversation()
@@ -216,6 +227,8 @@ class AnswerService:
         actual_tier: str | None,
         query_plan: QueryPlan,
     ) -> Message:
+        """在同一事务中保存问答消息和完整查询追踪信息。"""
+
         retrieval_index = getattr(
             self.settings,
             "search_index_name",
@@ -224,7 +237,11 @@ class AnswerService:
         search_backend = getattr(self.retriever, "index", None)
         if search_backend and hasattr(search_backend, "trace_index_name"):
             retrieval_index = search_backend.trace_index_name()
-        db.add(Message(conversation_id=conversation.id, role="user", content=question, trace_id=trace_id))
+        db.add(
+            Message(
+                conversation_id=conversation.id, role="user", content=question, trace_id=trace_id
+            )
+        )
         message = Message(
             conversation_id=conversation.id,
             role="assistant",
@@ -248,9 +265,7 @@ class AnswerService:
                         "actual_tier": actual_tier,
                     },
                     "query_understanding": query_plan.as_trace_dict(),
-                    "embedding_fingerprint": getattr(
-                        self.settings, "embedding_fingerprint", None
-                    ),
+                    "embedding_fingerprint": getattr(self.settings, "embedding_fingerprint", None),
                     "evidence": [
                         {
                             "chunk_id": item.chunk_id,
@@ -259,7 +274,7 @@ class AnswerService:
                             "score": item.score,
                         }
                         for item in evidence
-                    ]
+                    ],
                 },
                 answer_status=validated.status,
                 model_id=model_id,
@@ -272,6 +287,8 @@ class AnswerService:
     def _validate_live_sources(
         self, db: Session, validated: ValidatedAnswer, evidence: list[Evidence]
     ) -> None:
+        """落库前再次确认引用仍可搜索，阻止版本切换竞态产生陈旧引用。"""
+
         if not getattr(self.settings, "validate_citations_against_database", True):
             return
         cited = {citation for claim in validated.claims for citation in claim.citations}
@@ -308,6 +325,8 @@ class AnswerService:
         conversation_id: str | None,
         pinned_model: str | None,
     ) -> ChatResponse:
+        """完成一次证据约束问答，并保证失败路径也返回可审计结果。"""
+
         started_at = time.perf_counter()
         trace_id = str(uuid.uuid4())
         conversation = self._get_conversation(db, conversation_id)
@@ -326,6 +345,7 @@ class AnswerService:
             query_plan = fallback_query_plan(question, "service-not-configured")
             evidence = self.retriever.search(question, project_ids)
         if not evidence:
+            # 无证据时不调用生成模型，直接返回语言匹配的确定性拒答。
             validated = ValidatedAnswer(
                 status="insufficient_evidence",
                 answer=refusal_text(question),
@@ -375,6 +395,7 @@ class AnswerService:
         attempted_tier = tier
         failure_kind = "validation"
         for attempt in range(2):
+            # 第二次只提升非固定的 Plus 请求；固定模型评测必须保持可重复。
             if attempt == 1 and tier == "plus" and not pinned_model:
                 attempted_tier = "max"
             try:
@@ -420,10 +441,8 @@ class AnswerService:
             except (TypeError, ValueError, json.JSONDecodeError, NoModelAvailable) as exc:
                 if isinstance(exc, NoModelAvailable):
                     failure_kind = "provider"
-                    # Complex questions normally use Max. When every Max model
-                    # is unavailable, one evidence-bound Plus attempt is safer
-                    # and more useful than failing the request outright. Pinned
-                    # evaluation runs never degrade, preserving reproducibility.
+                    # 复杂问题通常使用 Max；若全部不可用，则允许一次仍受证据约束的
+                    # Plus 降级。固定模型评测不降级，以保持结果可重复。
                     if tier == "max" and attempt == 0 and not pinned_model:
                         logger.warning(
                             "Max tier unavailable; degrading one grounded answer attempt to Plus"

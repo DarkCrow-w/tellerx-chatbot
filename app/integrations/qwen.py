@@ -17,7 +17,11 @@ logger = logging.getLogger(__name__)
 
 
 class QwenAPIError(RuntimeError):
+    """保留 HTTP 状态和供应商错误码的统一千问调用异常。"""
+
     def __init__(self, message: str, *, status_code: int | None = None, code: str | None = None):
+        """记录安全截断后的错误消息及可用于重试判断的元数据。"""
+
         super().__init__(message)
         self.status_code = status_code
         self.code = code
@@ -25,6 +29,8 @@ class QwenAPIError(RuntimeError):
 
 @dataclass(slots=True)
 class Usage:
+    """一次模型调用返回的 Token 用量。"""
+
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
@@ -32,6 +38,8 @@ class Usage:
 
 @dataclass(slots=True)
 class ChatCallResult:
+    """聊天接口的标准化结果，屏蔽供应商响应结构差异。"""
+
     model_id: str
     request_id: str
     content: str
@@ -40,12 +48,13 @@ class ChatCallResult:
 
 
 class QwenClient:
-    """Thread-safe Qwen HTTP adapter with process-local connection pooling."""
+    """线程安全的千问 HTTP 适配器，并在进程内复用连接池。"""
 
     def __init__(self, settings: Settings, transport: httpx.BaseTransport | None = None):
+        """创建带统一鉴权、超时和可替换 Transport 的长连接客户端。"""
+
         self.settings = settings
-        # A long-lived client reuses TLS handshakes and provider connections.
-        # The application composition root closes it during graceful shutdown.
+        # 长生命周期客户端可复用 TLS 握手和供应商连接；应用优雅退出时统一关闭。
         self._http = httpx.Client(
             timeout=self.settings.qwen_timeout_seconds,
             transport=transport,
@@ -56,9 +65,13 @@ class QwenClient:
         )
 
     def close(self) -> None:
+        """释放进程内 HTTP 连接池。"""
+
         self._http.close()
 
     def _request(self, method: str, url: str, payload: dict[str, Any]) -> tuple[dict, float]:
+        """发送请求，仅对瞬时 HTTP/网络故障做有界指数退避重试。"""
+
         last_error: Exception | None = None
         started = time.perf_counter()
         for attempt in range(self.settings.qwen_max_retries + 1):
@@ -94,6 +107,8 @@ class QwenClient:
 
     @staticmethod
     def _usage(data: dict) -> Usage:
+        """兼容不同接口字段名，标准化 Token 用量。"""
+
         raw = data.get("usage") or {}
         prompt = int(raw.get("prompt_tokens") or raw.get("input_tokens") or 0)
         completion = int(raw.get("completion_tokens") or raw.get("output_tokens") or 0)
@@ -101,6 +116,8 @@ class QwenClient:
         return Usage(prompt_tokens=prompt, completion_tokens=completion, total_tokens=total)
 
     def embeddings(self, texts: list[str]) -> tuple[list[list[float]], Usage]:
+        """按输入顺序返回文本向量，并校验响应数量。"""
+
         if not texts:
             return [], Usage()
         payload = {
@@ -117,10 +134,14 @@ class QwenClient:
         rows = sorted(data.get("data", []), key=lambda row: row.get("index", 0))
         embeddings = [row["embedding"] for row in rows]
         if len(embeddings) != len(texts):
-            raise QwenAPIError("Embedding response count does not match input", code="invalid_response")
+            raise QwenAPIError(
+                "Embedding response count does not match input", code="invalid_response"
+            )
         return embeddings, self._usage(data)
 
     def rerank(self, query: str, documents: list[str], top_n: int) -> list[tuple[int, float]]:
+        """返回候选原始下标与相关度，供业务层保留来源关联。"""
+
         payload = {
             "model": self.settings.qwen_rerank_model,
             "query": query,
@@ -154,6 +175,8 @@ class QwenClient:
         user_prompt: str,
         max_tokens: int = 1600,
     ) -> ChatCallResult:
+        """以零温度和 JSON Object 模式执行可校验的聊天生成。"""
+
         payload = {
             "model": model_id,
             "messages": [
@@ -173,7 +196,9 @@ class QwenClient:
         try:
             content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise QwenAPIError("Chat response has an invalid shape", code="invalid_response") from exc
+            raise QwenAPIError(
+                "Chat response has an invalid shape", code="invalid_response"
+            ) from exc
         return ChatCallResult(
             model_id=str(data.get("model") or model_id),
             request_id=str(data.get("id") or uuid.uuid4()),
@@ -184,6 +209,8 @@ class QwenClient:
 
 
 def parse_json_object(content: str) -> dict[str, Any]:
+    """解析模型 JSON 对象，并兼容偶发的 Markdown 代码围栏。"""
+
     stripped = content.strip()
     if stripped.startswith("```"):
         lines = stripped.splitlines()
