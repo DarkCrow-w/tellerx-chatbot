@@ -213,65 +213,99 @@ class IndexingService:
             rows.append(row)
         return version, rows
 
-    def publish_event(self, db: Session, event_id: str) -> bool:
-        """幂等发布 Outbox 事件，并用退避策略记录可重试或最终失败。"""
+    @staticmethod
+    def _claim_event(db: Session, event_id: str) -> OutboxEvent:
+        """读取事件并为待处理事件设置五分钟发布租约。"""
 
         event = db.get(OutboxEvent, event_id)
-        if not event:
+        if event is None:
             raise ValueError(f"Unknown outbox event: {event_id}")
-        if event.status == "published":
-            return True
         if event.status == "pending":
             event.status = "processing"
             event.attempts += 1
             event.lease_until = datetime.now(UTC) + timedelta(minutes=5)
             db.commit()
+        return event
+
+    def _delete_version_event(self, db: Session, event: OutboxEvent) -> None:
+        """删除一个版本的搜索投影并同步版本、任务和代次状态。"""
+
+        self.index.delete_version(event.aggregate_id)
+        version = db.get(DocumentVersion, event.aggregate_id)
+        if version is not None:
+            version.technical_status = "deleted"
+            version.is_current = False
+            self._retire_sync_states(db, version.id)
+        self._refresh_generation_counts(db)
+
+        job_id = (event.payload or {}).get("job_id")
+        job = db.get(IngestionJob, job_id) if job_id else None
+        if job is not None:
+            job.status = "succeeded"
+            job.stage = "complete"
+            job.progress = 100
+            job.error_message = None
+            job.finished_at = datetime.now(UTC)
+
+    def _dispatch_event(self, db: Session, event: OutboxEvent) -> None:
+        """按事件类型调用唯一对应的投影操作。"""
+
+        if event.event_type == "delete_version":
+            self._delete_version_event(db, event)
+            return
+        if event.event_type == "index_version":
+            self._publish_version(db, event)
+            return
+        raise ValueError(f"Unsupported outbox event type: {event.event_type}")
+
+    @staticmethod
+    def _mark_event_published(db: Session, event_id: str) -> None:
+        """发布成功后清理租约与错误并提交最终状态。"""
+
+        event = db.get(OutboxEvent, event_id)
+        if event is None:
+            raise ValueError(f"Outbox event disappeared during publish: {event_id}")
+        event.status = "published"
+        event.published_at = datetime.now(UTC)
+        event.lease_until = None
+        event.last_error = None
+        db.commit()
+
+    @staticmethod
+    def _mark_event_failed(db: Session, event_id: str, exc: Exception) -> None:
+        """记录指数退避；达到五次失败后把事件和任务转为最终失败。"""
+
+        db.rollback()
+        event = db.get(OutboxEvent, event_id)
+        if event is None:
+            return
+        event.status = "dead" if event.attempts >= 5 else "pending"
+        event.available_at = datetime.now(UTC) + timedelta(
+            seconds=min(300, 2 ** min(event.attempts, 8))
+        )
+        event.lease_until = None
+        event.last_error = f"{type(exc).__name__}: {str(exc)[:1000]}"
+
+        job_id = (event.payload or {}).get("job_id")
+        job = db.get(IngestionJob, job_id) if job_id else None
+        if job is not None:
+            job.status = "failed" if event.status == "dead" else "index_pending"
+            job.stage = "indexing_failed" if event.status == "dead" else "indexing_retry"
+            job.error_message = event.last_error
+        db.commit()
+
+    def publish_event(self, db: Session, event_id: str) -> bool:
+        """幂等发布 Outbox 事件，并用退避策略记录可重试或最终失败。"""
+
+        event = self._claim_event(db, event_id)
+        if event.status == "published":
+            return True
         try:
-            if event.event_type == "delete_version":
-                self.index.delete_version(event.aggregate_id)
-                version = db.get(DocumentVersion, event.aggregate_id)
-                if version:
-                    version.technical_status = "deleted"
-                    version.is_current = False
-                    self._retire_sync_states(db, version.id)
-                self._refresh_generation_counts(db)
-                job_id = (event.payload or {}).get("job_id")
-                job = db.get(IngestionJob, job_id) if job_id else None
-                if job:
-                    job.status = "succeeded"
-                    job.stage = "complete"
-                    job.progress = 100
-                    job.error_message = None
-                    job.finished_at = datetime.now(UTC)
-            elif event.event_type == "index_version":
-                self._publish_version(db, event)
-            else:
-                raise ValueError(f"Unsupported outbox event type: {event.event_type}")
-            event = db.get(OutboxEvent, event_id)
-            event.status = "published"
-            event.published_at = datetime.now(UTC)
-            event.lease_until = None
-            event.last_error = None
-            db.commit()
+            self._dispatch_event(db, event)
+            self._mark_event_published(db, event_id)
             return True
         except Exception as exc:
-            db.rollback()
-            event = db.get(OutboxEvent, event_id)
-            if event:
-                # 前四次失败采用指数退避；达到上限后进入 dead，避免无限热重试。
-                event.status = "dead" if event.attempts >= 5 else "pending"
-                event.available_at = datetime.now(UTC) + timedelta(
-                    seconds=min(300, 2 ** min(event.attempts, 8))
-                )
-                event.lease_until = None
-                event.last_error = f"{type(exc).__name__}: {str(exc)[:1000]}"
-                job_id = (event.payload or {}).get("job_id")
-                job = db.get(IngestionJob, job_id) if job_id else None
-                if job:
-                    job.status = "failed" if event.status == "dead" else "index_pending"
-                    job.stage = "indexing_failed" if event.status == "dead" else "indexing_retry"
-                    job.error_message = event.last_error
-                db.commit()
+            self._mark_event_failed(db, event_id, exc)
             logger.exception("Could not publish outbox event %s", event_id)
             return False
 

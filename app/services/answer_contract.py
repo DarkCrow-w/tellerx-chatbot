@@ -243,6 +243,91 @@ def fit_evidence_budget(evidence: list[Evidence], max_tokens: int) -> list[Evide
     return selected
 
 
+def _answer_fields(payload: dict[str, Any]) -> tuple[str, str, list[Any]]:
+    """读取并校验模型响应的三个顶层字段。"""
+
+    status = payload.get("status")
+    answer = payload.get("answer")
+    claims = payload.get("claims")
+    if (
+        status not in {"answered", "insufficient_evidence", "conflict"}
+        or not isinstance(answer, str)
+        or not isinstance(claims, list)
+    ):
+        raise AnswerValidationError("Missing or invalid status, answer, or claims")
+    return status, answer, claims
+
+
+def _verified_quote(quote: str, evidence: Evidence) -> str:
+    """返回来源中连续存在的引用，必要时执行有边界的排版修复。"""
+
+    if _normalize_for_quote(quote) in _normalize_for_quote(evidence.content):
+        return quote
+    repaired = _repair_ellipsis_quote(quote, evidence.content)
+    repaired = repaired or _repair_formatting_quote(quote, evidence.content)
+    repaired = repaired or _repair_anchored_quote(quote, evidence.content)
+    if repaired is None:
+        raise AnswerValidationError(f"Quote is not present in source {evidence.chunk_id}")
+    return repaired
+
+
+def _validated_citation(
+    raw_citation: Any,
+    evidence_by_id: dict[str, Evidence],
+) -> tuple[str, str, CitationOut]:
+    """校验一条引用并转换为公开来源 DTO。"""
+
+    if not isinstance(raw_citation, dict):
+        raise AnswerValidationError("Invalid citation")
+    chunk_id = raw_citation.get("id")
+    quote = raw_citation.get("quote")
+    if (
+        not isinstance(chunk_id, str)
+        or chunk_id not in evidence_by_id
+        or not isinstance(quote, str)
+        or len(quote.strip()) < 2
+    ):
+        raise AnswerValidationError("Citation ID or quote is invalid")
+    item = evidence_by_id[chunk_id]
+    quote = _verified_quote(quote, item)
+    source = CitationOut(
+        chunk_id=chunk_id,
+        document_id=item.document_id,
+        filename=item.filename,
+        document_status=item.document_status,
+        heading_path=item.heading_path,
+        page_number=item.page_number,
+        sheet_name=item.sheet_name,
+        cell_range=item.cell_range,
+        quote=quote.strip(),
+    )
+    return chunk_id, quote, source
+
+
+def _validated_claim(
+    raw_claim: Any,
+    evidence_by_id: dict[str, Evidence],
+    source_map: dict[tuple[str, str], CitationOut],
+) -> ClaimOut:
+    """校验一项事实声明以及它的全部引用。"""
+
+    if not isinstance(raw_claim, dict) or not isinstance(raw_claim.get("text"), str):
+        raise AnswerValidationError("Invalid claim")
+    claim_text = raw_claim["text"].strip()
+    if not claim_text:
+        raise AnswerValidationError("Claim text cannot be empty")
+    raw_citations = raw_claim.get("evidence")
+    if not isinstance(raw_citations, list) or not raw_citations:
+        raise AnswerValidationError("Every claim requires evidence")
+
+    citation_ids: list[str] = []
+    for raw_citation in raw_citations:
+        chunk_id, quote, source = _validated_citation(raw_citation, evidence_by_id)
+        citation_ids.append(chunk_id)
+        source_map[(chunk_id, quote)] = source
+    return ClaimOut(text=claim_text, citations=list(dict.fromkeys(citation_ids)))
+
+
 def validate_answer(payload: dict[str, Any], evidence: list[Evidence]) -> ValidatedAnswer:
     """校验状态、声明、证据 ID 和逐字来源引用。
 
@@ -250,16 +335,7 @@ def validate_answer(payload: dict[str, Any], evidence: list[Evidence]) -> Valida
     无法绕过证据门禁。
     """
 
-    allowed_statuses = {"answered", "insufficient_evidence", "conflict"}
-    status = payload.get("status")
-    answer = payload.get("answer")
-    raw_claims = payload.get("claims")
-    if (
-        status not in allowed_statuses
-        or not isinstance(answer, str)
-        or not isinstance(raw_claims, list)
-    ):
-        raise AnswerValidationError("Missing or invalid status, answer, or claims")
+    status, answer, raw_claims = _answer_fields(payload)
     if status == "insufficient_evidence":
         if raw_claims:
             raise AnswerValidationError("Insufficient-evidence responses cannot contain claims")
@@ -268,48 +344,8 @@ def validate_answer(payload: dict[str, Any], evidence: list[Evidence]) -> Valida
         raise AnswerValidationError("Answered and conflict responses must contain claims")
 
     by_id = {item.chunk_id: item for item in evidence}
-    claims: list[ClaimOut] = []
     source_map: dict[tuple[str, str], CitationOut] = {}
-    for raw_claim in raw_claims:
-        if not isinstance(raw_claim, dict) or not isinstance(raw_claim.get("text"), str):
-            raise AnswerValidationError("Invalid claim")
-        claim_text = raw_claim["text"].strip()
-        if not claim_text:
-            raise AnswerValidationError("Claim text cannot be empty")
-        raw_citations = raw_claim.get("evidence")
-        if not isinstance(raw_citations, list) or not raw_citations:
-            raise AnswerValidationError("Every claim requires evidence")
-        citation_ids = []
-        for raw_citation in raw_citations:
-            if not isinstance(raw_citation, dict):
-                raise AnswerValidationError("Invalid citation")
-            chunk_id = raw_citation.get("id")
-            quote = raw_citation.get("quote")
-            if chunk_id not in by_id or not isinstance(quote, str) or len(quote.strip()) < 2:
-                raise AnswerValidationError("Citation ID or quote is invalid")
-            item = by_id[chunk_id]
-            if _normalize_for_quote(quote) not in _normalize_for_quote(item.content):
-                repaired = _repair_ellipsis_quote(quote, item.content)
-                if repaired is None:
-                    repaired = _repair_formatting_quote(quote, item.content)
-                if repaired is None:
-                    repaired = _repair_anchored_quote(quote, item.content)
-                if repaired is None:
-                    raise AnswerValidationError(f"Quote is not present in source {chunk_id}")
-                quote = repaired
-            citation_ids.append(chunk_id)
-            source_map[(chunk_id, quote)] = CitationOut(
-                chunk_id=chunk_id,
-                document_id=item.document_id,
-                filename=item.filename,
-                document_status=item.document_status,
-                heading_path=item.heading_path,
-                page_number=item.page_number,
-                sheet_name=item.sheet_name,
-                cell_range=item.cell_range,
-                quote=quote.strip(),
-            )
-        claims.append(ClaimOut(text=claim_text, citations=list(dict.fromkeys(citation_ids))))
+    claims = [_validated_claim(raw_claim, by_id, source_map) for raw_claim in raw_claims]
     if status == "conflict":
         conflict_ids = {citation for claim in claims for citation in claim.citations}
         if len(conflict_ids) < 2:

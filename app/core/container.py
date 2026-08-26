@@ -11,10 +11,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
 
+from app.application.chat_service import ChatApplicationService
+from app.application.document_service import DocumentApplicationService
+from app.application.operations_service import (
+    HealthApplicationService,
+    OperationsApplicationService,
+)
 from app.core.config import Settings, get_settings
 from app.integrations.qwen import QwenClient
 from app.integrations.search import SearchIndex
+from app.integrations.storage import LocalObjectStorage
 from app.knowledge.parsers import DocumentParser
+from app.repositories.chat import ChatRepository
+from app.repositories.documents import DocumentRepository
+from app.repositories.operations import OperationsRepository
 from app.services.answering import AnswerService
 from app.services.indexing import IndexingService
 from app.services.ingestion import IngestionService
@@ -42,10 +52,34 @@ class ApplicationContainer:
         return SearchIndex(self.settings)
 
     @cached_property
+    def storage(self) -> LocalObjectStorage:
+        """返回进程内共享的不可变对象存储适配器。"""
+
+        return LocalObjectStorage(self.settings.storage_root)
+
+    @cached_property
+    def chat_repository(self) -> ChatRepository:
+        """返回无状态问答 Repository。"""
+
+        return ChatRepository()
+
+    @cached_property
+    def document_repository(self) -> DocumentRepository:
+        """返回无状态文档 Repository。"""
+
+        return DocumentRepository()
+
+    @cached_property
+    def operations_repository(self) -> OperationsRepository:
+        """返回无状态运维 Repository。"""
+
+        return OperationsRepository()
+
+    @cached_property
     def indexing(self) -> IndexingService:
         """返回搜索投影发布与校验服务。"""
 
-        return IndexingService(self.settings, self.index)
+        return IndexingService(self.settings, self.index, self.storage)
 
     @cached_property
     def registry(self) -> ModelRegistry:
@@ -80,6 +114,7 @@ class ApplicationContainer:
             self.retrieval,
             self.router,
             self.query_understanding,
+            self.chat_repository,
         )
 
     @cached_property
@@ -92,7 +127,43 @@ class ApplicationContainer:
             self.qwen,
             self.index,
             self.indexing,
+            self.storage,
         )
+
+    @cached_property
+    def chat_application(self) -> ChatApplicationService:
+        """返回问答与反馈应用服务。"""
+
+        return ChatApplicationService(lambda: self.answering, self.chat_repository)
+
+    @cached_property
+    def document_application(self) -> DocumentApplicationService:
+        """返回文档目录与生命周期应用服务。"""
+
+        return DocumentApplicationService(
+            self.settings,
+            self.storage,
+            self.document_repository,
+            self.ingestion,
+        )
+
+    @cached_property
+    def operations_application(self) -> OperationsApplicationService:
+        """返回运行状态与维护应用服务。"""
+
+        return OperationsApplicationService(
+            self.settings,
+            self.operations_repository,
+            self.index,
+            self.indexing,
+            self.router,
+        )
+
+    @cached_property
+    def health_application(self) -> HealthApplicationService:
+        """返回依赖就绪检查应用服务。"""
+
+        return HealthApplicationService(self.operations_repository, self.index)
 
     def close(self) -> None:
         """只关闭实际初始化过的基础设施客户端。"""
@@ -162,3 +233,27 @@ def ingestion_service() -> IngestionService:
     """获取文档入库服务。"""
 
     return application_container().ingestion
+
+
+def chat_application_service() -> ChatApplicationService:
+    """获取问答与反馈应用服务。"""
+
+    return application_container().chat_application
+
+
+def document_application_service() -> DocumentApplicationService:
+    """获取文档应用服务。"""
+
+    return application_container().document_application
+
+
+def operations_application_service() -> OperationsApplicationService:
+    """获取运维应用服务。"""
+
+    return application_container().operations_application
+
+
+def health_application_service() -> HealthApplicationService:
+    """获取就绪检查应用服务。"""
+
+    return application_container().health_application

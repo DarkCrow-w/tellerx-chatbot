@@ -67,6 +67,16 @@ class Settings(BaseSettings):
     def validate_runtime_invariants(self) -> Settings:
         """拒绝不安全、相互矛盾或与数据库结构不兼容的配置。"""
 
+        self._validate_search_configuration()
+        self._validate_chunk_configuration()
+        self._validate_retrieval_configuration()
+        self._validate_embedding_configuration()
+        self._validate_production_configuration()
+        return self
+
+    def _validate_search_configuration(self) -> None:
+        """保证运行配置与当前 PostgreSQL 搜索迁移兼容。"""
+
         if self.search_backend != "postgresql-pgvector-fts":
             raise ValueError("SEARCH_BACKEND must be postgresql-pgvector-fts")
         if self.postgres_search_table != "chunk_search_index":
@@ -76,16 +86,31 @@ class Settings(BaseSettings):
                 "QWEN_EMBEDDING_DIMENSIONS must be 1024 for migration 0004; "
                 "a dimension change requires a new PostgreSQL vector schema migration"
             )
+
+    def _validate_chunk_configuration(self) -> None:
+        """校验切块目标、上限和重叠窗口的大小关系。"""
+
         if not 0 <= self.chunk_overlap_tokens < self.chunk_target_tokens <= self.chunk_max_tokens:
             raise ValueError("chunk sizes must satisfy 0 <= overlap < target <= maximum")
+
+    def _validate_retrieval_configuration(self) -> None:
+        """校验召回、重排和最终证据数量的漏斗关系。"""
+
         if not 1 <= self.evidence_top_k <= self.rerank_candidates <= self.retrieval_top_k:
             raise ValueError("retrieval sizes must satisfy evidence <= rerank <= retrieval")
+
+    def _validate_embedding_configuration(self) -> None:
+        """校验向量、重试和查询缓存参数。"""
+
         if self.qwen_embedding_dimensions <= 0 or self.pgvector_hnsw_ef_search <= 0:
             raise ValueError("embedding dimensions and HNSW ef_search must be positive")
         if self.qwen_max_retries < 0:
             raise ValueError("qwen_max_retries cannot be negative")
         if self.query_embedding_cache_size <= 0 or self.query_embedding_cache_ttl_seconds <= 0:
             raise ValueError("query embedding cache size and TTL must be positive")
+
+    def _validate_production_configuration(self) -> None:
+        """在生产模式拒绝弱一致性或过宽暴露配置。"""
 
         if self.app_env.casefold() in {"prod", "production"}:
             if self.allow_bm25_only:
@@ -94,7 +119,6 @@ class Settings(BaseSettings):
                 raise ValueError("production requires asynchronous ingestion workers")
             if "*" in self.cors_origins:
                 raise ValueError("production CORS origins cannot contain a wildcard")
-        return self
 
     @property
     def qwen_api_key(self) -> str:

@@ -7,17 +7,18 @@ import logging
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Protocol
 
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.contracts.schemas import ChatResponse, CitationOut
 from app.core.config import Settings
-from app.db.models import Chunk, Conversation, Document, DocumentVersion, Message, QueryTrace
+from app.db.models import Conversation, Message
 from app.integrations.qwen import ChatCallResult, parse_json_object
 from app.integrations.search import _lexical_signals, normalize_query
 from app.knowledge.evidence import Evidence
+from app.repositories.chat import ChatRepository
 from app.services.answer_contract import (
     SYSTEM_PROMPT,
     AnswerValidationError,
@@ -71,6 +72,26 @@ class AnswerModelRouter(Protocol):
         ...
 
 
+@dataclass(slots=True)
+class AnswerPreparation:
+    """一次问答在调用生成模型前准备好的全部上下文。"""
+
+    query_plan: QueryPlan
+    evidence: list[Evidence]
+    requested_tier: str | None
+    user_prompt: str | None
+
+
+@dataclass(slots=True)
+class GenerationResult:
+    """生成尝试的结果；失败时 ``validated`` 为空并记录失败类别。"""
+
+    validated: ValidatedAnswer | None
+    model_id: str | None
+    actual_tier: str | None
+    failure_kind: str = "validation"
+
+
 BRIDGE_IDENTIFIER = re.compile(
     r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]{1,12}-\d{2,}(?:-[A-Za-z0-9]+)*)",
     re.IGNORECASE,
@@ -78,6 +99,16 @@ BRIDGE_IDENTIFIER = re.compile(
 ZH_BRIDGE_SUBJECT = re.compile(
     r"^([\u3400-\u9fff]{2,20}?)\s*(?:当前|的|在|受|使用|由|如果|若|最新)"
 )
+
+CITATION_CORRECTION_PROMPT = """
+
+PREVIOUS_OUTPUT_REJECTED: Return a fresh JSON object. Copy each quote exactly and
+contiguously from one evidence block. Do not paraphrase inside quote fields. Return
+at most 6 claims, use the shortest sufficient quote for each claim, and keep the JSON
+compact. Prioritize the most important supported facts instead of producing an
+exhaustive answer. For cross-document joins, cite the subject-to-identifier bridge
+evidence together with the downstream value evidence.
+"""
 
 
 def attach_cross_document_bridges(
@@ -192,6 +223,7 @@ class AnswerService:
         retriever: EvidenceRetriever,
         router: AnswerModelRouter,
         query_understanding: QueryUnderstandingService | None = None,
+        repository: ChatRepository | None = None,
     ):
         """注入回答链路所需的策略配置和端口实现。"""
 
@@ -199,17 +231,15 @@ class AnswerService:
         self.retriever = retriever
         self.router = router
         self.query_understanding = query_understanding
+        # 可选参数保持独立单元测试易用；生产组合根会显式注入 Repository。
+        self.repository = repository or ChatRepository()
 
     @staticmethod
     def _get_conversation(db: Session, conversation_id: str | None) -> Conversation:
         """返回已有会话，或为无会话请求创建并立即取得主键。"""
 
-        conversation = db.get(Conversation, conversation_id) if conversation_id else None
-        if not conversation:
-            conversation = Conversation()
-            db.add(conversation)
-            db.flush()
-        return conversation
+        # 保留静态方法供既有测试和调用方使用；新代码通过实例 Repository 调用。
+        return ChatRepository().get_or_create_conversation(db, conversation_id)
 
     def _persist(
         self,
@@ -237,52 +267,38 @@ class AnswerService:
         search_backend = getattr(self.retriever, "index", None)
         if search_backend and hasattr(search_backend, "trace_index_name"):
             retrieval_index = search_backend.trace_index_name()
-        db.add(
-            Message(
-                conversation_id=conversation.id, role="user", content=question, trace_id=trace_id
-            )
-        )
-        message = Message(
-            conversation_id=conversation.id,
-            role="assistant",
-            content=validated.answer,
+        return self.repository.save_exchange(
+            db,
+            conversation=conversation,
+            question=question,
+            answer=validated.answer,
             answer_status=validated.status,
             model_id=model_id,
             trace_id=trace_id,
             citations=[source.model_dump() for source in validated.sources],
-        )
-        db.add(message)
-        db.add(
-            QueryTrace(
-                trace_id=trace_id,
-                normalized_query=normalize_query(question),
-                project_ids=project_ids,
-                index_name=retrieval_index,
-                retrieval_json={
-                    "prompt_version": getattr(self.settings, "prompt_version", None),
-                    "routing": {
-                        "requested_tier": requested_tier,
-                        "actual_tier": actual_tier,
-                    },
-                    "query_understanding": query_plan.as_trace_dict(),
-                    "embedding_fingerprint": getattr(self.settings, "embedding_fingerprint", None),
-                    "evidence": [
-                        {
-                            "chunk_id": item.chunk_id,
-                            "document_id": item.document_id,
-                            "version_id": item.version_id,
-                            "score": item.score,
-                        }
-                        for item in evidence
-                    ],
+            normalized_query=normalize_query(question),
+            project_ids=project_ids,
+            index_name=retrieval_index,
+            retrieval_json={
+                "prompt_version": getattr(self.settings, "prompt_version", None),
+                "routing": {
+                    "requested_tier": requested_tier,
+                    "actual_tier": actual_tier,
                 },
-                answer_status=validated.status,
-                model_id=model_id,
-                latency_ms=(time.perf_counter() - started_at) * 1000,
-            )
+                "query_understanding": query_plan.as_trace_dict(),
+                "embedding_fingerprint": getattr(self.settings, "embedding_fingerprint", None),
+                "evidence": [
+                    {
+                        "chunk_id": item.chunk_id,
+                        "document_id": item.document_id,
+                        "version_id": item.version_id,
+                        "score": item.score,
+                    }
+                    for item in evidence
+                ],
+            },
+            latency_ms=(time.perf_counter() - started_at) * 1000,
         )
-        db.commit()
-        return message
 
     def _validate_live_sources(
         self, db: Session, validated: ValidatedAnswer, evidence: list[Evidence]
@@ -294,43 +310,24 @@ class AnswerService:
         cited = {citation for claim in validated.claims for citation in claim.citations}
         if not cited:
             return
-        rows = db.execute(
-            select(
-                Chunk.id,
-                DocumentVersion.lifecycle_status,
-                DocumentVersion.technical_status,
-                DocumentVersion.is_current,
-                Document.is_deleted,
-            )
-            .join(DocumentVersion, Chunk.version_id == DocumentVersion.id)
-            .join(Document, DocumentVersion.document_id == Document.id)
-            .where(Chunk.id.in_(cited))
-        ).all()
-        live = {
-            chunk_id
-            for chunk_id, lifecycle, technical, is_current, is_deleted in rows
-            if not is_deleted
-            and technical == "searchable"
-            and (lifecycle == "draft" or (lifecycle == "approved" and is_current))
-        }
+        live = self.repository.live_searchable_chunk_ids(db, cited)
         if live != cited:
             raise AnswerValidationError("A cited source is no longer searchable")
 
-    def answer(
+    def _prepare_answer(
         self,
         db: Session,
         *,
         question: str,
         project_ids: list[str],
-        conversation_id: str | None,
         pinned_model: str | None,
-    ) -> ChatResponse:
-        """完成一次证据约束问答，并保证失败路径也返回可审计结果。"""
+    ) -> AnswerPreparation:
+        """完成查询理解、检索、路由和证据预算准备。"""
 
-        started_at = time.perf_counter()
-        trace_id = str(uuid.uuid4())
-        conversation = self._get_conversation(db, conversation_id)
-        if self.query_understanding is not None:
+        if self.query_understanding is None:
+            query_plan = fallback_query_plan(question, "service-not-configured")
+            evidence = self.retriever.search(question, project_ids)
+        else:
             query_plan = self.query_understanding.understand(
                 db,
                 question,
@@ -341,55 +338,40 @@ class AnswerService:
                 project_ids,
                 query_plan=query_plan,
             )
-        else:
-            query_plan = fallback_query_plan(question, "service-not-configured")
-            evidence = self.retriever.search(question, project_ids)
         if not evidence:
-            # 无证据时不调用生成模型，直接返回语言匹配的确定性拒答。
-            validated = ValidatedAnswer(
-                status="insufficient_evidence",
-                answer=refusal_text(question),
-                claims=[],
-                sources=[],
-            )
-            message = self._persist(
-                db,
-                conversation=conversation,
-                question=question,
-                validated=validated,
-                model_id=None,
-                trace_id=trace_id,
-                started_at=started_at,
-                project_ids=project_ids,
-                evidence=evidence,
-                requested_tier=None,
-                actual_tier=None,
-                query_plan=query_plan,
-            )
-            return ChatResponse(
-                status=validated.status,
-                answer=validated.answer,
-                claims=validated.claims,
-                sources=validated.sources,
-                model_id=None,
-                route_tier=None,
-                conversation_id=conversation.id,
-                message_id=message.id,
-                trace_id=trace_id,
-            )
+            return AnswerPreparation(query_plan, [], None, None)
 
         version_pairs: dict[str, set[str]] = {}
         for item in evidence:
             version_pairs.setdefault(item.document_id, set()).add(item.version_id)
         has_conflict = any(len(versions) > 1 for versions in version_pairs.values())
-        tier = route_tier(question, [item.document_id for item in evidence[:6]], has_conflict)
+        tier = route_tier(
+            question,
+            [item.document_id for item in evidence[:6]],
+            has_conflict,
+        )
         evidence = fit_evidence_budget(evidence, 4000 if tier == "plus" else 7000)
-        user_prompt = build_evidence_prompt(
+        prompt = build_evidence_prompt(
             question,
             evidence,
             self.settings.prompt_version,
             query_plan.requested_facts,
         )
+        return AnswerPreparation(query_plan, evidence, tier, prompt)
+
+    def _generate_answer(
+        self,
+        db: Session,
+        *,
+        question: str,
+        preparation: AnswerPreparation,
+        pinned_model: str | None,
+    ) -> GenerationResult:
+        """最多尝试两次受约束生成，并封装升级、降级和纠错策略。"""
+
+        tier = preparation.requested_tier
+        user_prompt = preparation.user_prompt
+        assert tier is not None and user_prompt is not None
 
         model_id: str | None = None
         attempted_tier = tier
@@ -408,75 +390,56 @@ class AnswerService:
                     prompt_version=self.settings.prompt_version,
                 )
                 model_id = call.model_id
-                validated = validate_answer(parse_json_object(call.content), evidence)
-                validated = attach_cross_document_bridges(question, validated, evidence)
+                validated = validate_answer(
+                    parse_json_object(call.content),
+                    preparation.evidence,
+                )
+                validated = attach_cross_document_bridges(
+                    question,
+                    validated,
+                    preparation.evidence,
+                )
                 if validated.status == "insufficient_evidence":
                     validated.answer = refusal_text(question)
-                self._validate_live_sources(db, validated, evidence)
-                message = self._persist(
-                    db,
-                    conversation=conversation,
-                    question=question,
-                    validated=validated,
-                    model_id=model_id,
-                    trace_id=trace_id,
-                    started_at=started_at,
-                    project_ids=project_ids,
-                    evidence=evidence,
-                    requested_tier=tier,
-                    actual_tier=attempted_tier,
-                    query_plan=query_plan,
-                )
-                return ChatResponse(
-                    status=validated.status,
-                    answer=validated.answer,
-                    claims=validated.claims,
-                    sources=validated.sources,
-                    model_id=model_id,
-                    route_tier=attempted_tier,
-                    conversation_id=conversation.id,
-                    message_id=message.id,
-                    trace_id=trace_id,
-                )
-            except (TypeError, ValueError, json.JSONDecodeError, NoModelAvailable) as exc:
-                if isinstance(exc, NoModelAvailable):
-                    failure_kind = "provider"
-                    # 复杂问题通常使用 Max；若全部不可用，则允许一次仍受证据约束的
-                    # Plus 降级。固定模型评测不降级，以保持结果可重复。
-                    if tier == "max" and attempt == 0 and not pinned_model:
-                        logger.warning(
-                            "Max tier unavailable; degrading one grounded answer attempt to Plus"
-                        )
-                        attempted_tier = "plus"
-                        continue
-                    break
+                self._validate_live_sources(db, validated, preparation.evidence)
+                return GenerationResult(validated, model_id, attempted_tier)
+            except NoModelAvailable:
+                failure_kind = "provider"
+                # Max 不可用时，允许一次仍受证据约束的 Plus 降级。
+                if tier == "max" and attempt == 0 and not pinned_model:
+                    logger.warning(
+                        "Max tier unavailable; degrading one grounded answer attempt to Plus"
+                    )
+                    attempted_tier = "plus"
+                    continue
+                break
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 logger.warning(
                     "Answer output rejected; retrying with citation correction (%s: %s)",
                     type(exc).__name__,
                     str(exc),
                 )
-                user_prompt += (
-                    "\n\nPREVIOUS_OUTPUT_REJECTED: Return a fresh JSON object. "
-                    "Copy each quote exactly and contiguously from one evidence block. "
-                    "Do not paraphrase inside quote fields. Return at most 6 claims, use "
-                    "the shortest sufficient quote for each claim, and keep the JSON compact. "
-                    "Prioritize the most important supported facts instead of producing an "
-                    "exhaustive answer. "
-                    "For cross-document joins, cite the subject-to-identifier bridge evidence "
-                    "together with the downstream value evidence."
-                )
+                user_prompt += CITATION_CORRECTION_PROMPT
                 if pinned_model:
                     continue
-        validated = ValidatedAnswer(
-            status="insufficient_evidence",
-            answer=refusal_text(
-                question,
-                validation_failed=failure_kind == "validation",
-                generation_unavailable=failure_kind == "provider",
-            ),
-            claims=[],
-            sources=[],
-        )
+        return GenerationResult(None, model_id, attempted_tier, failure_kind)
+
+    def _persist_response(
+        self,
+        db: Session,
+        *,
+        conversation: Conversation,
+        question: str,
+        validated: ValidatedAnswer,
+        model_id: str | None,
+        trace_id: str,
+        started_at: float,
+        project_ids: list[str],
+        preparation: AnswerPreparation,
+        actual_tier: str | None,
+    ) -> ChatResponse:
+        """持久化审计记录并构造稳定的公开响应。"""
+
         message = self._persist(
             db,
             conversation=conversation,
@@ -486,19 +449,104 @@ class AnswerService:
             trace_id=trace_id,
             started_at=started_at,
             project_ids=project_ids,
-            evidence=evidence,
-            requested_tier=tier,
-            actual_tier=attempted_tier,
-            query_plan=query_plan,
+            evidence=preparation.evidence,
+            requested_tier=preparation.requested_tier,
+            actual_tier=actual_tier,
+            query_plan=preparation.query_plan,
         )
         return ChatResponse(
             status=validated.status,
             answer=validated.answer,
-            claims=[],
-            sources=[],
+            claims=validated.claims,
+            sources=validated.sources,
             model_id=model_id,
-            route_tier=attempted_tier,
+            route_tier=actual_tier,
             conversation_id=conversation.id,
             message_id=message.id,
             trace_id=trace_id,
+        )
+
+    def answer(
+        self,
+        db: Session,
+        *,
+        question: str,
+        project_ids: list[str],
+        conversation_id: str | None,
+        pinned_model: str | None,
+    ) -> ChatResponse:
+        """完成一次证据约束问答，并保证失败路径也返回可审计结果。"""
+
+        started_at = time.perf_counter()
+        trace_id = str(uuid.uuid4())
+        conversation = self.repository.get_or_create_conversation(db, conversation_id)
+        preparation = self._prepare_answer(
+            db,
+            question=question,
+            project_ids=project_ids,
+            pinned_model=pinned_model,
+        )
+
+        if not preparation.evidence:
+            # 无证据时不调用模型，直接返回语言匹配的确定性拒答。
+            validated = ValidatedAnswer(
+                status="insufficient_evidence",
+                answer=refusal_text(question),
+                claims=[],
+                sources=[],
+            )
+            return self._persist_response(
+                db,
+                conversation=conversation,
+                question=question,
+                validated=validated,
+                model_id=None,
+                trace_id=trace_id,
+                started_at=started_at,
+                project_ids=project_ids,
+                preparation=preparation,
+                actual_tier=None,
+            )
+
+        generation = self._generate_answer(
+            db,
+            question=question,
+            preparation=preparation,
+            pinned_model=pinned_model,
+        )
+        if generation.validated is not None:
+            return self._persist_response(
+                db,
+                conversation=conversation,
+                question=question,
+                validated=generation.validated,
+                model_id=generation.model_id,
+                trace_id=trace_id,
+                started_at=started_at,
+                project_ids=project_ids,
+                preparation=preparation,
+                actual_tier=generation.actual_tier,
+            )
+
+        refusal = ValidatedAnswer(
+            status="insufficient_evidence",
+            answer=refusal_text(
+                question,
+                validation_failed=generation.failure_kind == "validation",
+                generation_unavailable=generation.failure_kind == "provider",
+            ),
+            claims=[],
+            sources=[],
+        )
+        return self._persist_response(
+            db,
+            conversation=conversation,
+            question=question,
+            validated=refusal,
+            model_id=generation.model_id,
+            trace_id=trace_id,
+            started_at=started_at,
+            project_ids=project_ids,
+            preparation=preparation,
+            actual_tier=generation.actual_tier,
         )

@@ -7,14 +7,19 @@
 
 ```mermaid
 flowchart TD
-    ENTRY["API / Jobs / Commands"] --> CONTAINER["core.container\nComposition Root"]
-    ENTRY --> SERVICE["services\nApplication Use Cases"]
-    CONTAINER --> SERVICE
-    CONTAINER --> ADAPTER["integrations\nExternal Adapters"]
-    SERVICE --> CONTRACT["contracts\nDTO Contracts"]
-    SERVICE --> KNOWLEDGE["knowledge\nPure Knowledge Logic"]
-    SERVICE --> DB["db\nPersistence"]
-    SERVICE --> ADAPTER
+    HTTP["api/routes\nController"] --> APP["application\nApplication Service"]
+    APP --> SERVICE["services / knowledge\nDomain & Business Service"]
+    APP --> REPO["repositories\nRepository"]
+    SERVICE --> REPO
+    REPO --> DB["db\nORM & PostgreSQL"]
+    SERVICE --> ADAPTER["integrations\nExternal Adapters"]
+    APP --> CONTRACT["contracts\nDTO Contracts"]
+    ENTRY["Jobs / Commands"] --> SERVICE
+    CONTAINER["core.container\nComposition Root"] -. 构造并注入 .-> HTTP
+    CONTAINER -. 构造并注入 .-> APP
+    CONTAINER -. 构造并注入 .-> SERVICE
+    CONTAINER -. 构造并注入 .-> REPO
+    CONTAINER -. 构造并注入 .-> ADAPTER
     ADAPTER --> KNOWLEDGE
     ADAPTER --> QWEN["Qwen API"]
     ADAPTER --> SEARCH["PostgreSQL FTS + pgvector"]
@@ -24,9 +29,11 @@ flowchart TD
 本项目采用务实的分层架构和依赖注入模式，而不是把所有代码强行抽象成接口。依赖方向由
 `tests/test_architecture.py` 自动检查：
 
-- `app/api/`：HTTP 参数、状态码、路由和 FastAPI 依赖，不实现检索算法。
+- `app/api/`：Controller；只处理 HTTP 参数、状态码和响应，不写 SQL 或业务规则。
+- `app/application/`：Application Service；按一个用户用例编排业务服务和 Repository。
+- `app/repositories/`：Repository；集中封装 SQLAlchemy 查询和持久化细节。
 - `app/contracts/`：跨边界 DTO，不依赖数据库、FastAPI 或外部客户端。
-- `app/services/`：问答、入库、索引和模型路由用例编排。
+- `app/services/`：问答、检索、入库、索引和模型路由等业务流程与领域策略。
 - `app/knowledge/`：证据值对象、解析和切块等纯知识处理逻辑。
 - `app/integrations/`：Qwen、PostgreSQL 检索投影与不可变对象存储适配器。
 - `app/db/`：SQLAlchemy Session、ORM 模型和持久工作流记录。
@@ -41,11 +48,21 @@ flowchart TD
 app/
 ├── api/
 │   ├── router.py               公共路由树组装
-│   └── routes/                 Chat、文档、运维和健康接口
+│   ├── error_mapping.py        应用异常到 HTTP 状态码的统一翻译
+│   └── routes/                 薄 Controller：Chat、文档、运维和健康接口
+├── application/
+│   ├── chat_service.py         问答范围和人工反馈用例
+│   ├── document_service.py     上传、查询和文档生命周期用例
+│   ├── operations_service.py   就绪状态、用量和索引维护用例
+│   └── errors.py               与 HTTP 框架无关的应用异常
+├── repositories/
+│   ├── chat.py                 会话、回答追踪和反馈持久化
+│   ├── documents.py            文档、版本、任务和 Outbox 查询
+│   └── operations.py           健康状态和一致性聚合查询
 ├── contracts/
 │   └── schemas.py              请求、响应和应用 DTO
 ├── services/
-│   ├── answering.py            检索→路由→生成→校验→持久化
+│   ├── answering.py            准备上下文→生成/重试→校验→响应持久化
 │   ├── answer_contract.py      证据 Prompt 与严格引用校验
 │   ├── ingestion.py            解析、切块、Embedding、任务状态
 │   ├── indexing.py             Outbox、索引发布、manifest 验证
@@ -77,7 +94,23 @@ app/
 `evaluation -> app`；`app` 不得导入 `evaluation` 或 `tests`。生产模块也不能反向导入
 `commands` 或 `jobs`。
 
-## 2.1 质量保障目录
+## 2.1 与 Spring MVC 的对应关系
+
+| Spring MVC 概念 | TellerX 位置 | 责任 |
+|---|---|---|
+| Controller | `app/api/routes/` | HTTP 参数与响应；不写 SQL，不实现业务分支 |
+| Application Service | `app/application/` | 一个接口用例的事务边界和协作编排 |
+| Domain Service | `app/services/`、`app/knowledge/` | 可复用业务规则、检索与知识处理算法 |
+| Repository | `app/repositories/` | ORM 查询、聚合加载和持久化 |
+| Entity | `app/db/models.py` | 持久化实体与关系 |
+| Infrastructure Adapter | `app/integrations/` | Qwen、搜索投影和对象存储 |
+| Dependency Injection | `app/core/container.py` | 唯一组合根，负责构造并连接具体实现 |
+
+这里借鉴的是职责边界，不是 Java 语法。FastAPI 的路由函数相当于 Controller，SQLAlchemy
+`Session` 仍作为请求作用域资源显式传入；网络客户端、Repository 和 Application Service
+均由组合根复用或装配。
+
+## 2.2 质量保障目录
 
 ```text
 evaluation/
@@ -143,10 +176,20 @@ frontend/src/
 - 新检索算法：修改 `app/services/retrieval.py`；PostgreSQL SQL/索引变更才修改
   `app/integrations/search.py`，并同步补 Recall、精确标识符和项目过滤测试。
 - 新模型或供应商：在 `app/integrations/` 实现独立适配器，通过组合根注入。
-- 新 HTTP 接口：放入 `app/api/routes/`；跨接口业务规则应先提取到 `app/services/`。
+- 新 HTTP 接口：Controller 放入 `app/api/routes/`，用例编排放入 `app/application/`；
+  SQLAlchemy 查询只能进入 `app/repositories/`，可复用业务规则进入 `app/services/`。
 - 变更 Embedding 模型、维度或预处理：提升 fingerprint 并通过新物理索引原子切换。
 - 变更回答 JSON：同步修改 `app/contracts/schemas.py`、`app/services/answer_contract.py`、
   Prompt 版本和回归评测基线。
+
+### 7.1 可读性规则
+
+- Controller 方法应保持“接收参数 → 构造命令 → 调用用例 → 返回响应”的线性结构。
+- 一个私有方法只表达一个阶段；复杂流程优先拆成有名称的准备、执行、校验和持久化步骤。
+- 注释解释业务原因、并发条件和安全不变量，不逐行翻译显而易见的 Python 语句。
+- Repository 方法使用业务意图命名，例如 `get_or_restore_document`，避免上层拼装查询条件。
+- 外部依赖通过 `Protocol` 描述最小端口，使单元测试无需启动 Qwen 或 PostgreSQL。
+- 生产代码单个函数的 McCabe 复杂度不得超过 10，由 Ruff `C901` 在 CI 中强制检查。
 
 ## 8. 必须通过的提交门禁
 

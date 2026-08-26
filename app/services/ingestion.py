@@ -134,6 +134,113 @@ class IngestionService:
                 pass
             db.commit()
 
+    @staticmethod
+    def _missing_embedding_chunks(
+        chunks: list[TextChunk],
+        cached_hashes: set[str],
+    ) -> list[TextChunk]:
+        """按内容哈希去重，返回本次真正需要请求向量的分块。"""
+
+        missing: list[TextChunk] = []
+        seen = set(cached_hashes)
+        for chunk in chunks:
+            if chunk.content_hash not in seen:
+                missing.append(chunk)
+                seen.add(chunk.content_hash)
+        return missing
+
+    def _load_embedding_cache(
+        self,
+        db: Session,
+        chunks: list[TextChunk],
+        fingerprint: str,
+    ) -> dict[str, EmbeddingCache]:
+        """批量读取当前向量空间中已存在的内容缓存。"""
+
+        hashes = list(dict.fromkeys(chunk.content_hash for chunk in chunks))
+        return {
+            row.content_hash: row
+            for row in db.scalars(
+                select(EmbeddingCache).where(
+                    EmbeddingCache.content_hash.in_(hashes),
+                    EmbeddingCache.embedding_fingerprint == fingerprint,
+                )
+            )
+        }
+
+    def _save_embedding_cache(
+        self,
+        db: Session,
+        *,
+        chunk: TextChunk,
+        vector: list[float],
+        fingerprint: str,
+    ) -> EmbeddingCache:
+        """保存一个内容寻址向量，并安全复用并发 Worker 的胜出记录。"""
+
+        uri, checksum, _ = self.storage.save_vector(fingerprint, chunk.content_hash, vector)
+        new_cache = EmbeddingCache(
+            content_hash=chunk.content_hash,
+            embedding_fingerprint=fingerprint,
+            object_uri=uri,
+            checksum=checksum,
+            dimensions=len(vector),
+        )
+        try:
+            with db.begin_nested():
+                db.add(new_cache)
+                db.flush()
+            return new_cache
+        except IntegrityError:
+            # 唯一键冲突说明其他 Worker 已写入相同内容；按内容寻址可安全复用。
+            cache = db.scalar(
+                select(EmbeddingCache).where(
+                    EmbeddingCache.content_hash == chunk.content_hash,
+                    EmbeddingCache.embedding_fingerprint == fingerprint,
+                )
+            )
+            if cache is None:
+                raise
+            return cache
+
+    def _embed_batch(
+        self,
+        db: Session,
+        batch: list[TextChunk],
+        fingerprint: str,
+        cached: dict[str, EmbeddingCache],
+    ) -> None:
+        """请求并校验一批向量，然后提交对应缓存元数据。"""
+
+        vectors, _ = self.qwen.embeddings([chunk.content for chunk in batch])
+        if len(vectors) != len(batch):
+            raise ValueError("Embedding count does not match chunk count")
+        for chunk, vector in zip(batch, vectors):
+            if len(vector) != self.settings.qwen_embedding_dimensions:
+                raise ValueError(
+                    "Embedding dimension mismatch: expected "
+                    f"{self.settings.qwen_embedding_dimensions}, got {len(vector)}"
+                )
+            cached[chunk.content_hash] = self._save_embedding_cache(
+                db,
+                chunk=chunk,
+                vector=vector,
+                fingerprint=fingerprint,
+            )
+        db.commit()
+
+    def _generate_missing_embeddings(
+        self,
+        db: Session,
+        missing: list[TextChunk],
+        fingerprint: str,
+        cached: dict[str, EmbeddingCache],
+    ) -> None:
+        """以十条为一批生成缺失向量，避免触发供应商载荷上限。"""
+
+        for start in range(0, len(missing), 10):
+            self._embed_batch(db, missing[start : start + 10], fingerprint, cached)
+
     def _embeddings(
         self,
         db: Session,
@@ -144,63 +251,10 @@ class IngestionService:
 
         self._ensure_embedding_model(db)
         fingerprint = self.settings.embedding_fingerprint
-        hashes = list(dict.fromkeys(chunk.content_hash for chunk in chunks))
-        cached = {
-            row.content_hash: row
-            for row in db.scalars(
-                select(EmbeddingCache).where(
-                    EmbeddingCache.content_hash.in_(hashes),
-                    EmbeddingCache.embedding_fingerprint == fingerprint,
-                )
-            )
-        }
-        missing_chunks = []
-        seen = set(cached)
-        for chunk in chunks:
-            if chunk.content_hash not in seen:
-                missing_chunks.append(chunk)
-                seen.add(chunk.content_hash)
+        cached = self._load_embedding_cache(db, chunks, fingerprint)
+        missing_chunks = self._missing_embedding_chunks(chunks, set(cached))
         try:
-            # 控制单批大小，避免大文档一次请求触发供应商的载荷或限流上限。
-            for start in range(0, len(missing_chunks), 10):
-                batch = missing_chunks[start : start + 10]
-                vectors, _ = self.qwen.embeddings([chunk.content for chunk in batch])
-                if len(vectors) != len(batch):
-                    raise ValueError("Embedding count does not match chunk count")
-                for chunk, vector in zip(batch, vectors):
-                    if len(vector) != self.settings.qwen_embedding_dimensions:
-                        raise ValueError(
-                            f"Embedding dimension mismatch: expected "
-                            f"{self.settings.qwen_embedding_dimensions}, got {len(vector)}"
-                        )
-                    uri, checksum, _ = self.storage.save_vector(
-                        fingerprint, chunk.content_hash, vector
-                    )
-                    new_cache = EmbeddingCache(
-                        content_hash=chunk.content_hash,
-                        embedding_fingerprint=fingerprint,
-                        object_uri=uri,
-                        checksum=checksum,
-                        dimensions=len(vector),
-                    )
-                    try:
-                        with db.begin_nested():
-                            db.add(new_cache)
-                            db.flush()
-                        cache = new_cache
-                    except IntegrityError:
-                        # 唯一键冲突说明其他 Worker 已写入同一内容的向量；对象地址按
-                        # 内容寻址，因此读取胜出记录不会造成向量版本混用。
-                        cache = db.scalar(
-                            select(EmbeddingCache).where(
-                                EmbeddingCache.content_hash == chunk.content_hash,
-                                EmbeddingCache.embedding_fingerprint == fingerprint,
-                            )
-                        )
-                        if not cache:
-                            raise
-                    cached[chunk.content_hash] = cache
-                db.commit()
+            self._generate_missing_embeddings(db, missing_chunks, fingerprint, cached)
         except Exception as exc:
             db.rollback()
             if not self.settings.allow_bm25_only:

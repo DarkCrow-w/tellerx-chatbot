@@ -123,13 +123,9 @@ def _strip_polite_prefixes(query: str) -> str:
     return value
 
 
-def _query_subject_signals(query: str) -> list[str]:
-    """从常见中英文问法中提取高置信业务主题。"""
+def _structured_subject(query: str) -> str | None:
+    """按优先级提取带明确句式的中文业务主题。"""
 
-    normalized = normalize_query(query)
-    cleaned = _strip_polite_prefixes(normalized)
-    values = [match.group(1) for match in ZH_QUOTED_SUBJECT.finditer(normalized)]
-    structured_match = False
     for pattern in (
         ZH_RELATED_SUBJECT,
         ZH_ABOUT_SUBJECT,
@@ -137,39 +133,58 @@ def _query_subject_signals(query: str) -> list[str]:
         ZH_DEFINITION_SUBJECT,
         ZH_KNOWLEDGE_SUBJECT,
     ):
-        match = pattern.search(cleaned)
-        if match:
-            subject = match.group(1)
-            if pattern is ZH_DEFINITION_SUBJECT:
-                subject = ZH_DEFINITION_TAIL.sub("", subject).strip()
-            values.append(subject)
-            structured_match = True
-            break
-    bare = cleaned.removesuffix("吗").removesuffix("呢").removesuffix("吧").strip()
+        match = pattern.search(query)
+        if match is None:
+            continue
+        subject = match.group(1)
+        if pattern is ZH_DEFINITION_SUBJECT:
+            subject = ZH_DEFINITION_TAIL.sub("", subject).strip()
+        return subject
+    return None
+
+
+def _bare_subject(query: str) -> str | None:
+    """仅在短语足够短且不含疑问词时接受裸实体问法。"""
+
+    bare = query.removesuffix("吗").removesuffix("呢").removesuffix("吧").strip()
+    has_allowed_characters = re.fullmatch(r"[\u3400-\u9fffA-Za-z0-9·_.\-/ ]+", bare)
     if (
-        not structured_match
-        and 2 <= len(bare) <= 20
+        2 <= len(bare) <= 20
         and not any(term in bare for term in ZH_BARE_BLOCKERS)
-        and re.fullmatch(r"[\u3400-\u9fffA-Za-z0-9·_.\-/ ]+", bare)
+        and has_allowed_characters
     ):
-        values.append(bare)
-        structured_match = True
-    if not structured_match:
+        return bare
+    return None
+
+
+def _clean_subject(value: str) -> str | None:
+    """清理主题边界字符，并排除 ID、缩写和过长文本。"""
+
+    subject = value.strip(" \t\r\n，,。.!！?？；;：:\"'“”「」『』")
+    if EXACT_IDENTIFIER.search(subject) or ACRONYM.search(subject):
+        return None
+    for suffix in ("业务", "系统", "项目", "模块"):
+        if subject.endswith(suffix) and len(subject) > len(suffix):
+            subject = subject[: -len(suffix)]
+            break
+    return subject if 2 <= len(subject) <= 40 else None
+
+
+def _query_subject_signals(query: str) -> list[str]:
+    """从常见中英文问法中提取高置信业务主题。"""
+
+    normalized = normalize_query(query)
+    cleaned = _strip_polite_prefixes(normalized)
+    values = [match.group(1) for match in ZH_QUOTED_SUBJECT.finditer(normalized)]
+    subject = _structured_subject(cleaned) or _bare_subject(cleaned)
+    if subject is not None:
+        values.append(subject)
+    else:
         values.extend(match.group(1) for match in ZH_QUERY_SUBJECT.finditer(cleaned))
     values.extend(match.group(1) for match in EN_ENTITY.finditer(normalized))
     values.extend(match.group(1) for match in EN_RELATED_SUBJECT.finditer(normalized))
 
-    cleaned_values: list[str] = []
-    for value in values:
-        subject = value.strip(" \t\r\n，,。.!！?？；;：:\"'“”「」『』")
-        if EXACT_IDENTIFIER.search(subject) or ACRONYM.search(subject):
-            continue
-        for suffix in ("业务", "系统", "项目", "模块"):
-            if subject.endswith(suffix) and len(subject) > len(suffix):
-                subject = subject[: -len(suffix)]
-                break
-        if 2 <= len(subject) <= 40:
-            cleaned_values.append(subject)
+    cleaned_values = [subject for value in values if (subject := _clean_subject(value))]
     return list(dict.fromkeys(cleaned_values))
 
 

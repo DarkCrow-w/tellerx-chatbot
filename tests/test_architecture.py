@@ -18,8 +18,26 @@ ALLOWED_APP_DEPENDENCIES = {
     "knowledge": {"knowledge"},
     "db": {"core", "db"},
     "integrations": {"core", "integrations", "knowledge"},
-    "services": {"contracts", "core", "db", "integrations", "knowledge", "services"},
-    "api": {"api", "contracts", "core", "db", "integrations", "knowledge", "services"},
+    "repositories": {"core", "db", "repositories"},
+    "services": {
+        "contracts",
+        "core",
+        "db",
+        "integrations",
+        "knowledge",
+        "repositories",
+        "services",
+    },
+    "application": {
+        "application",
+        "contracts",
+        "core",
+        "db",
+        "knowledge",
+        "repositories",
+        "services",
+    },
+    "api": {"api", "application", "contracts", "core", "db"},
 }
 
 
@@ -65,7 +83,17 @@ def test_layer_dependencies_point_in_the_documented_direction() -> None:
 def test_entrypoint_packages_are_not_imported_by_runtime_layers() -> None:
     """Commands and jobs are outermost adapters and must remain dependency leaves."""
 
-    runtime_layers = ("api", "contracts", "core", "db", "integrations", "knowledge", "services")
+    runtime_layers = (
+        "api",
+        "application",
+        "contracts",
+        "core",
+        "db",
+        "integrations",
+        "knowledge",
+        "repositories",
+        "services",
+    )
     violations = []
     for layer in runtime_layers:
         for path in (APP_ROOT / layer).rglob("*.py"):
@@ -75,6 +103,24 @@ def test_entrypoint_packages_are_not_imported_by_runtime_layers() -> None:
                 violations.append(
                     f"{path.relative_to(APP_ROOT)} imports entrypoints: {sorted(forbidden)}"
                 )
+    assert not violations, "\n".join(violations)
+
+
+def test_controllers_do_not_contain_database_queries_or_business_services() -> None:
+    """Controller 只能调用应用用例，不能直接访问 ORM 模型或底层业务服务。"""
+
+    violations: list[str] = []
+    for path in (APP_ROOT / "api" / "routes").glob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            module = node.module if isinstance(node, ast.ImportFrom) else None
+            if module == "app.db.models" or (module and module.startswith("app.services")):
+                violations.append(f"{path.name} imports {module}")
+            if module == "sqlalchemy":
+                imported = {alias.name for alias in node.names}
+                forbidden = imported & {"select", "func", "text", "delete", "update"}
+                if forbidden:
+                    violations.append(f"{path.name} imports SQL builders: {sorted(forbidden)}")
     assert not violations, "\n".join(violations)
 
 

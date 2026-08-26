@@ -265,6 +265,84 @@ class DocumentParser:
         return units
 
     @staticmethod
+    def _render_excel_row(
+        sheet_name: str,
+        formula_row: tuple,
+        value_row: tuple,
+        warnings: list[str],
+    ) -> list[str]:
+        """把一行公式单元格和缓存值转换成可检索文本。"""
+
+        rendered: list[str] = []
+        for formula_cell, value_cell in zip(formula_row, value_row):
+            raw = formula_cell.value
+            cached = value_cell.value
+            if raw is None and cached is None:
+                rendered.append("")
+            elif isinstance(raw, str) and raw.startswith("="):
+                rendered.append(f"{cached if cached is not None else '[no cached value]'} ({raw})")
+                if cached is None:
+                    warnings.append(
+                        f"{sheet_name}!{formula_cell.coordinate} has no cached formula value"
+                    )
+            else:
+                rendered.append(str(cached if cached is not None else raw))
+        while rendered and not rendered[-1]:
+            rendered.pop()
+        return rendered
+
+    @staticmethod
+    def _read_excel_rows(
+        formula_sheet,
+        value_sheet,
+        warnings: list[str],
+    ) -> tuple[list[tuple[int, list[str]]], int]:
+        """读取工作表非空行，并记录实际使用的最大列数。"""
+
+        rows: list[tuple[int, list[str]]] = []
+        max_column = 0
+        paired_rows = zip(formula_sheet.iter_rows(), value_sheet.iter_rows())
+        for row_number, (formula_row, value_row) in enumerate(paired_rows, start=1):
+            rendered = DocumentParser._render_excel_row(
+                formula_sheet.title,
+                formula_row,
+                value_row,
+                warnings,
+            )
+            if rendered and any(rendered):
+                max_column = max(max_column, len(rendered))
+                rows.append((row_number, rendered))
+        return rows, max_column
+
+    @staticmethod
+    def _excel_units(
+        sheet_name: str,
+        rows: list[tuple[int, list[str]]],
+        max_column: int,
+    ) -> list[ParsedUnit]:
+        """把工作表按 25 行窗口转换为带坐标范围的解析单元。"""
+
+        units: list[ParsedUnit] = []
+        header = rows[0][1]
+        for start in range(0, len(rows), 25):
+            group = rows[start : start + 25]
+            lines = [" | ".join(header)] if start > 0 else []
+            lines.extend(" | ".join(cells) for _, cells in group)
+            first_row, last_row = group[0][0], group[-1][0]
+            units.append(
+                ParsedUnit(
+                    text="\n".join(lines),
+                    heading_path=f"Worksheet: {sheet_name}",
+                    sheet_name=sheet_name,
+                    cell_range=(
+                        f"A{first_row}:{get_column_letter(max_column)}{last_row}"
+                    ),
+                    is_table=True,
+                )
+            )
+        return units
+
+    @staticmethod
     def _parse_excel(path: Path) -> tuple[list[ParsedUnit], list[str]]:
         """同时读取公式与缓存值，按固定行窗口输出带单元格范围的表格块。"""
 
@@ -272,58 +350,26 @@ class DocumentParser:
         values = load_workbook(path, read_only=True, data_only=True, keep_links=False)
         units: list[ParsedUnit] = []
         warnings: list[str] = []
-        for formula_sheet in formulas.worksheets:
-            if formula_sheet.sheet_state != "visible":
-                continue
-            value_sheet = values[formula_sheet.title]
-            rows: list[tuple[int, list[str]]] = []
-            max_column = 0
-            for row_number, (formula_row, value_row) in enumerate(
-                zip(formula_sheet.iter_rows(), value_sheet.iter_rows()), start=1
-            ):
-                rendered: list[str] = []
-                for formula_cell, value_cell in zip(formula_row, value_row):
-                    raw = formula_cell.value
-                    cached = value_cell.value
-                    if raw is None and cached is None:
-                        rendered.append("")
-                    elif isinstance(raw, str) and raw.startswith("="):
-                        rendered.append(
-                            f"{cached if cached is not None else '[no cached value]'} ({raw})"
-                        )
-                        if cached is None:
-                            warnings.append(
-                                f"{formula_sheet.title}!{formula_cell.coordinate} has no cached formula value"
-                            )
-                    else:
-                        rendered.append(str(cached if cached is not None else raw))
-                while rendered and not rendered[-1]:
-                    rendered.pop()
-                if rendered and any(cell for cell in rendered):
-                    max_column = max(max_column, len(rendered))
-                    rows.append((row_number, rendered))
-            if not rows:
-                continue
-            header = rows[0][1]
-            for start in range(0, len(rows), 25):
-                group = rows[start : start + 25]
-                lines = []
-                if start > 0:
-                    lines.append(" | ".join(header))
-                lines.extend(" | ".join(cells) for _, cells in group)
-                first_row, last_row = group[0][0], group[-1][0]
-                cell_range = f"A{first_row}:{get_column_letter(max_column)}{last_row}"
-                units.append(
-                    ParsedUnit(
-                        text="\n".join(lines),
-                        heading_path=f"Worksheet: {formula_sheet.title}",
-                        sheet_name=formula_sheet.title,
-                        cell_range=cell_range,
-                        is_table=True,
-                    )
+        try:
+            for formula_sheet in formulas.worksheets:
+                if formula_sheet.sheet_state != "visible":
+                    continue
+                rows, max_column = DocumentParser._read_excel_rows(
+                    formula_sheet,
+                    values[formula_sheet.title],
+                    warnings,
                 )
-        formulas.close()
-        values.close()
+                if rows:
+                    units.extend(
+                        DocumentParser._excel_units(
+                            formula_sheet.title,
+                            rows,
+                            max_column,
+                        )
+                    )
+        finally:
+            formulas.close()
+            values.close()
         return DocumentParser._ensure_content(units), list(dict.fromkeys(warnings))
 
     @staticmethod

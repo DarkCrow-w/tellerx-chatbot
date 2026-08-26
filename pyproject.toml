@@ -59,4 +59,13 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-extend-per-file-ignores = { "app/api/routes/*.py" = ["B008"], "app/jobs/*.py" = ["BLE001"] }
+extend-select = ["C901"]
+
+[tool.ruff.lint.extend-per-file-ignores]
+"app/api/routes/*.py" = ["B008"]
+"app/jobs/*.py" = ["BLE001"]
+# Benchmark 属于独立质量工具；生产包 app/ 仍强制复杂度上限。
+"evaluation/**/*.py" = ["C901"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
