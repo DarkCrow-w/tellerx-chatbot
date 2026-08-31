@@ -5,7 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.db import Base
-from app.integrations.qwen import ChatCallResult, Usage
+from app.integrations.openai_client import ChatCallResult, Usage
 from app.services.query_understanding import QueryUnderstandingService, fallback_query_plan
 
 

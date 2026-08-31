@@ -12,8 +12,8 @@ if [ ! -f "$CORPUS/manifest.jsonl" ] || [ ! -f "$CORPUS/questions.jsonl" ]; then
   echo "Cross-document corpus is missing: $CORPUS" >&2
   exit 2
 fi
-if [ ! -f "${QWEN_API_KEY_SECRET_FILE:-./Qwen/Qwen token.txt}" ]; then
-  echo "Set QWEN_API_KEY_SECRET_FILE to the existing Qwen token file." >&2
+if [ ! -f "${MODEL_API_KEY_SECRET_FILE:-./Qwen/Qwen token.txt}" ]; then
+  echo "Set MODEL_API_KEY_SECRET_FILE to the existing model API token file." >&2
   exit 2
 fi
 
@@ -43,7 +43,7 @@ until curl -fsS "$BASE_URL/health/ready" >/dev/null; do
   sleep 2
 done
 
-compose run --rm api qwen-diagnostics
+compose run --rm api model-diagnostics
 compose run --rm \
   -v "$PWD/evaluation:/app/evaluation" \
   quality python -m evaluation.scripts.upload_evaluation_corpus "/app/$CORPUS" \

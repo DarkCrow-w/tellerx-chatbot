@@ -1,13 +1,16 @@
 # TellerX Knowledge Chatbot
 
-基于 Qwen API、PostgreSQL 全文检索和 pgvector 的证据优先企业知识库。系统支持中英混合 Word、Excel、Markdown、HTML 和文本型 PDF，回答必须通过服务器端原文引用校验。
+基于公司 OpenAI 兼容模型网关、PostgreSQL 全文检索和 pgvector 的证据优先企业知识库。系统支持中英混合 Word、Excel、Markdown、HTML 和文本型 PDF，回答必须通过服务器端原文引用校验。
 
 Docker 镜像使用确定性原生解析器：`python-docx`、`openpyxl`、BeautifulSoup 和
 `pypdf`。项目不安装 Docling 的本地 OCR/视觉模型、PyTorch 或 CUDA 运行时。
 
-向量检索使用百炼 `qwen3.7-text-embedding`（控制台名称：Qwen3.7-通用文本向量），
-输出维度为 1024。模型、维度和预处理版本共同生成 Embedding fingerprint，并进入
+内部向量检索使用 `qwen3-embedding`，Chat 使用 `qwen3.5-122B`，两者均通过
+`openai.OpenAI` SDK 和系统证书信任库访问公司 Endpoint。向量必须输出 1024 维；
+模型、维度和预处理版本共同生成 Embedding fingerprint，并进入
 PostgreSQL 搜索行；向量查询只使用 fingerprint 匹配的 pgvector 数据，避免不同向量空间混用。
+内部环境没有专用 Rerank 模型，本分支不会发送 Rerank 请求，候选结果使用 BM25、
+pgvector 和 RRF 融合排序。
 
 切换向量模型后，已有文档需要重新生成向量。服务启动后执行：
 
@@ -16,7 +19,7 @@ docker compose exec api knowledge-reindex
 ```
 
 命令会复用对象存储中的持久向量，事务性写入全文、精确词和 pgvector 搜索行并逐版本验证；
-如果目标 fingerprint 没有缓存，才调用 Qwen 生成缺失向量。临时只重建 BM25 可加
+如果目标 fingerprint 没有缓存，才调用 Embedding 模型生成缺失向量。临时只重建 BM25 可加
 `--bm25-only`，但这不能通过正式混合检索验收。
 
 完整文档：
@@ -24,6 +27,7 @@ docker compose exec api knowledge-reindex
 - [生产代码重构与 100 文档回归报告](evaluation/reports/production-refactoring-regression-report.md)
 - [生产代码架构与维护约定](docs/production-code-architecture.md)
 - [使用、开发与运维手册](docs/usage-and-operations-guide.md)
+- [公司 OpenAI 兼容模型网关配置](docs/internal-openai-model-api.md)
 - [PostgreSQL + pgvector + 全文检索架构设计](docs/postgresql-pgvector-fulltext-design.md)
 - [pgvector 迁移与运行手册](docs/pgvector-migration-and-operations.md)
 - [历史 Elasticsearch 实施与在线回测报告](evaluation/reports/elasticsearch-implementation-and-regression-report.md)
@@ -32,7 +36,7 @@ docker compose exec api knowledge-reindex
 
 ## 本地启动
 
-1. 确保 `Qwen/Qwen token.txt` 中只有百炼 API Key；该文件已被 Git 忽略。
+1. 确保 `Qwen/Qwen token.txt` 中只有模型网关 Token；该文件已被 Git 忽略。
    Docker 构建上下文也会排除整个 `Qwen` 目录，token 仅在容器运行时通过 secret 挂载。
 2. 复制配置：
 
@@ -75,26 +79,17 @@ curl -F 'file=@./example.docx' \
 curl http://localhost:8000/api/v1/ingestion-jobs/JOB_ID
 ```
 
-## Qwen 连通性诊断
+## 模型网关连通性诊断
 
 诊断会产生少量 API 用量，只在需要时显式运行：
 
 ```bash
-docker compose run --rm api qwen-diagnostics
+docker compose run --rm api model-diagnostics
 ```
 
-可使用 `--skip-chat`、`--skip-embedding` 或 `--skip-rerank` 单独跳过检查。诊断永远不输出 token。
-
-该 token 在首次诊断时已验证可用的生成模型为：
-
-- `qwen3.7-plus-2026-05-26`
-- `qwen3.7-plus`
-- `qwen3.7-max-2026-05-20`
-- `qwen3.7-max`
-
-`qwen3.7-max-2026-05-17` 和 `qwen3.7-max-preview` 当前返回模型参数错误，已在注册表中保留但禁用。
-复杂问题优先 Max；若全部 Max 临时不可用，非固定评测请求会执行一次有完整证据约束的
-Plus 降级，响应会显示实际模型和档位。固定模型评测不会自动切换。
+可使用 `--skip-chat` 或 `--skip-embedding` 单独跳过检查。诊断永远不输出 token，
+并会明确输出 `rerank: disabled`。内部模型清单位于 `config/models.yaml`；本地使用百炼
+验证 SDK 时，可显式覆盖 Endpoint、模型和 `MODEL_REGISTRY_PATH=config/models.dashscope-local.yaml`。
 
 2026-08-13 的 Chat、Embedding、Rerank 和 Elasticsearch 回归结果仅作为迁移前历史基线。
 pgvector 架构必须在目标机器完成迁移、`knowledge-reindex`、`knowledge-reconcile` 和同题集
@@ -122,7 +117,7 @@ python -m evaluation.benchmark.cli load-production-offline evaluation/generated/
 python -m evaluation.benchmark.cli api-smoke-offline evaluation/generated/benchmark-1k
 python -m evaluation.benchmark.cli project-filter-offline evaluation/generated/benchmark-1k
 
-# 正式混合检索与 Qwen 答案回归（先确保 qwen-diagnostics 全部成功）
+# 正式混合检索与模型答案回归（先确保 model-diagnostics 全部成功）
 python -m evaluation.benchmark.cli index-existing evaluation/generated/benchmark-1k
 python -m evaluation.benchmark.cli retrieve evaluation/generated/benchmark-1k
 python -m evaluation.benchmark.cli answers evaluation/generated/benchmark-1k \
@@ -165,8 +160,8 @@ npm run build
 # 专用临时库：空库迁移 + PostgreSQL FTS + pgvector HNSW 集成验证
 evaluation/scripts/run-pgvector-integration.sh
 
-# 独立 Compose 项目：120 份交叉文档、110 题、Qwen 与重启持久性门禁
-QWEN_API_KEY_SECRET_FILE='/path/to/Qwen token.txt' \
+# 独立 Compose 项目：120 份交叉文档、110 题、模型网关与重启持久性门禁
+MODEL_API_KEY_SECRET_FILE='/path/to/model API token.txt' \
   evaluation/scripts/run-crossdoc-pgvector-gate.sh
 ```
 

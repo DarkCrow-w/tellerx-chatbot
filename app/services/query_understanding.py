@@ -12,7 +12,7 @@ from typing import Any, Protocol
 
 from sqlalchemy.orm import Session
 
-from app.integrations.qwen import ChatCallResult, parse_json_object
+from app.integrations.openai_client import ChatCallResult, parse_json_object
 from app.integrations.search import (
     ACRONYM,
     EXACT_IDENTIFIER,

@@ -11,7 +11,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
-from app.core.container import qwen_client, search_index
+from app.core.container import model_client, search_index
 from app.db import SessionLocal
 from app.db.models import (
     Chunk,
@@ -197,7 +197,7 @@ def main() -> None:
     ingestion = IngestionService(
         settings,
         DocumentParser(settings.parser_backend),
-        qwen_client(),
+        model_client(),
         index,
         indexer,
         storage,
@@ -217,9 +217,9 @@ def main() -> None:
             {
                 "status": "succeeded",
                 "backend": settings.search_backend,
-                "model": settings.qwen_embedding_model,
+                "model": settings.embedding_model,
                 "embedding_fingerprint": settings.embedding_fingerprint,
-                "dimensions": settings.qwen_embedding_dimensions,
+                "dimensions": settings.embedding_dimensions,
                 "chunks": expected_total,
                 "pruned_rows": pruned,
                 "index": index.trace_index_name(),

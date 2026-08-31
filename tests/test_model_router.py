@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.db import Base
 from app.db.models import ModelUsage
-from app.integrations.qwen import QwenAPIError
+from app.integrations.openai_client import ModelAPIError
 from app.services.model_router import ModelRegistry, NoModelAvailable, QwenModelRouter, route_tier
 
 
@@ -37,6 +37,25 @@ def test_registry_priority_and_quota(tmp_path: Path) -> None:
     )
     registry = ModelRegistry.load(config)
     assert [model.id for model in registry.by_tier("plus")] == ["plus-a", "plus-b"]
+
+
+def test_single_all_tier_model_serves_simple_and_complex_queries(tmp_path: Path) -> None:
+    config = tmp_path / "models.yaml"
+    config.write_text(
+        """models:
+  - id: internal-chat
+    tier: all
+    quota_tokens: 1000
+    priority: 10
+    enabled: true
+    stable: true
+""",
+        encoding="utf-8",
+    )
+    registry = ModelRegistry.load(config)
+
+    assert [model.id for model in registry.by_tier("plus")] == ["internal-chat"]
+    assert [model.id for model in registry.by_tier("max")] == ["internal-chat"]
 
 
 def test_usage_table_can_track_model_tokens() -> None:
@@ -76,7 +95,7 @@ def test_router_does_not_expose_provider_error_message(tmp_path: Path) -> None:
 
     class FailingClient:
         def chat_json(self, **_: object) -> None:
-            raise QwenAPIError(
+            raise ModelAPIError(
                 "provider body may contain sensitive diagnostics",
                 status_code=400,
                 code="invalid_request",
@@ -119,7 +138,7 @@ def test_router_forwards_bounded_query_planning_output_limit(tmp_path: Path) -> 
             self.kwargs: dict = {}
 
         def chat_json(self, **kwargs: object):
-            from app.integrations.qwen import ChatCallResult, Usage
+            from app.integrations.openai_client import ChatCallResult, Usage
 
             self.kwargs = kwargs
             return ChatCallResult(

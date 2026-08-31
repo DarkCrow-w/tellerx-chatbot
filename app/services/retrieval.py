@@ -10,7 +10,7 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
 from app.core.config import Settings
-from app.integrations.qwen import QwenAPIError, QwenClient
+from app.integrations.openai_client import ModelAPIError, OpenAIModelClient
 from app.integrations.search import (
     ACRONYM,
     CONTROLLED_ALIAS,
@@ -32,12 +32,12 @@ logger = logging.getLogger(__name__)
 class Retriever:
     """编排确定性的混合召回，并在候选集稳定后按需调用千问重排。"""
 
-    def __init__(self, settings: Settings, index: SearchIndex, qwen: QwenClient):
+    def __init__(self, settings: Settings, index: SearchIndex, model_client: OpenAIModelClient):
         """注入检索配置、搜索后端和向量/重排客户端。"""
 
         self.settings = settings
         self.index = index
-        self.qwen = qwen
+        self.model_client = model_client
         self._query_cache: OrderedDict[str, tuple[float, list[float]]] = OrderedDict()
 
     def _query_embedding(self, query: str) -> list[float]:
@@ -54,7 +54,7 @@ class Retriever:
             return cached[1]
         if cached:
             self._query_cache.pop(key, None)
-        embeddings, _ = self.qwen.embeddings([normalized])
+        embeddings, _ = self.model_client.embeddings([normalized])
         if len(embeddings) != 1:
             raise ValueError("Query embedding response count does not match input")
         if len(self._query_cache) >= self.settings.query_embedding_cache_size:
@@ -610,6 +610,111 @@ class Retriever:
             ]
         )
 
+    def _select_rrf_evidence(
+        self,
+        query: str,
+        candidates: list[dict[str, Any]],
+        related_hits: list[dict[str, Any]],
+        linked_identifiers: list[str] | None = None,
+    ) -> list[Evidence]:
+        """在禁用或无法使用 Rerank 时，按 RRF 顺序完成邻居与来源桥接。"""
+
+        selected_rows = self._attach_short_chunk_neighbors(
+            candidates[: self.settings.evidence_top_k],
+            related_hits,
+            max_extra=max(1, self.settings.evidence_top_k // 2),
+        )
+        selected_rows = self._attach_provenance_bridge_chunks(
+            query,
+            selected_rows,
+            related_hits,
+            linked_identifiers or [],
+            max_extra=2,
+        )
+        return [
+            self._to_evidence(row["hit"]["_source"], float(row.get("score") or 0.0))
+            for row in selected_rows
+        ]
+
+    def _rank_candidates(
+        self,
+        *,
+        query: str,
+        candidates: list[dict[str, Any]],
+        related_hits: list[dict[str, Any]],
+        linked_identifiers: list[str],
+        semantic_context: str,
+        semantic_anchors: tuple[str, ...],
+    ) -> list[Evidence]:
+        """按配置选择 RRF 或专用重排；任何重排故障都安全回退到 RRF。"""
+
+        if not getattr(self.settings, "rerank_enabled", False):
+            return self._select_rrf_evidence(
+                query,
+                candidates,
+                related_hits,
+                linked_identifiers,
+            )
+        passages = [self._rerank_passage(row) for row in candidates]
+        rerank_query = "\n".join(
+            part
+            for part in [
+                query,
+                semantic_context,
+                (
+                    "Approved cross-document references: " + " ".join(linked_identifiers)
+                    if linked_identifiers
+                    else ""
+                ),
+            ]
+            if part
+        )
+        rerank_top_n = min(
+            len(candidates),
+            max(self.settings.evidence_top_k * 3, self.settings.evidence_top_k),
+        )
+        try:
+            ranked = self.model_client.rerank(rerank_query, passages, rerank_top_n)
+        except ModelAPIError as exc:
+            logger.warning("Rerank unavailable; using RRF ordering: %s", exc.code)
+            return self._select_rrf_evidence(
+                query,
+                candidates,
+                related_hits,
+                linked_identifiers,
+            )
+        ranked = self._ensure_signal_coverage(
+            query,
+            candidates,
+            ranked,
+            rerank_top_n,
+            additional_signals=semantic_anchors,
+        )
+        ranked = self._diversify_documents(
+            candidates, ranked, self.settings.evidence_top_k, query=query
+        )
+        selected_rows = [
+            {**candidates[index], "score": score}
+            for index, score in ranked[: self.settings.evidence_top_k]
+            if 0 <= index < len(candidates)
+        ]
+        selected_rows = self._attach_short_chunk_neighbors(
+            selected_rows,
+            related_hits,
+            max_extra=max(1, self.settings.evidence_top_k // 2),
+        )
+        selected_rows = self._attach_provenance_bridge_chunks(
+            query,
+            selected_rows,
+            related_hits,
+            linked_identifiers,
+            max_extra=2,
+        )
+        return [
+            self._to_evidence(row["hit"]["_source"], float(row.get("score") or 0.0))
+            for row in selected_rows
+        ]
+
     @classmethod
     def _ensure_signal_coverage(
         cls,
@@ -836,69 +941,11 @@ class Retriever:
         )
         if not candidates:
             return []
-        passages = [self._rerank_passage(row) for row in candidates]
-        try:
-            rerank_query = "\n".join(
-                part
-                for part in [
-                    query,
-                    semantic_context,
-                    (
-                        "Approved cross-document references: " + " ".join(linked_identifiers)
-                        if linked_identifiers
-                        else ""
-                    ),
-                ]
-                if part
-            )
-            rerank_top_n = min(
-                len(candidates),
-                max(self.settings.evidence_top_k * 3, self.settings.evidence_top_k),
-            )
-            ranked = self.qwen.rerank(rerank_query, passages, rerank_top_n)
-            ranked = self._ensure_signal_coverage(
-                query,
-                candidates,
-                ranked,
-                rerank_top_n,
-                additional_signals=semantic_anchors,
-            )
-            ranked = self._diversify_documents(
-                candidates, ranked, self.settings.evidence_top_k, query=query
-            )
-            selected_rows = [
-                {**candidates[index], "score": score}
-                for index, score in ranked[: self.settings.evidence_top_k]
-                if 0 <= index < len(candidates)
-            ]
-            selected_rows = self._attach_short_chunk_neighbors(
-                selected_rows,
-                related_hits,
-                max_extra=max(1, self.settings.evidence_top_k // 2),
-            )
-            selected_rows = self._attach_provenance_bridge_chunks(
-                query,
-                selected_rows,
-                related_hits,
-                linked_identifiers,
-                max_extra=2,
-            )
-            return [
-                self._to_evidence(row["hit"]["_source"], float(row.get("score") or 0.0))
-                for row in selected_rows
-            ]
-        except QwenAPIError as exc:
-            logger.warning("Rerank unavailable; using RRF ordering: %s", exc.code)
-            selected_rows = self._attach_short_chunk_neighbors(
-                candidates[: self.settings.evidence_top_k],
-                related_hits,
-                max_extra=max(1, self.settings.evidence_top_k // 2),
-            )
-            selected_rows = self._attach_provenance_bridge_chunks(
-                query,
-                selected_rows,
-                related_hits,
-                linked_identifiers,
-                max_extra=2,
-            )
-            return [self._to_evidence(row["hit"]["_source"], row["score"]) for row in selected_rows]
+        return self._rank_candidates(
+            query=query,
+            candidates=candidates,
+            related_hits=related_hits,
+            linked_identifiers=linked_identifiers,
+            semantic_context=semantic_context,
+            semantic_anchors=semantic_anchors,
+        )

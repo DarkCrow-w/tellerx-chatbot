@@ -215,7 +215,7 @@ cd /Users/cliff/Documents/TellerxChatBot
 chmod 600 "Qwen/Qwen token.txt"
 ```
 
-该目录已被 Git 和 Docker 构建上下文排除。Compose 只在容器运行时将文件只读挂载到 `/run/secrets/qwen_api_key`。不要把 token 写进 `.env`、代码、截图或日志。
+该目录已被 Git 和 Docker 构建上下文排除。Compose 只在容器运行时将文件只读挂载到 `/run/secrets/model_api_key`。不要把 token 写进 `.env`、代码、截图或日志。
 
 ### 4.3 创建配置
 
@@ -393,7 +393,7 @@ export DATABASE_URL='postgresql+psycopg://knowledge:knowledge@localhost:5432/kno
 export SEARCH_BACKEND='postgresql-pgvector-fts'
 export POSTGRES_SEARCH_TABLE='chunk_search_index'
 export STORAGE_ROOT="$PWD/.local-data/uploads"
-export QWEN_API_KEY_FILE="$PWD/Qwen/Qwen token.txt"
+export MODEL_API_KEY_FILE="$PWD/Qwen/Qwen token.txt"
 export MODEL_REGISTRY_PATH="$PWD/config/models.yaml"
 mkdir -p "$STORAGE_ROOT"
 ```
@@ -646,13 +646,13 @@ curl -sS 'http://localhost:8000/api/v1/models/usage'
 | `POSTGRES_SEARCH_SCHEMA_VERSION` | `1` | 检索结构代际 |
 | `PGVECTOR_HNSW_EF_SEARCH` | `200` | HNSW 查询候选深度 |
 | `STORAGE_ROOT` | `/data/knowledge` | 原文件存储根目录 |
-| `QWEN_API_KEY_FILE` | `/run/secrets/qwen_api_key` | token 文件路径 |
-| `QWEN_CHAT_BASE_URL` | 百炼兼容模式 URL | Chat API 根地址 |
-| `QWEN_RERANK_BASE_URL` | 百炼兼容 API URL | Embedding/Rerank 根地址 |
-| `QWEN_EMBEDDING_MODEL` | `qwen3.7-text-embedding` | 向量模型 ID |
-| `QWEN_EMBEDDING_DIMENSIONS` | `1024` | 向量维度 |
+| `MODEL_API_KEY_FILE` | `/run/secrets/model_api_key` | 公司模型网关 token 文件路径 |
+| `MODEL_API_BASE_URL` | 公司 SDK Endpoint | OpenAI 兼容 API 根地址 |
+| `MODEL_API_JSON_MODE_ENABLED` | `true` | 是否发送标准 JSON Object 响应格式 |
+| `EMBEDDING_MODEL` | `qwen3-embedding` | 向量模型 ID |
+| `EMBEDDING_DIMENSIONS` | `1024` | 向量维度，必须匹配 pgvector 结构 |
 | `EMBEDDING_PREPROCESS_VERSION` | `normalized-text-v1` | 向量预处理版本 |
-| `QWEN_RERANK_MODEL` | `qwen3-rerank` | 排序模型 ID |
+| `RERANK_ENABLED` | `false` | 内部环境禁用专用重排，使用 RRF |
 | `MODEL_REGISTRY_PATH` | `/app/config/models.yaml` | 生成模型注册表 |
 | `ALLOW_BM25_ONLY` | `true` | Embedding 失败时允许纯 BM25 导入/检索 |
 | `RUN_INLINE_INGESTION` | `false` | 是否由 API 后台任务处理导入；Compose 应保持 false |
@@ -661,8 +661,8 @@ curl -sS 'http://localhost:8000/api/v1/models/usage'
 
 | 变量 | 默认值 | 说明 |
 |---|---:|---|
-| `QWEN_TIMEOUT_SECONDS` | `60` | 单次 Qwen 请求超时 |
-| `QWEN_MAX_RETRIES` | `2` | 临时错误最大重试次数 |
+| `MODEL_API_TIMEOUT_SECONDS` | `60` | 单次模型网关请求超时 |
+| `MODEL_API_MAX_RETRIES` | `2` | SDK 临时错误最大重试次数 |
 | `PARSER_BACKEND` | `native` | 当前固定使用确定性原生解析器 |
 | `WORKER_POLL_SECONDS` | `2` | Worker 无任务时轮询间隔 |
 | `INDEX_RECONCILE_INTERVAL_SECONDS` | `3600` | Indexer 自动 manifest 对账/修复周期；`0` 禁用 |
@@ -720,7 +720,7 @@ Worker 不负责生成模型路由，但如果同时修改了 Embedding/Rerank �
 | `knowledge-worker` | 启动导入 Worker |
 | `knowledge-indexer` | 消费可靠索引 outbox |
 | `knowledge-reconcile` | 对账事实表与 PostgreSQL 检索投影；可加 `--repair` |
-| `qwen-diagnostics` | 显式检查 Chat、Embedding、Rerank |
+| `model-diagnostics` | 显式检查 Chat、Embedding，并确认 Rerank 已禁用 |
 | `python -m evaluation.business` | 运行 JSONL 业务问答评测 |
 | `python -m evaluation.benchmark.cli` | 生成和运行千文档基准 |
 | `knowledge-reindex` | 从事实库和持久向量构建、验证并切换新索引代际 |
@@ -738,26 +738,26 @@ docker compose run --rm api COMMAND
 docker compose exec api COMMAND
 ```
 
-### 11.1 Qwen 连通性诊断
+### 11.1 模型网关连通性诊断
 
 诊断会产生少量真实 API 用量：
 
 ```bash
-docker compose run --rm api qwen-diagnostics
+docker compose run --rm api model-diagnostics
 ```
 
 指定 Chat 模型：
 
 ```bash
-docker compose run --rm api qwen-diagnostics \
-  --chat-model qwen3.7-max-2026-05-20
+docker compose run --rm api model-diagnostics \
+  --chat-model qwen3.5-122B
 ```
 
 按需跳过部分检查：
 
 ```bash
-docker compose run --rm api qwen-diagnostics --skip-chat
-docker compose run --rm api qwen-diagnostics --skip-embedding --skip-rerank
+docker compose run --rm api model-diagnostics --skip-chat
+docker compose run --rm api model-diagnostics --skip-embedding
 ```
 
 命令退出码为 0 表示全部已选检查成功，1 表示至少一项失败。输出不会包含 token。
@@ -775,10 +775,10 @@ API 本身不会抢跑迁移。`alembic downgrade` 会改变数据库结构，�
 
 ### 11.3 全量向量重建
 
-切换 `QWEN_EMBEDDING_MODEL` 或 `QWEN_EMBEDDING_DIMENSIONS` 后：
+切换 `EMBEDDING_MODEL` 或 `EMBEDDING_DIMENSIONS` 后：
 
 ```bash
-docker compose run --rm api qwen-diagnostics --skip-chat --skip-rerank
+docker compose run --rm api model-diagnostics --skip-chat
 docker compose exec api knowledge-reindex
 ```
 
@@ -1056,16 +1056,16 @@ docker compose restart indexer
 
 该接口还返回 `physical_index`、`embedding_fingerprint` 和 `missing_embeddings`。正式验收前
 `pending_events`、`dead_events`、`sync_differences`、`missing_embeddings` 都应为 `0`；
-开发环境允许的 BM25-only 数据必须在 Qwen 恢复后用 `knowledge-reindex` 补齐。
+开发环境允许的 BM25-only 数据必须在 Embedding 服务恢复后用 `knowledge-reindex` 补齐。
 
 ### 15.4 导入 succeeded 但有 warnings
 
 查看任务的 `warnings`。当 `ALLOW_BM25_ONLY=true` 且 Embedding 调用失败时，任务可能以 BM25-only 完成；这时文本搜索可用，但不是正式混合检索状态。恢复 Qwen 后应诊断并重新索引。
 
-### 15.5 Qwen 返回 400、429、额度或模型错误
+### 15.5 模型网关返回 400、429、额度或模型错误
 
 ```bash
-docker compose run --rm api qwen-diagnostics
+docker compose run --rm api model-diagnostics
 curl -sS http://localhost:8000/api/v1/models/usage
 ```
 
@@ -1108,8 +1108,8 @@ docker compose up -d --build api
 - 当前没有用户登录和生效的文档 ACL，不应直接公网部署。
 - 正式环境应接入公司身份系统、Secret Manager、TLS、审计日志和备份策略。
 - 生产环境应更换示例数据库密码，并限制 PostgreSQL 网络访问。
-- 不记录 Qwen token、原文全文或供应商完整错误响应到公共日志。
-- `QWEN_API_KEY_FILE` 应保持只读 secret 文件方式。
+- 不记录模型网关 token、原文全文或供应商完整错误响应到公共日志。
+- `MODEL_API_KEY_FILE` 应保持只读 secret 文件方式。
 - 上传接口在上线前应增加认证、恶意文件检查、租户/项目权限和访问频率限制。
 - 本地 Compose 使用开发数据库口令且不发布 5432 端口；生产必须使用 Secret Manager、TLS、最小权限账号和网络隔离。
 - 模型、Embedding、Prompt 或检索参数变化后，应运行同一套人工标注回归。
@@ -1152,10 +1152,10 @@ docker compose cp api:/data/knowledge backup/uploads
 ```bash
 docker compose up --build -d
 curl -fsS http://localhost:8000/health/ready
-docker compose run --rm api qwen-diagnostics
+docker compose run --rm api model-diagnostics
 ```
 
-诊断会产生少量 Qwen 用量；仅在首次配置、模型切换、权限变化或排障时运行。
+诊断会产生少量模型用量；仅在首次配置、模型切换、权限变化或排障时运行。
 
 ## 18. 相关文档
 

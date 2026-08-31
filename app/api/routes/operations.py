@@ -38,7 +38,7 @@ def diagnostics_notice() -> dict:
     return {
         "status": "disabled-over-http",
         "message": (
-            "Run `qwen-diagnostics` locally so credentials and paid diagnostics "
+            "Run `model-diagnostics` locally so credentials and paid diagnostics "
             "are not exposed via HTTP."
         ),
     }

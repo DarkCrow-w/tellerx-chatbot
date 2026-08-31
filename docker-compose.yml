@@ -29,13 +29,13 @@ services:
       target: runtime
     env_file: ${TELLERX_ENV_FILE:-.env}
     environment:
-      QWEN_API_KEY_FILE: /run/secrets/qwen_api_key
+      MODEL_API_KEY_FILE: /run/secrets/model_api_key
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     depends_on:
       migrate:
         condition: service_completed_successfully
     secrets:
-      - qwen_api_key
+      - model_api_key
     ports:
       - "8000:8000"
     volumes:
@@ -47,13 +47,13 @@ services:
       target: worker-runtime
     env_file: ${TELLERX_ENV_FILE:-.env}
     environment:
-      QWEN_API_KEY_FILE: /run/secrets/qwen_api_key
+      MODEL_API_KEY_FILE: /run/secrets/model_api_key
     command: ["knowledge-worker"]
     depends_on:
       migrate:
         condition: service_completed_successfully
     secrets:
-      - qwen_api_key
+      - model_api_key
     volumes:
       - uploads:/data/knowledge
 
@@ -63,19 +63,19 @@ services:
       target: runtime
     env_file: ${TELLERX_ENV_FILE:-.env}
     environment:
-      QWEN_API_KEY_FILE: /run/secrets/qwen_api_key
+      MODEL_API_KEY_FILE: /run/secrets/model_api_key
     command: ["knowledge-indexer"]
     depends_on:
       migrate:
         condition: service_completed_successfully
     secrets:
-      - qwen_api_key
+      - model_api_key
     volumes:
       - uploads:/data/knowledge
 
 secrets:
-  qwen_api_key:
-    file: "${QWEN_API_KEY_SECRET_FILE:-./Qwen/Qwen token.txt}"
+  model_api_key:
+    file: "${MODEL_API_KEY_SECRET_FILE:-./Qwen/Qwen token.txt}"
 
 volumes:
   postgres-data:

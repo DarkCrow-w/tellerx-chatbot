@@ -30,7 +30,7 @@ from app.db.models import (
     IngestionJob,
     OutboxEvent,
 )
-from app.integrations.qwen import QwenClient
+from app.integrations.openai_client import OpenAIModelClient
 from app.integrations.search import SearchIndex
 from app.integrations.storage import LocalObjectStorage
 from app.knowledge.chunking import TextChunk, chunk_units
@@ -66,7 +66,7 @@ class IngestionService:
         self,
         settings: Settings,
         parser: DocumentParser,
-        qwen: QwenClient,
+        model_client: OpenAIModelClient,
         index: SearchIndex,
         indexer: IndexingService | None = None,
         storage: LocalObjectStorage | None = None,
@@ -75,7 +75,7 @@ class IngestionService:
 
         self.settings = settings
         self.parser = parser
-        self.qwen = qwen
+        self.model_client = model_client
         self.index = index
         self.storage = storage or LocalObjectStorage(settings.storage_root)
         self.indexer = indexer or IndexingService(settings, index, self.storage)
@@ -123,8 +123,8 @@ class IngestionService:
                     db.add(
                         EmbeddingModel(
                             fingerprint=fingerprint,
-                            model_id=self.settings.qwen_embedding_model,
-                            dimensions=self.settings.qwen_embedding_dimensions,
+                            model_id=self.settings.embedding_model,
+                            dimensions=self.settings.embedding_dimensions,
                             preprocess_version=self.settings.embedding_preprocess_version,
                         )
                     )
@@ -212,14 +212,14 @@ class IngestionService:
     ) -> None:
         """请求并校验一批向量，然后提交对应缓存元数据。"""
 
-        vectors, _ = self.qwen.embeddings([chunk.content for chunk in batch])
+        vectors, _ = self.model_client.embeddings([chunk.content for chunk in batch])
         if len(vectors) != len(batch):
             raise ValueError("Embedding count does not match chunk count")
         for chunk, vector in zip(batch, vectors):
-            if len(vector) != self.settings.qwen_embedding_dimensions:
+            if len(vector) != self.settings.embedding_dimensions:
                 raise ValueError(
                     "Embedding dimension mismatch: expected "
-                    f"{self.settings.qwen_embedding_dimensions}, got {len(vector)}"
+                    f"{self.settings.embedding_dimensions}, got {len(vector)}"
                 )
             cached[chunk.content_hash] = self._save_embedding_cache(
                 db,

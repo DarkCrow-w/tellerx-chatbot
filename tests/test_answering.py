@@ -9,7 +9,7 @@ from app.api.routes import chat as chat_routes
 from app.contracts.schemas import ChatRequest
 from app.db import Base
 from app.db.models import Chunk, Document, DocumentVersion, Project
-from app.integrations.qwen import ChatCallResult, Usage
+from app.integrations.openai_client import ChatCallResult, Usage
 from app.knowledge.evidence import Evidence
 from app.services.answer_contract import build_evidence_prompt
 from app.services.answering import (

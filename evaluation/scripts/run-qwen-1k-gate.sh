@@ -12,8 +12,8 @@ if [ ! -f "$CORPUS_DIR/manifest.jsonl" ] || [ ! -f "$CORPUS_DIR/questions.jsonl"
 fi
 
 # This must pass before any bulk or answer workload is allowed to consume API
-# quota. qwen-diagnostics never prints the API key or provider response text.
-qwen-diagnostics
+# quota. model-diagnostics never prints the API key or provider response text.
+model-diagnostics
 
 python -m evaluation.benchmark.cli index-existing "$CORPUS_DIR"
 python -m evaluation.benchmark.cli retrieve "$CORPUS_DIR"

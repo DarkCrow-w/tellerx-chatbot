@@ -12,7 +12,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.integrations.qwen import ChatCallResult, QwenAPIError, Usage
+from app.integrations.openai_client import ChatCallResult, ModelAPIError, Usage
 from app.integrations.search import _lexical_signals
 
 EVIDENCE_BLOCK = re.compile(
@@ -29,11 +29,11 @@ class OfflineBenchmarkQwen:
 
     def embeddings(self, texts: list[str]) -> tuple[list[list[float]], Usage]:
         del texts
-        raise QwenAPIError("offline benchmark", code="offline_benchmark")
+        raise ModelAPIError("offline benchmark", code="offline_benchmark")
 
     def rerank(self, query: str, documents: list[str], top_n: int) -> list[tuple[int, float]]:
         del query, documents, top_n
-        raise QwenAPIError("offline benchmark", code="offline_benchmark")
+        raise ModelAPIError("offline benchmark", code="offline_benchmark")
 
 
 def _offline_feature_vector(text: str, dimensions: int = 1024) -> list[float]:

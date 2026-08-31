@@ -18,7 +18,7 @@ from app.application.operations_service import (
     OperationsApplicationService,
 )
 from app.core.config import Settings, get_settings
-from app.integrations.qwen import QwenClient
+from app.integrations.openai_client import OpenAIModelClient
 from app.integrations.search import SearchIndex
 from app.integrations.storage import LocalObjectStorage
 from app.knowledge.parsers import DocumentParser
@@ -40,10 +40,10 @@ class ApplicationContainer:
     settings: Settings
 
     @cached_property
-    def qwen(self) -> QwenClient:
-        """返回复用连接池的千问客户端。"""
+    def model_client(self) -> OpenAIModelClient:
+        """返回复用 HTTP/2 连接池的 OpenAI 兼容模型客户端。"""
 
-        return QwenClient(self.settings)
+        return OpenAIModelClient(self.settings)
 
     @cached_property
     def index(self) -> SearchIndex:
@@ -91,13 +91,13 @@ class ApplicationContainer:
     def router(self) -> QwenModelRouter:
         """返回带配额与故障转移策略的模型路由器。"""
 
-        return QwenModelRouter(self.registry, self.qwen)
+        return QwenModelRouter(self.registry, self.model_client)
 
     @cached_property
     def retrieval(self) -> Retriever:
         """返回混合检索服务。"""
 
-        return Retriever(self.settings, self.index, self.qwen)
+        return Retriever(self.settings, self.index, self.model_client)
 
     @cached_property
     def query_understanding(self) -> QueryUnderstandingService:
@@ -124,7 +124,7 @@ class ApplicationContainer:
         return IngestionService(
             self.settings,
             DocumentParser(self.settings.parser_backend),
-            self.qwen,
+            self.model_client,
             self.index,
             self.indexing,
             self.storage,
@@ -168,9 +168,9 @@ class ApplicationContainer:
     def close(self) -> None:
         """只关闭实际初始化过的基础设施客户端。"""
 
-        qwen = self.__dict__.get("qwen")
-        if qwen is not None:
-            qwen.close()
+        model_client = self.__dict__.get("model_client")
+        if model_client is not None:
+            model_client.close()
         index = self.__dict__.get("index")
         if index is not None:
             index.close()
@@ -187,10 +187,10 @@ def application_container() -> ApplicationContainer:
 
 
 # 这些薄函数让调用点保持简洁，也为 FastAPI 提供稳定依赖目标；对象构造仍集中在上方。
-def qwen_client() -> QwenClient:
-    """获取进程级千问客户端。"""
+def model_client() -> OpenAIModelClient:
+    """获取进程级 OpenAI 兼容模型客户端。"""
 
-    return application_container().qwen
+    return application_container().model_client
 
 
 def search_index() -> SearchIndex:

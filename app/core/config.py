@@ -6,7 +6,7 @@ import hashlib
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, model_validator
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +18,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        populate_by_name=True,
     )
 
     app_name: str = "TellerX Knowledge Chatbot"
@@ -29,16 +30,60 @@ class Settings(BaseSettings):
     pgvector_hnsw_ef_search: int = 200
     storage_root: Path = Path("/data/knowledge")
 
-    qwen_api_key_file: Path = Path("/run/secrets/qwen_api_key")
-    qwen_chat_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    qwen_rerank_base_url: str = "https://dashscope.aliyuncs.com/compatible-api/v1"
-    # 百炼控制台名称：Qwen3.7-通用文本向量；API 模型 ID 如下。
-    qwen_embedding_model: str = "qwen3.7-text-embedding"
-    qwen_embedding_dimensions: int = 1024
+    # 内部和本地模型服务都通过 OpenAI 兼容 SDK 接入。旧 QWEN_* 名称保留为迁移别名，
+    # 新环境只需要配置 MODEL_API_* / EMBEDDING_*。
+    model_api_key_file: Path = Field(
+        default=Path("/run/secrets/model_api_key"),
+        validation_alias=AliasChoices(
+            "MODEL_API_KEY_FILE",
+            "QWEN_API_KEY_FILE",
+            "qwen_api_key_file",
+        ),
+    )
+    model_api_base_url: str = Field(
+        default="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        validation_alias=AliasChoices(
+            "MODEL_API_BASE_URL",
+            "QWEN_CHAT_BASE_URL",
+            "qwen_chat_base_url",
+        ),
+    )
+    model_api_json_mode_enabled: bool = True
+    # 内部 qwen3-embedding 必须实际返回 1024 维，否则需要新增数据库迁移。
+    embedding_model: str = Field(
+        default="qwen3-embedding",
+        validation_alias=AliasChoices(
+            "EMBEDDING_MODEL",
+            "QWEN_EMBEDDING_MODEL",
+            "qwen_embedding_model",
+        ),
+    )
+    embedding_dimensions: int = Field(
+        default=1024,
+        validation_alias=AliasChoices(
+            "EMBEDDING_DIMENSIONS",
+            "QWEN_EMBEDDING_DIMENSIONS",
+            "qwen_embedding_dimensions",
+        ),
+    )
     embedding_preprocess_version: str = "normalized-text-v1"
-    qwen_rerank_model: str = "qwen3-rerank"
-    qwen_timeout_seconds: float = 60.0
-    qwen_max_retries: int = 2
+    rerank_enabled: bool = False
+    model_api_timeout_seconds: float = Field(
+        default=60.0,
+        validation_alias=AliasChoices(
+            "MODEL_API_TIMEOUT_SECONDS",
+            "QWEN_TIMEOUT_SECONDS",
+            "qwen_timeout_seconds",
+        ),
+    )
+    model_api_max_retries: int = Field(
+        default=2,
+        validation_alias=AliasChoices(
+            "MODEL_API_MAX_RETRIES",
+            "QWEN_MAX_RETRIES",
+            "qwen_max_retries",
+        ),
+    )
 
     model_registry_path: Path = Path("config/models.yaml")
     allow_bm25_only: bool = True
@@ -81,9 +126,9 @@ class Settings(BaseSettings):
             raise ValueError("SEARCH_BACKEND must be postgresql-pgvector-fts")
         if self.postgres_search_table != "chunk_search_index":
             raise ValueError("POSTGRES_SEARCH_TABLE is fixed to chunk_search_index")
-        if self.database_url.startswith("postgresql") and self.qwen_embedding_dimensions != 1024:
+        if self.database_url.startswith("postgresql") and self.embedding_dimensions != 1024:
             raise ValueError(
-                "QWEN_EMBEDDING_DIMENSIONS must be 1024 for migration 0004; "
+                "EMBEDDING_DIMENSIONS must be 1024 for migration 0004; "
                 "a dimension change requires a new PostgreSQL vector schema migration"
             )
 
@@ -102,10 +147,10 @@ class Settings(BaseSettings):
     def _validate_embedding_configuration(self) -> None:
         """校验向量、重试和查询缓存参数。"""
 
-        if self.qwen_embedding_dimensions <= 0 or self.pgvector_hnsw_ef_search <= 0:
+        if self.embedding_dimensions <= 0 or self.pgvector_hnsw_ef_search <= 0:
             raise ValueError("embedding dimensions and HNSW ef_search must be positive")
-        if self.qwen_max_retries < 0:
-            raise ValueError("qwen_max_retries cannot be negative")
+        if self.model_api_max_retries < 0:
+            raise ValueError("model_api_max_retries cannot be negative")
         if self.query_embedding_cache_size <= 0 or self.query_embedding_cache_ttl_seconds <= 0:
             raise ValueError("query embedding cache size and TTL must be positive")
 
@@ -121,15 +166,17 @@ class Settings(BaseSettings):
                 raise ValueError("production CORS origins cannot contain a wildcard")
 
     @property
-    def qwen_api_key(self) -> str:
-        """按需读取千问密钥，避免把 Secret 内容常驻配置序列化结果。"""
+    def model_api_key(self) -> str:
+        """按需读取模型网关密钥，避免把 Secret 内容常驻配置序列化结果。"""
 
         try:
-            value = self.qwen_api_key_file.read_text(encoding="utf-8").strip()
+            value = self.model_api_key_file.read_text(encoding="utf-8").strip()
         except FileNotFoundError as exc:
-            raise RuntimeError(f"Qwen API key file is missing: {self.qwen_api_key_file}") from exc
+            raise RuntimeError(
+                f"Model API key file is missing: {self.model_api_key_file}"
+            ) from exc
         if not value:
-            raise RuntimeError("Qwen API key file is empty")
+            raise RuntimeError("Model API key file is empty")
         return value
 
     @property
@@ -138,8 +185,8 @@ class Settings(BaseSettings):
 
         payload = ":".join(
             [
-                self.qwen_embedding_model,
-                str(self.qwen_embedding_dimensions),
+                self.embedding_model,
+                str(self.embedding_dimensions),
                 self.embedding_preprocess_version,
             ]
         )

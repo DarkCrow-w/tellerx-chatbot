@@ -71,7 +71,7 @@ flowchart TD
     TIER --> BUDGET["fit_evidence_budget()<br/>限制上下文预算"]
     BUDGET --> PROMPT["build_evidence_prompt()<br/>问题 + 请求字段 + 原文证据"]
     PROMPT --> MODEL["QwenModelRouter.call()"]
-    MODEL --> QWEN["QwenClient.chat_json()<br/>temperature=0 + JSON Object"]
+    MODEL --> QWEN["OpenAIModelClient.chat_json()<br/>temperature=0 + JSON Object"]
     QWEN --> VALIDATE["parse_json_object()<br/>validate_answer()"]
 
     VALIDATE --> VALID{"声明和引用是否合法？"}

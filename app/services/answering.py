@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from app.contracts.schemas import ChatResponse, CitationOut
 from app.core.config import Settings
 from app.db.models import Conversation, Message
-from app.integrations.qwen import ChatCallResult, parse_json_object
+from app.integrations.openai_client import ChatCallResult, parse_json_object
 from app.integrations.search import _lexical_signals, normalize_query
 from app.knowledge.evidence import Evidence
 from app.repositories.chat import ChatRepository

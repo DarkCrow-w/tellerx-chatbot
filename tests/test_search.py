@@ -716,6 +716,28 @@ def test_rerank_passage_includes_governance_metadata() -> None:
     assert "heading=Approved Decision" in passage
 
 
+def test_disabled_rerank_uses_rrf_without_calling_model() -> None:
+    retriever = Retriever.__new__(Retriever)
+    retriever.settings = SimpleNamespace(rerank_enabled=False, evidence_top_k=8)
+    retriever.model_client = SimpleNamespace(
+        rerank=lambda *_: (_ for _ in ()).throw(
+            AssertionError("disabled rerank must not call the model")
+        )
+    )
+    retriever._select_rrf_evidence = lambda *args: ["rrf-result"]  # type: ignore[method-assign]
+
+    result = retriever._rank_candidates(
+        query="question",
+        candidates=[{"hit": {"_source": {"content": "candidate"}}, "score": 1.0}],
+        related_hits=[],
+        linked_identifiers=[],
+        semantic_context="",
+        semantic_anchors=(),
+    )
+
+    assert result == ["rrf-result"]
+
+
 def test_complete_entity_match_removes_distractor_documents() -> None:
     rows = [
         {

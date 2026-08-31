@@ -16,7 +16,7 @@ from typing import Any
 from sqlalchemy import delete, func, select
 
 from app.core.config import Settings
-from app.core.container import qwen_client, search_index
+from app.core.container import model_client, search_index
 from app.db import Base, SessionLocal, engine
 from app.db.models import (
     Chunk,
@@ -61,7 +61,7 @@ KNOWLEDGE_RESET_ORDER = [
 def load_corpus(corpus_dir: Path, *, reset: bool, embedding: bool) -> dict[str, Any]:
     settings = Settings()
     parser = DocumentParser(settings.parser_backend)
-    qwen = qwen_client()
+    qwen = model_client()
     index = search_index()
     Base.metadata.create_all(engine)
     manifest = _read_jsonl(corpus_dir / "manifest.jsonl")
@@ -174,7 +174,7 @@ def load_corpus(corpus_dir: Path, *, reset: bool, embedding: bool) -> dict[str, 
         embedding_cache: dict[str, list[float]] = {}
         if cache_path.exists():
             for row in _read_jsonl(cache_path):
-                if len(row.get("embedding", [])) == settings.qwen_embedding_dimensions:
+                if len(row.get("embedding", [])) == settings.embedding_dimensions:
                     embedding_cache[row["content_hash"]] = row["embedding"]
         missing: list[tuple[str, dict[str, Any]]] = []
         for item in chunks_to_index:
@@ -228,7 +228,7 @@ def load_via_production_pipeline_offline(corpus_dir: Path, *, reset: bool) -> di
         storage_root=corpus_dir,
         parser_backend="native",
         allow_bm25_only=True,
-        qwen_embedding_model="offline-production-pipeline",
+        embedding_model="offline-production-pipeline",
     )
     index = SearchIndex(settings)
     service = IngestionService(
@@ -365,7 +365,7 @@ def evaluate_api_smoke_offline(corpus_dir: Path) -> dict[str, Any]:
             storage_root=Path(temp_dir),
             parser_backend="native",
             allow_bm25_only=True,
-            qwen_embedding_model="offline-api-smoke",
+            embedding_model="offline-api-smoke",
         )
         index = SearchIndex(settings)
         index.ensure_index()
@@ -464,7 +464,7 @@ def evaluate_api_smoke_offline(corpus_dir: Path) -> dict[str, Any]:
         db.execute(delete(Document).where(Document.id.in_(document_ids)))
         db.execute(delete(Project).where(Project.name == project_name))
         db.commit()
-    SearchIndex(Settings(qwen_embedding_model="offline-production-pipeline")).ensure_index()
+    SearchIndex(Settings(embedding_model="offline-production-pipeline")).ensure_index()
 
     report = {
         "mode": "public_api_offline_smoke",
@@ -481,7 +481,7 @@ def evaluate_api_smoke_offline(corpus_dir: Path) -> dict[str, Any]:
 
 def index_existing(corpus_dir: Path, *, embedding: bool) -> dict[str, Any]:
     settings = Settings()
-    qwen = qwen_client()
+    qwen = model_client()
     index = search_index()
     started = time.perf_counter()
     with SessionLocal() as db:
@@ -517,7 +517,7 @@ def index_existing(corpus_dir: Path, *, embedding: bool) -> dict[str, Any]:
         {
             row["content_hash"]: row["embedding"]
             for row in _read_jsonl(cache_path)
-            if len(row.get("embedding", [])) == settings.qwen_embedding_dimensions
+            if len(row.get("embedding", [])) == settings.embedding_dimensions
         }
         if cache_path.exists()
         else {}
@@ -564,7 +564,7 @@ def index_existing(corpus_dir: Path, *, embedding: bool) -> dict[str, Any]:
 
 def index_offline_hybrid(corpus_dir: Path) -> dict[str, Any]:
     """Build a local feature-hash vector index without Qwen or network access."""
-    settings = Settings(qwen_embedding_model="offline-feature-hash-v1")
+    settings = Settings(embedding_model="offline-feature-hash-v1")
     index = SearchIndex(settings)
     started = time.perf_counter()
     with SessionLocal() as db:
@@ -603,7 +603,7 @@ def index_offline_hybrid(corpus_dir: Path) -> dict[str, Any]:
         "mode": "offline_feature_hash",
         "disclaimer": "Validates PostgreSQL pgvector mechanics; not Qwen embedding quality.",
         "chunks": len(documents),
-        "dimensions": settings.qwen_embedding_dimensions,
+        "dimensions": settings.embedding_dimensions,
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "index": settings.search_index_name,
     }

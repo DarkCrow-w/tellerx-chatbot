@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db.models import ModelUsage
-from app.integrations.qwen import ChatCallResult, QwenAPIError, QwenClient
+from app.integrations.openai_client import ChatCallResult, ModelAPIError, OpenAIModelClient
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +57,13 @@ class ModelRegistry:
         return next((model for model in self.models if model.id == model_id), None)
 
     def by_tier(self, tier: str) -> list[RegisteredModel]:
-        """返回指定层级中已启用的模型，顺序即调用优先级。"""
+        """返回指定层级及可服务全部层级的已启用模型。"""
 
-        return [model for model in self.models if model.tier == tier and model.enabled]
+        return [
+            model
+            for model in self.models
+            if model.tier in {tier, "all"} and model.enabled
+        ]
 
 
 COMPLEX_QUERY_MARKERS = {
@@ -92,8 +96,8 @@ def route_tier(question: str, evidence_document_ids: list[str], has_conflict: bo
 class QwenModelRouter:
     """执行本地配额保护、用量审计和同层模型故障转移。"""
 
-    def __init__(self, registry: ModelRegistry, client: QwenClient):
-        """注入模型注册表和实际的千问 API 客户端。"""
+    def __init__(self, registry: ModelRegistry, client: OpenAIModelClient):
+        """注入模型注册表和 OpenAI 兼容 API 客户端。"""
 
         self.registry = registry
         self.client = client
@@ -200,7 +204,7 @@ class QwenModelRouter:
                 f"No model with remaining local quota is available for tier {tier}"
             )
 
-        last_error: QwenAPIError | None = None
+        last_error: ModelAPIError | None = None
         for model in candidates:
             local_request_id = str(uuid.uuid4())
             try:
@@ -222,7 +226,7 @@ class QwenModelRouter:
                     prompt_version=prompt_version,
                 )
                 return result
-            except QwenAPIError as exc:
+            except ModelAPIError as exc:
                 last_error = exc
                 self._record(
                     db,

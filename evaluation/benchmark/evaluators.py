@@ -16,10 +16,10 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.core.container import answer_service, qwen_client, search_index
+from app.core.container import answer_service, model_client, search_index
 from app.db import Base, SessionLocal
 from app.db.models import Project
-from app.integrations.qwen import QwenAPIError
+from app.integrations.openai_client import ModelAPIError
 from app.integrations.search import SearchIndex
 from app.services.answering import AnswerService
 from app.services.retrieval import Retriever
@@ -69,7 +69,7 @@ def evaluate_retrieval(
 ) -> dict[str, Any]:
     settings = Settings(allow_bm25_only=not use_vector)
     index = search_index()
-    qwen = qwen_client()
+    qwen = model_client()
     retriever = Retriever(settings, index, qwen)
     questions = _read_jsonl(corpus_dir / "questions.jsonl")
     if limit:
@@ -93,7 +93,7 @@ def evaluate_retrieval(
     if not use_rerank:
 
         def disabled_rerank(*_: Any, **__: Any) -> list[tuple[int, float]]:
-            raise QwenAPIError("disabled for RRF benchmark", code="benchmark_disabled")
+            raise ModelAPIError("disabled for RRF benchmark", code="benchmark_disabled")
 
         qwen.rerank = disabled_rerank  # type: ignore[method-assign]
     else:
@@ -104,7 +104,7 @@ def evaluate_retrieval(
                 result = original_rerank(*args, **kwargs)
                 rerank_successes += 1
                 return result
-            except QwenAPIError:
+            except ModelAPIError:
                 rerank_failures += 1
                 raise
 
@@ -240,7 +240,7 @@ def evaluate_retrieval(
 
 
 def evaluate_offline_hybrid_retrieval(corpus_dir: Path) -> dict[str, Any]:
-    settings = Settings(qwen_embedding_model="offline-feature-hash-v1", allow_bm25_only=False)
+    settings = Settings(embedding_model="offline-feature-hash-v1", allow_bm25_only=False)
     index = SearchIndex(settings)
     qwen = OfflineHybridQwen()
     retriever = Retriever(settings, index, qwen)  # type: ignore[arg-type]
@@ -299,7 +299,7 @@ def evaluate_offline_hybrid_retrieval(corpus_dir: Path) -> dict[str, Any]:
 
 
 def evaluate_project_filtering_offline(corpus_dir: Path) -> dict[str, Any]:
-    settings = Settings(qwen_embedding_model="offline-production-pipeline", allow_bm25_only=True)
+    settings = Settings(embedding_model="offline-production-pipeline", allow_bm25_only=True)
     retriever = Retriever(settings, SearchIndex(settings), OfflineBenchmarkQwen())  # type: ignore[arg-type]
     rows = [
         row

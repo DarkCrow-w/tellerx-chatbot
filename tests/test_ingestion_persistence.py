@@ -118,8 +118,8 @@ def test_ingestion_persists_artifact_embedding_and_reuses_cache(tmp_path: Path) 
         _env_file=None,
         database_url="sqlite+pysqlite:///:memory:",
         storage_root=tmp_path,
-        qwen_embedding_model="test-embedding",
-        qwen_embedding_dimensions=3,
+        embedding_model="test-embedding",
+        embedding_dimensions=3,
         allow_bm25_only=False,
     )
     engine = create_engine("sqlite+pysqlite:///:memory:")
@@ -166,8 +166,8 @@ def test_verified_approved_version_replaces_previous_version_without_early_delet
         _env_file=None,
         database_url="sqlite+pysqlite:///:memory:",
         storage_root=tmp_path,
-        qwen_embedding_model="test-embedding",
-        qwen_embedding_dimensions=3,
+        embedding_model="test-embedding",
+        embedding_dimensions=3,
         allow_bm25_only=False,
     )
     engine = create_engine("sqlite+pysqlite:///:memory:")
