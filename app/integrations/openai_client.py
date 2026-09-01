@@ -62,7 +62,7 @@ class OpenAIModelClient:
             transport=transport,
         )
         self._client = openai.OpenAI(
-            api_key=self.settings.model_api_key,
+            api_key=self.settings.require_model_api_key(),
             base_url=self.settings.model_api_base_url.rstrip("/") + "/",
             http_client=self._http,
             timeout=self.settings.model_api_timeout_seconds,

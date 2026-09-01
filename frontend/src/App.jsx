@@ -3,7 +3,12 @@ import { Check, ChevronDown, Menu, MoreHorizontal } from "lucide-react";
 
 import { askKnowledgeBase, listProjects } from "./api";
 import { Composer, EmptyState, Message, Sidebar } from "./components";
+import KnowledgeManager from "./KnowledgeManager";
 import { getSavedChats, getSavedTheme, saveChats, saveTheme, uid } from "./storage";
+
+function viewFromHash() {
+  return globalThis.location.hash === "#/knowledge" ? "knowledge" : "chat";
+}
 
 /** 页面顶层状态与用例编排；纯视觉细节集中在 components.jsx。 */
 export default function App() {
@@ -18,6 +23,7 @@ export default function App() {
   const [localChatId, setLocalChatId] = useState(uid);
   const [chats, setChats] = useState(getSavedChats);
   const [toast, setToast] = useState("");
+  const [view, setView] = useState(viewFromHash);
   const scrollRef = useRef(null);
   const toastTimer = useRef(null);
 
@@ -30,6 +36,12 @@ export default function App() {
     ? `仅检索：${selectedProject.name}`
     : projects.length > 1 ? "请先选择知识库项目" : "当前知识库";
 
+  const navigate = useCallback((nextView) => {
+    const hash = nextView === "knowledge" ? "#/knowledge" : "#/chat";
+    if (globalThis.location.hash !== hash) globalThis.location.hash = hash;
+    setView(nextView);
+  }, []);
+
   const newChat = useCallback(() => {
     // 本地会话 ID 与服务端 conversationId 分离，新对话必须同时重置二者。
     setMessages([]);
@@ -37,18 +49,36 @@ export default function App() {
     setLocalChatId(uid());
     setInput("");
     setSidebarOpen(false);
-  }, []);
+    navigate("chat");
+  }, [navigate]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     saveTheme(theme);
   }, [theme]);
 
+  const refreshProjects = useCallback(async (preferredId = null) => {
+    const items = await listProjects();
+    setProjects(items);
+    setProjectId((current) => {
+      if (preferredId && items.some((item) => item.id === preferredId)) return preferredId;
+      if (items.some((item) => item.id === current)) return current;
+      return items.length === 1 ? items[0].id : "";
+    });
+    return items;
+  }, []);
+
   useEffect(() => {
-    listProjects().then((items) => {
-      setProjects(items);
-      if (items.length === 1) setProjectId(items[0].id);
-    }).catch(() => setProjects([]));
+    refreshProjects().catch(() => setProjects([]));
+  }, [refreshProjects]);
+
+  useEffect(() => {
+    function onHashChange() {
+      setView(viewFromHash());
+      setSidebarOpen(false);
+    }
+    globalThis.addEventListener("hashchange", onHashChange);
+    return () => globalThis.removeEventListener("hashchange", onHashChange);
   }, []);
 
   useEffect(() => {
@@ -69,12 +99,12 @@ export default function App() {
 
   useEffect(() => () => clearTimeout(toastTimer.current), []);
 
-  function showToast(message) {
+  const showToast = useCallback((message) => {
     /** 显示短暂提示，并覆盖尚未结束的上一次计时器。 */
     setToast(message);
     clearTimeout(toastTimer.current);
     toastTimer.current = setTimeout(() => setToast(""), 1800);
-  }
+  }, []);
 
   function persist(nextMessages, nextConversationId = conversationId) {
     /** 把当前服务端会话的前端快照提升到最近列表首位。 */
@@ -100,6 +130,7 @@ export default function App() {
     setConversationId(chat.conversationId || null);
     setMessages(chat.messages || []);
     setSidebarOpen(false);
+    navigate("chat");
   }
 
   function clearChat() {
@@ -166,11 +197,22 @@ export default function App() {
         activeId={localChatId}
         onNew={newChat}
         onOpenChat={openChat}
+        activeView={view}
+        onManage={() => { navigate("knowledge"); setSidebarOpen(false); }}
         theme={theme}
         onToggleTheme={() => setTheme((value) => value === "dark" ? "light" : "dark")}
       />
 
-      <main className="workspace">
+      {view === "knowledge" ? (
+        <KnowledgeManager
+          projects={projects}
+          projectId={projectId}
+          onProjectChange={setProjectId}
+          onProjectsChanged={refreshProjects}
+          onOpenSidebar={() => setSidebarOpen(true)}
+          onToast={showToast}
+        />
+      ) : <main className="workspace">
         <header className="topbar">
           <button className="icon-button menu-button" type="button" onClick={() => setSidebarOpen(true)} aria-label="打开侧栏"><Menu size={19} /></button>
           <button className="conversation-title" type="button" title={title}>{title}<ChevronDown size={13} /></button>
@@ -201,7 +243,7 @@ export default function App() {
         </section>
 
         <Composer value={input} onChange={setInput} onSubmit={submit} disabled={sending} scope={scope} />
-      </main>
+      </main>}
       <div className={`toast ${toast ? "show" : ""}`} role="status">{toast}<Check size={14} /></div>
     </div>
   );

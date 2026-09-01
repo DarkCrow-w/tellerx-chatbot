@@ -20,6 +20,20 @@ class ProjectOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ProjectNameIn(BaseModel):
+    """创建或重命名知识库时使用的名称。"""
+
+    name: str = Field(min_length=1, max_length=200)
+
+
+class DocumentCapabilitiesOut(BaseModel):
+    """前端上传校验所需的服务端能力，避免两端重复硬编码。"""
+
+    allowed_extensions: list[str]
+    max_upload_bytes: int
+    default_lifecycle_status: LifecycleStatus = "approved"
+
+
 class UploadResponse(BaseModel):
     """文档上传受理结果及对应异步任务标识。"""
 
@@ -61,6 +75,32 @@ class VersionOut(BaseModel):
     parse_warnings: list = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
+
+
+class DocumentSummaryOut(BaseModel):
+    """知识库管理页使用的文档、版本和任务聚合摘要。"""
+
+    id: str
+    project_id: str
+    logical_key: str
+    filename: str
+    document_type: str
+    owner: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    version_count: int
+    current_version: VersionOut | None = None
+    latest_version: VersionOut | None = None
+    latest_job: JobOut | None = None
+
+
+class DocumentPageOut(BaseModel):
+    """可搜索、可分页的文档目录。"""
+
+    items: list[DocumentSummaryOut]
+    total: int
+    limit: int
+    offset: int
 
 
 class IndexStatusOut(BaseModel):

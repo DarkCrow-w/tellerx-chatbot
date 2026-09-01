@@ -11,6 +11,7 @@
     "backend": "tellerx-backend",
     "local": "concurrently --kill-others --kill-signal SIGINT --names backend,frontend --prefix-colors blue,green \"npm:backend\" \"npm:dev\"",
     "build": "vite build --config frontend/vite.config.js",
+    "test": "node --test frontend/src/knowledge/*.test.js",
     "preview": "vite preview --config frontend/vite.config.js"
   },
   "dependencies": {

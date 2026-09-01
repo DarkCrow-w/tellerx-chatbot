@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
-from app.db.models import Chunk, Document, DocumentVersion, IngestionJob, OutboxEvent, Project
+from app.db.models import (
+    Chunk,
+    Document,
+    DocumentVersion,
+    IngestionJob,
+    OutboxEvent,
+    Project,
+    utcnow,
+)
 
 
 class DocumentRepository:
@@ -16,6 +24,31 @@ class DocumentRepository:
         """按名称返回知识库项目。"""
 
         return list(db.scalars(select(Project).order_by(Project.name)))
+
+    def get_project(self, db: Session, project_id: str) -> Project | None:
+        """按主键读取知识库项目。"""
+
+        return db.get(Project, project_id)
+
+    def get_project_by_name(self, db: Session, name: str) -> Project | None:
+        """按唯一名称读取知识库项目。"""
+
+        return db.scalar(select(Project).where(Project.name == name))
+
+    def create_project(self, db: Session, name: str) -> Project:
+        """创建可在首次上传前存在的空知识库。"""
+
+        project = Project(name=name)
+        db.add(project)
+        db.commit()
+        return project
+
+    def rename_project(self, db: Session, project: Project, name: str) -> Project:
+        """修改知识库显示名称，不改变其稳定主键和文档归属。"""
+
+        project.name = name
+        db.commit()
+        return project
 
     def get_or_create_project(self, db: Session, name: str) -> Project:
         """并发安全地取得或创建项目。"""
@@ -34,6 +67,56 @@ class DocumentRepository:
             if project is None:
                 raise
         return project
+
+    def list_documents(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        query: str | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[Document], int]:
+        """分页返回项目文档，并预加载版本供应用层生成管理摘要。"""
+
+        predicates = [
+            Document.project_id == project_id,
+            Document.is_deleted.is_(False),
+        ]
+        if query:
+            pattern = f"%{query}%"
+            predicates.append(
+                or_(Document.filename.ilike(pattern), Document.logical_key.ilike(pattern))
+            )
+        total = db.scalar(select(func.count(Document.id)).where(*predicates)) or 0
+        documents = list(
+            db.scalars(
+                select(Document)
+                .options(selectinload(Document.versions))
+                .where(*predicates)
+                .order_by(Document.updated_at.desc(), Document.id)
+                .offset(offset)
+                .limit(limit)
+            )
+        )
+        return documents, total
+
+    def latest_jobs_for_versions(
+        self, db: Session, version_ids: list[str]
+    ) -> dict[str, IngestionJob]:
+        """批量读取各版本最近一次任务，避免管理列表逐行查询。"""
+
+        if not version_ids:
+            return {}
+        jobs = db.scalars(
+            select(IngestionJob)
+            .where(IngestionJob.version_id.in_(version_ids))
+            .order_by(IngestionJob.created_at.desc(), IngestionJob.id.desc())
+        )
+        latest: dict[str, IngestionJob] = {}
+        for job in jobs:
+            latest.setdefault(job.version_id, job)
+        return latest
 
     def get_or_restore_document(
         self,
@@ -64,12 +147,12 @@ class DocumentRepository:
             db.add(document)
             db.flush()
             return document
-        if document.is_deleted:
-            # 软删除不会抹去逻辑身份；重新上传时恢复原聚合，避免同键歧义。
-            document.is_deleted = False
-            document.filename = filename
-            document.document_type = document_type
-            document.owner = owner
+        # 逻辑身份稳定，但目录摘要跟随最新上传更新；赋值也会刷新 updated_at。
+        document.is_deleted = False
+        document.filename = filename
+        document.document_type = document_type
+        document.owner = owner
+        document.updated_at = utcnow()
         return document
 
     def find_version_by_hash(

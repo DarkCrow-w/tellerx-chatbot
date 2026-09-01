@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, ClassVar, Protocol
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.application.errors import (
@@ -16,7 +17,15 @@ from app.application.errors import (
     UnsupportedDocumentError,
     UploadTooLargeError,
 )
-from app.contracts.schemas import SourceOut, UploadResponse
+from app.contracts.schemas import (
+    DocumentCapabilitiesOut,
+    DocumentPageOut,
+    DocumentSummaryOut,
+    JobOut,
+    SourceOut,
+    UploadResponse,
+    VersionOut,
+)
 from app.core.config import Settings
 from app.db.models import DocumentVersion, IngestionJob, Project
 from app.knowledge.parsers import DocumentParser
@@ -102,6 +111,106 @@ class DocumentApplicationService:
         """返回可供前端选择的知识库项目。"""
 
         return self.repository.list_projects(db)
+
+    def create_project(self, db: Session, name: str) -> Project:
+        """创建空知识库，方便用户先组织目录再上传文档。"""
+
+        normalized = name.strip()
+        if not normalized:
+            raise InvalidRequestError("Project name cannot be empty")
+        if self.repository.get_project_by_name(db, normalized) is not None:
+            raise ResourceConflictError("A project with this name already exists")
+        try:
+            return self.repository.create_project(db, normalized)
+        except IntegrityError as exc:
+            db.rollback()
+            if self.repository.get_project_by_name(db, normalized) is not None:
+                raise ResourceConflictError("A project with this name already exists") from exc
+            raise
+
+    def rename_project(self, db: Session, project_id: str, name: str) -> Project:
+        """重命名知识库，同时保持问答范围使用的项目 ID 不变。"""
+
+        project = self.repository.get_project(db, project_id)
+        if project is None:
+            raise ResourceNotFoundError("Project not found")
+        normalized = name.strip()
+        if not normalized:
+            raise InvalidRequestError("Project name cannot be empty")
+        duplicate = self.repository.get_project_by_name(db, normalized)
+        if duplicate is not None and duplicate.id != project.id:
+            raise ResourceConflictError("A project with this name already exists")
+        try:
+            return self.repository.rename_project(db, project, normalized)
+        except IntegrityError as exc:
+            db.rollback()
+            duplicate = self.repository.get_project_by_name(db, normalized)
+            if duplicate is not None and duplicate.id != project_id:
+                raise ResourceConflictError("A project with this name already exists") from exc
+            raise
+
+    def document_capabilities(self) -> DocumentCapabilitiesOut:
+        """公开真实上传约束，供浏览器在传输前完成友好校验。"""
+
+        return DocumentCapabilitiesOut(
+            allowed_extensions=sorted(DocumentParser.allowed_suffixes),
+            max_upload_bytes=self.settings.max_upload_bytes,
+        )
+
+    def list_documents(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        query: str | None,
+        limit: int,
+        offset: int,
+    ) -> DocumentPageOut:
+        """聚合文档、版本和最近任务，返回管理页面所需的单次快照。"""
+
+        if self.repository.get_project(db, project_id) is None:
+            raise ResourceNotFoundError("Project not found")
+        documents, total = self.repository.list_documents(
+            db,
+            project_id=project_id,
+            query=query.strip() if query and query.strip() else None,
+            limit=limit,
+            offset=offset,
+        )
+        latest_versions = []
+        sorted_versions: dict[str, list[DocumentVersion]] = {}
+        for document in documents:
+            versions = sorted(document.versions, key=lambda item: item.created_at, reverse=True)
+            sorted_versions[document.id] = versions
+            if versions:
+                latest_versions.append(versions[0].id)
+        jobs = self.repository.latest_jobs_for_versions(db, latest_versions)
+        items = []
+        for document in documents:
+            versions = sorted_versions[document.id]
+            latest = versions[0] if versions else None
+            current = next((item for item in versions if item.is_current), None)
+            items.append(
+                DocumentSummaryOut(
+                    id=document.id,
+                    project_id=document.project_id,
+                    logical_key=document.logical_key,
+                    filename=document.filename,
+                    document_type=document.document_type,
+                    owner=document.owner,
+                    created_at=document.created_at,
+                    updated_at=document.updated_at,
+                    version_count=len(versions),
+                    current_version=(VersionOut.model_validate(current) if current else None),
+                    latest_version=(VersionOut.model_validate(latest) if latest else None),
+                    latest_job=(
+                        JobOut.model_validate(jobs[latest.id])
+                        if latest is not None and latest.id in jobs
+                        else None
+                    ),
+                )
+            )
+        return DocumentPageOut(items=items, total=total, limit=limit, offset=offset)
 
     def upload(self, db: Session, command: UploadDocumentCommand) -> UploadDocumentResult:
         """保存不可变原始文件，并创建或复用文档版本和入库任务。"""

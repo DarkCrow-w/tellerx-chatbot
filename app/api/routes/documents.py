@@ -4,13 +4,22 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.api.error_mapping import run_application
 from app.application.document_service import UploadDocumentCommand
-from app.contracts.schemas import JobOut, ProjectOut, SourceOut, UploadResponse, VersionOut
+from app.contracts.schemas import (
+    DocumentCapabilitiesOut,
+    DocumentPageOut,
+    JobOut,
+    ProjectNameIn,
+    ProjectOut,
+    SourceOut,
+    UploadResponse,
+    VersionOut,
+)
 from app.core.container import document_application_service
 from app.db import SessionLocal, get_db
 
@@ -29,6 +38,56 @@ def list_projects(db: Session = Depends(get_db)) -> list:
     """返回可供前端选择的知识库项目。"""
 
     return document_application_service().list_projects(db)
+
+
+@router.post("/projects", response_model=ProjectOut, status_code=201)
+def create_project(payload: ProjectNameIn, db: Session = Depends(get_db)) -> ProjectOut:
+    """创建一个尚未包含文档的知识库。"""
+
+    return run_application(
+        lambda: document_application_service().create_project(db, payload.name)
+    )
+
+
+@router.patch("/projects/{project_id}", response_model=ProjectOut)
+def rename_project(
+    project_id: str,
+    payload: ProjectNameIn,
+    db: Session = Depends(get_db),
+) -> ProjectOut:
+    """修改知识库显示名称，不改变其检索范围 ID。"""
+
+    return run_application(
+        lambda: document_application_service().rename_project(db, project_id, payload.name)
+    )
+
+
+@router.get("/projects/{project_id}/documents", response_model=DocumentPageOut)
+def list_project_documents(
+    project_id: str,
+    q: str | None = Query(default=None, max_length=500),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> DocumentPageOut:
+    """返回知识库下用于管理的分页文档摘要。"""
+
+    return run_application(
+        lambda: document_application_service().list_documents(
+            db,
+            project_id=project_id,
+            query=q,
+            limit=limit,
+            offset=offset,
+        )
+    )
+
+
+@router.get("/documents/capabilities", response_model=DocumentCapabilitiesOut)
+def document_capabilities() -> DocumentCapabilitiesOut:
+    """返回前端上传前需要使用的文件类型和大小限制。"""
+
+    return document_application_service().document_capabilities()
 
 
 @router.post("/documents", response_model=UploadResponse, status_code=202)

@@ -31,12 +31,12 @@ def _upgrade_database(project_root: Path) -> None:
 
 
 def _prepare_local_files() -> None:
-    """在监听端口前验证本地运行必需的目录、Token 和模型清单。"""
+    """在监听端口前验证本地目录、环境变量 Token 和模型清单。"""
 
     settings = get_settings()
     settings.storage_root.mkdir(parents=True, exist_ok=True)
-    # 属性读取会验证 Token 文件存在且不为空，但不会输出 Secret 内容。
-    _ = settings.model_api_key
+    # 只验证环境变量存在，不输出或持久化 Token 内容。
+    settings.require_model_api_key()
     if not settings.model_registry_path.is_file():
         raise RuntimeError(f"模型清单不存在: {settings.model_registry_path}")
 

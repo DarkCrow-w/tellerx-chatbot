@@ -1,0 +1,33 @@
+from __future__ import annotations
+
+import unittest
+from unittest.mock import patch
+
+from app.core.config import Settings
+
+
+class ModelTokenEnvironmentTest(unittest.TestCase):
+    """确保模型 Token 只从环境变量进入运行配置。"""
+
+    def test_model_api_key_is_read_from_environment_and_excluded_from_dump(self) -> None:
+        with patch.dict("os.environ", {"MODEL_API_KEY": "  internal-token  "}, clear=False):
+            settings = Settings(_env_file=None)
+
+        self.assertEqual(settings.require_model_api_key(), "internal-token")
+        self.assertNotIn("model_api_key", settings.model_dump())
+        self.assertNotIn("internal-token", repr(settings))
+
+    def test_missing_model_api_key_has_actionable_error(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"MODEL_API_KEY": "", "QWEN_API_KEY": ""},
+            clear=False,
+        ):
+            settings = Settings(_env_file=None)
+
+        with self.assertRaisesRegex(RuntimeError, "MODEL_API_KEY"):
+            settings.require_model_api_key()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -44,10 +44,9 @@ npm install
 
 ```bash
 cp .env.example .env
-mkdir -p .secrets
 ```
 
-使用文本编辑器创建 `.secrets/model_api_key.txt`，文件中只放公司模型网关 Token，不要添加引号或其他配置。
+在 `.env` 中直接填写公司模型网关 Token。`.env` 已被 Git 忽略，不要把真实 Token 写入其他配置或提交到仓库。
 
 ## 3. 配置 IKP PostgreSQL
 
@@ -74,7 +73,7 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 ```env
 MODEL_API_BASE_URL=https://公司的SDK-Endpoint/v1
-MODEL_API_KEY_FILE=.secrets/model_api_key.txt
+MODEL_API_KEY="公司模型网关Token"
 EMBEDDING_MODEL=qwen3-embedding
 EMBEDDING_DIMENSIONS=1024
 MODEL_REGISTRY_PATH=config/models.yaml
@@ -130,7 +129,16 @@ tellerx-backend --skip-migrations
 
 ## 6. 上传和使用文档
 
-前端用于知识问答。文档上传可以打开 Swagger：
+打开前端后，从左侧进入“知识库管理”：
+
+1. 新建或选择一个知识库；
+2. 点击“选择文件”上传一个或多个文档，或点击“选择文件夹”导入完整目录；
+3. 等待页面中的任务状态变成“可检索”；
+4. 返回问答页，在“知识范围”中选择对应知识库后提问。
+
+文件夹导入会保留根目录以内的相对路径，用于区分不同目录下的同名文件。每次最多并行构建两份文档；单份失败不会阻断其余文件。管理页还可以查看历史版本、重试失败任务、上传新版本、下载、废弃或软删除文档。
+
+需要调试接口时仍可打开 Swagger：
 
 <http://127.0.0.1:8000/docs>
 
@@ -176,4 +184,15 @@ pyproject.toml       Python 依赖和命令入口
 package.json         前端依赖和启动命令
 ```
 
-`.env`、`.secrets/`、`.local-data/`、`.venv/` 和 `node_modules/` 均不会提交到 Git。
+`.env`、`.local-data/`、`.venv/` 和 `node_modules/` 均不会提交到 Git。
+
+## 9. 开发检查
+
+```bash
+python -m unittest discover -s tests
+npm test
+npm run build
+ruff check app
+```
+
+这些检查不调用公司模型接口；完整验收仍应在已配置 PostgreSQL 和模型 Token 的环境中上传真实文档并执行一次问答。

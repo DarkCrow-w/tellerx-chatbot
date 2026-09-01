@@ -30,14 +30,15 @@ class Settings(BaseSettings):
     pgvector_hnsw_ef_search: int = 200
     storage_root: Path = Path(".local-data/knowledge")
 
-    # 内部和本地模型服务都通过 OpenAI 兼容 SDK 接入。旧 QWEN_* 名称保留为迁移别名，
-    # 新环境只需要配置 MODEL_API_* / EMBEDDING_*。
-    model_api_key_file: Path = Field(
-        default=Path(".secrets/model_api_key.txt"),
+    # Token 只从进程环境读取；exclude/repr=False 防止配置日志或序列化意外泄露。
+    model_api_key: str = Field(
+        default="",
+        exclude=True,
+        repr=False,
         validation_alias=AliasChoices(
-            "MODEL_API_KEY_FILE",
-            "QWEN_API_KEY_FILE",
-            "qwen_api_key_file",
+            "MODEL_API_KEY",
+            "QWEN_API_KEY",
+            "qwen_api_key",
         ),
     )
     model_api_base_url: str = Field(
@@ -167,18 +168,12 @@ class Settings(BaseSettings):
             if "*" in self.cors_origins:
                 raise ValueError("production CORS origins cannot contain a wildcard")
 
-    @property
-    def model_api_key(self) -> str:
-        """按需读取模型网关密钥，避免把 Secret 内容常驻配置序列化结果。"""
+    def require_model_api_key(self) -> str:
+        """返回环境变量中的模型 Token，并在启动或首次调用前拒绝空值。"""
 
-        try:
-            value = self.model_api_key_file.read_text(encoding="utf-8").strip()
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Model API key file is missing: {self.model_api_key_file}"
-            ) from exc
+        value = self.model_api_key.strip()
         if not value:
-            raise RuntimeError("Model API key file is empty")
+            raise RuntimeError("MODEL_API_KEY environment variable is missing or empty")
         return value
 
     @property

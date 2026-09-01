@@ -7,6 +7,7 @@ import {
   CircleAlert,
   Clipboard,
   Code2,
+  Database,
   FileSearch,
   MessageSquareText,
   Moon,
@@ -144,13 +145,13 @@ export function Message({ message, onToast }) {
   );
 }
 
-export function Sidebar({ open, onClose, chats, activeId, onNew, onOpenChat, theme, onToggleTheme }) {
+export function Sidebar({ open, onClose, chats, activeId, onNew, onOpenChat, activeView, onManage, theme, onToggleTheme }) {
   /** 渲染最近对话导航、知识库状态和主题切换。 */
   return (
     <>
       <aside className={`sidebar ${open ? "open" : ""}`} aria-label="对话导航">
         <div className="sidebar-header">
-          <a className="brand" href="/" aria-label="TellerX 首页">
+          <a className="brand" href="#/chat" aria-label="TellerX 首页">
             <span className="brand-mark">T</span>
             <span>TellerX</span>
           </a>
@@ -161,6 +162,11 @@ export function Sidebar({ open, onClose, chats, activeId, onNew, onOpenChat, the
           <Plus size={16} />
           <span>新对话</span>
           <kbd>⌘ K</kbd>
+        </button>
+
+        <button className={`manage-nav ${activeView === "knowledge" ? "active" : ""}`} type="button" onClick={onManage}>
+          <Database size={16} />
+          <span>知识库管理</span>
         </button>
 
         <nav className="history" aria-label="最近对话">
