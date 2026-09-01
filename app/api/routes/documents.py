@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, UploadFile
@@ -11,6 +12,8 @@ from sqlalchemy.orm import Session
 from app.api.error_mapping import run_application
 from app.application.document_service import UploadDocumentCommand
 from app.contracts.schemas import (
+    BulkDeleteDocumentsIn,
+    BulkDeleteDocumentsOut,
     DocumentCapabilitiesOut,
     DocumentPageOut,
     JobOut,
@@ -24,13 +27,20 @@ from app.core.container import document_application_service
 from app.db import SessionLocal, get_db
 
 router = APIRouter(tags=["documents"])
+logger = logging.getLogger(__name__)
 
 
 def _run_job(job_id: str) -> None:
     """在独立数据库会话中执行仅供开发环境使用的内联任务。"""
 
-    with SessionLocal() as db:
-        document_application_service().process_ingestion_job(db, job_id)
+    logger.info("后台入库任务开始 job_id=%s", job_id)
+    try:
+        with SessionLocal() as db:
+            document_application_service().process_ingestion_job(db, job_id)
+    except Exception:
+        logger.exception("后台入库任务异常 job_id=%s", job_id)
+        raise
+    logger.info("后台入库任务完成 job_id=%s", job_id)
 
 
 @router.get("/projects", response_model=list[ProjectOut])
@@ -203,3 +213,23 @@ def delete_document(document_id: str, db: Session = Depends(get_db)) -> None:
     """软删除文档，并异步移除全部版本的搜索投影。"""
 
     run_application(lambda: document_application_service().delete_document(db, document_id))
+
+
+@router.post(
+    "/projects/{project_id}/documents/bulk-delete",
+    response_model=BulkDeleteDocumentsOut,
+)
+def bulk_delete_documents(
+    project_id: str,
+    payload: BulkDeleteDocumentsIn,
+    db: Session = Depends(get_db),
+) -> BulkDeleteDocumentsOut:
+    """批量软删除当前知识库中勾选的逻辑文档。"""
+
+    return run_application(
+        lambda: document_application_service().bulk_delete_documents(
+            db,
+            project_id=project_id,
+            document_ids=payload.document_ids,
+        )
+    )

@@ -263,12 +263,20 @@ h1 { margin: 0; font-size: clamp(28px, 4vw, 40px); font-weight: 610; letter-spac
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .document-toolbar { display: flex; align-items: center; gap: 6px; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
-.document-toolbar label { display: flex; min-width: 180px; max-width: 340px; flex: 1; align-items: center; gap: 7px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: var(--surface); }
-.document-toolbar input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; font-size: 11px; }
+.document-toolbar .document-search { display: flex; min-width: 180px; max-width: 340px; flex: 1; align-items: center; gap: 7px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: var(--surface); }
+.document-search input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; font-size: 11px; }
+.document-selection { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.document-selection label { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); cursor: pointer; font-size: 10px; white-space: nowrap; }
+.document-selection input, .document-checkbox { width: 14px; height: 14px; accent-color: var(--accent); cursor: pointer; }
+.bulk-delete-button { display: inline-flex; min-height: 29px; align-items: center; gap: 5px; padding: 0 8px; border: 1px solid color-mix(in srgb, #ad574e 45%, var(--line)); border-radius: 7px; color: #ad574e; background: transparent; cursor: pointer; font-size: 10px; }
+.bulk-delete-button:hover { background: color-mix(in srgb, #ad574e 9%, transparent); }
+.bulk-delete-button:disabled { cursor: wait; opacity: .55; }
 .document-list { min-height: 180px; margin-top: 9px; transition: opacity .15s; }
 .document-list.loading { opacity: .55; }
 .document-row { overflow: hidden; border-bottom: 1px solid var(--line); }
-.document-main { display: grid; min-height: 72px; grid-template-columns: 24px 34px minmax(180px,1fr) auto auto; align-items: center; gap: 8px; padding: 10px 2px; }
+.document-row.selected { background: color-mix(in srgb, var(--accent-soft) 45%, transparent); }
+.document-main { display: grid; min-height: 72px; grid-template-columns: 18px 24px 34px minmax(180px,1fr) auto auto; align-items: center; gap: 8px; padding: 10px 2px; }
+.document-checkbox { margin: 0; }
 .document-expand { display: grid; width: 24px; height: 24px; place-items: center; border: 0; border-radius: 6px; color: var(--muted); background: transparent; cursor: pointer; }
 .document-expand svg { transition: transform .15s; }
 .document-row.expanded .document-expand svg { transform: rotate(180deg); }
@@ -312,8 +320,8 @@ h1 { margin: 0; font-size: clamp(28px, 4vw, 40px); font-weight: 610; letter-spac
 
 @media (max-width: 1080px) {
   .manager-page { grid-template-columns: 180px minmax(0,1fr); }
-  .document-main { grid-template-columns: 24px 34px minmax(160px,1fr) auto; }
-  .document-actions { grid-column: 3 / -1; justify-content: flex-end; margin-top: -6px; }
+  .document-main { grid-template-columns: 18px 24px 34px minmax(160px,1fr) auto; }
+  .document-actions { grid-column: 4 / -1; justify-content: flex-end; margin-top: -6px; }
 }
 
 @media (max-width: 820px) {
@@ -333,9 +341,12 @@ h1 { margin: 0; font-size: clamp(28px, 4vw, 40px); font-weight: 610; letter-spac
   .upload-buttons { width: 100%; }
   .upload-buttons button { flex: 1; }
   .advanced-upload > div { grid-template-columns: 1fr; }
-  .document-main { grid-template-columns: 22px 31px minmax(0,1fr) auto; }
-  .document-status { grid-column: 3; justify-self: start; }
-  .document-actions { grid-column: 3 / -1; flex-wrap: wrap; justify-content: flex-start; margin-top: 0; }
+  .document-toolbar { flex-wrap: wrap; }
+  .document-toolbar .document-search { max-width: none; }
+  .document-selection { width: 100%; justify-content: flex-end; }
+  .document-main { grid-template-columns: 18px 22px 31px minmax(0,1fr) auto; }
+  .document-status { grid-column: 4; justify-self: start; }
+  .document-actions { grid-column: 4 / -1; flex-wrap: wrap; justify-content: flex-start; margin-top: 0; }
   .document-actions .text-button { padding-left: 2px; }
   .version-list { margin-left: 30px; }
   .version-row { grid-template-columns: 1fr; gap: 6px; }

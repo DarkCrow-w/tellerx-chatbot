@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 from pathlib import Path
 
@@ -11,6 +12,9 @@ from alembic.config import Config
 
 from alembic import command
 from app.core.config import get_settings
+from app.core.logging import configure_logging
+
+logger = logging.getLogger(__name__)
 
 
 def _project_root() -> Path:
@@ -25,9 +29,13 @@ def _project_root() -> Path:
 def _upgrade_database(project_root: Path) -> None:
     """启动前把目标 PostgreSQL 升级到当前代码所需结构。"""
 
+    logger.info("开始执行数据库迁移 target=head")
     alembic_config = Config(str(project_root / "alembic.ini"))
     alembic_config.set_main_option("script_location", str(project_root / "alembic"))
+    # 本地启动器已经配置统一日志，阻止 Alembic 再次覆盖根 Logger。
+    alembic_config.attributes["configure_logger"] = False
     command.upgrade(alembic_config, "head")
+    logger.info("数据库迁移完成 target=head")
 
 
 def _prepare_local_files() -> None:
@@ -39,6 +47,11 @@ def _prepare_local_files() -> None:
     settings.require_model_api_key()
     if not settings.model_registry_path.is_file():
         raise RuntimeError(f"模型清单不存在: {settings.model_registry_path}")
+    logger.info(
+        "本地运行目录检查完成 storage_root=%s model_registry=%s",
+        settings.storage_root,
+        settings.model_registry_path,
+    )
 
 
 def main() -> None:
@@ -55,15 +68,30 @@ def main() -> None:
     parser.add_argument("--skip-migrations", action="store_true")
     args = parser.parse_args()
 
-    project_root = _project_root()
-    _prepare_local_files()
-    if not args.skip_migrations:
-        _upgrade_database(project_root)
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    try:
+        project_root = _project_root()
+        _prepare_local_files()
+        if not args.skip_migrations:
+            _upgrade_database(project_root)
+    except Exception:
+        logger.exception("后端启动准备失败")
+        raise
+    logger.info(
+        "启动HTTP服务 host=%s port=%d reload=%s migrations=%s",
+        args.host,
+        args.port,
+        args.reload,
+        "skipped" if args.skip_migrations else "applied",
+    )
     uvicorn.run(
         "app.main:app",
         host=args.host,
         port=args.port,
         reload=args.reload,
+        log_config=None,
+        access_log=False,
     )
 
 

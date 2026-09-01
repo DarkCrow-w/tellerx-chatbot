@@ -200,11 +200,18 @@ class QwenModelRouter:
         else:
             candidates = self.eligible(db, tier)
         if not candidates:
+            logger.error("没有可用模型 tier=%s pinned=%s", tier, bool(pinned_model))
             raise NoModelAvailable(
                 f"No model with remaining local quota is available for tier {tier}"
             )
 
         last_error: ModelAPIError | None = None
+        logger.info(
+            "模型路由完成 tier=%s pinned=%s candidates=%s",
+            tier,
+            bool(pinned_model),
+            ",".join(model.id for model in candidates),
+        )
         for model in candidates:
             local_request_id = str(uuid.uuid4())
             try:
@@ -224,6 +231,12 @@ class QwenModelRouter:
                     total_tokens=result.usage.total_tokens,
                     latency_ms=result.latency_ms,
                     prompt_version=prompt_version,
+                )
+                logger.info(
+                    "模型调用审计成功 model=%s request_id=%s total_tokens=%d",
+                    model.id,
+                    result.request_id,
+                    result.usage.total_tokens,
                 )
                 return result
             except ModelAPIError as exc:

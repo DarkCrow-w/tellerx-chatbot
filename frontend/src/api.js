@@ -111,6 +111,18 @@ export function deleteDocument(documentId) {
   });
 }
 
+export function bulkDeleteDocuments(projectId, documentIds) {
+  /** 在指定知识库中一次软删除多份逻辑文档。 */
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/documents/bulk-delete`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ document_ids: documentIds }),
+    },
+  );
+}
+
 export function documentDownloadUrl(documentId, versionId = null) {
   /** 构造浏览器可直接打开的原文件下载地址。 */
   const path = `/api/v1/documents/${encodeURIComponent(documentId)}/download`;

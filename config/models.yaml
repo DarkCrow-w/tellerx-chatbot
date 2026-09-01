@@ -1,5 +1,5 @@
 models:
-  - id: qwen3.5-122B
+  - id: qwen3.7-max-2026-06-08
     tier: all
     quota_tokens: 100000000
     priority: 10

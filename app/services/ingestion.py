@@ -111,6 +111,7 @@ class IngestionService:
         job.started_at = now
         job.lease_until = now + timedelta(minutes=15)
         db.commit()
+        logger.info("已领取入库任务 job_id=%s attempt=%d", job.id, job.attempts)
         return job.id
 
     def _ensure_embedding_model(self, db: Session) -> None:
@@ -253,6 +254,13 @@ class IngestionService:
         fingerprint = self.settings.embedding_fingerprint
         cached = self._load_embedding_cache(db, chunks, fingerprint)
         missing_chunks = self._missing_embedding_chunks(chunks, set(cached))
+        logger.info(
+            "向量缓存检查完成 chunks=%d cached=%d missing=%d fingerprint=%s",
+            len(chunks),
+            len(cached),
+            len(missing_chunks),
+            fingerprint,
+        )
         try:
             self._generate_missing_embeddings(db, missing_chunks, fingerprint, cached)
         except Exception as exc:
@@ -260,6 +268,10 @@ class IngestionService:
             if not self.settings.allow_bm25_only:
                 raise
             # 开启降级时保留词法索引能力，避免向量服务故障阻塞整个入库链路。
+            logger.warning(
+                "Embedding不可用，降级为BM25-only error=%s",
+                type(exc).__name__,
+            )
             warnings.append(f"Embedding unavailable; indexed for BM25 only ({type(exc).__name__})")
         return cached
 
@@ -395,6 +407,13 @@ class IngestionService:
         )
         if not version:
             raise ValueError(f"Unknown document version: {job.version_id}")
+        logger.info(
+            "入库任务处理开始 job_id=%s document_id=%s version_id=%s filename=%s",
+            job_id,
+            version.document_id,
+            version.id,
+            version.document.filename,
+        )
         try:
             # 每个阶段先持久化状态，进程异常退出后运维端仍能定位失败位置。
             job.status = "running"
@@ -417,6 +436,13 @@ class IngestionService:
             )
             if not text_chunks:
                 raise ValueError("Parser produced no chunks")
+            logger.info(
+                "文档解析切块完成 job_id=%s units=%d chunks=%d warnings=%d",
+                job_id,
+                len(units),
+                len(text_chunks),
+                len(warnings),
+            )
             self._save_normalized_artifact(db, version, units, warnings)
             version.technical_status = "chunked"
             job.stage, job.progress = "embedding", 35
@@ -430,6 +456,13 @@ class IngestionService:
             )
             event_id = self._persist_chunks_and_event(
                 db, job, version, text_chunks, cache, warnings
+            )
+            logger.info(
+                "入库数据写入完成 job_id=%s event_id=%s chunks=%d embeddings=%d",
+                job_id,
+                event_id,
+                len(text_chunks),
+                len(cache),
             )
             return event_id
         except Exception as exc:

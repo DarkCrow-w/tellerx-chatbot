@@ -339,6 +339,10 @@ class AnswerService:
                 query_plan=query_plan,
             )
         if not evidence:
+            logger.info(
+                "证据检索完成 evidence_count=0 project_count=%d",
+                len(project_ids),
+            )
             return AnswerPreparation(query_plan, [], None, None)
 
         version_pairs: dict[str, set[str]] = {}
@@ -356,6 +360,13 @@ class AnswerService:
             evidence,
             self.settings.prompt_version,
             query_plan.requested_facts,
+        )
+        logger.info(
+            "证据检索与路由完成 evidence_count=%d project_count=%d tier=%s conflict=%s",
+            len(evidence),
+            len(project_ids),
+            tier,
+            has_conflict,
         )
         return AnswerPreparation(query_plan, evidence, tier, prompt)
 
@@ -380,6 +391,13 @@ class AnswerService:
             # 第二次只提升非固定的 Plus 请求；固定模型评测必须保持可重复。
             if attempt == 1 and tier == "plus" and not pinned_model:
                 attempted_tier = "max"
+            logger.info(
+                "回答生成尝试 attempt=%d tier=%s pinned=%s evidence_count=%d",
+                attempt + 1,
+                attempted_tier,
+                bool(pinned_model),
+                len(preparation.evidence),
+            )
             try:
                 call = self.router.call(
                     db,
@@ -454,7 +472,7 @@ class AnswerService:
             actual_tier=actual_tier,
             query_plan=preparation.query_plan,
         )
-        return ChatResponse(
+        response = ChatResponse(
             status=validated.status,
             answer=validated.answer,
             claims=validated.claims,
@@ -465,6 +483,18 @@ class AnswerService:
             message_id=message.id,
             trace_id=trace_id,
         )
+        logger.info(
+            "问答处理完成 trace_id=%s status=%s model=%s tier=%s evidence_count=%d "
+            "source_count=%d elapsed_ms=%.1f",
+            trace_id,
+            validated.status,
+            model_id or "none",
+            actual_tier or "none",
+            len(preparation.evidence),
+            len(validated.sources),
+            (time.perf_counter() - started_at) * 1000,
+        )
+        return response
 
     def answer(
         self,
@@ -479,6 +509,13 @@ class AnswerService:
 
         started_at = time.perf_counter()
         trace_id = str(uuid.uuid4())
+        logger.info(
+            "问答处理开始 trace_id=%s question_chars=%d project_count=%d pinned=%s",
+            trace_id,
+            len(question),
+            len(project_ids),
+            bool(pinned_model),
+        )
         conversation = self.repository.get_or_create_conversation(db, conversation_id)
         preparation = self._prepare_answer(
             db,

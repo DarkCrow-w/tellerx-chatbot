@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Generator
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -33,5 +36,10 @@ def get_db() -> Generator[Session, None, None]:
     session = SessionLocal()
     try:
         yield session
+    except Exception as exc:
+        session.rollback()
+        # HTTP 业务异常也会经过依赖清理，详细堆栈由请求中间件统一记录。
+        logger.debug("数据库会话已回滚 error=%s", type(exc).__name__)
+        raise
     finally:
         session.close()

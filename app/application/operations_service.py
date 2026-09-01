@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Protocol
 
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.repositories.operations import OperationsRepository
+
+logger = logging.getLogger(__name__)
 
 
 class SearchStatusPort(Protocol):
@@ -58,7 +61,15 @@ class OperationsApplicationService:
     def reconcile_index(self, db: Session, *, repair: bool) -> dict:
         """比较事实表和搜索投影，并按调用参数决定是否修复。"""
 
-        return self.indexing.reconcile(db, repair=repair)
+        logger.info("索引一致性检查开始 repair=%s", repair)
+        result = self.indexing.reconcile(db, repair=repair)
+        logger.info(
+            "索引一致性检查完成 repair=%s differences=%d repaired=%s",
+            repair,
+            len(result.get("differences", [])),
+            result.get("repaired", 0),
+        )
+        return result
 
     def model_usage(self, db: Session) -> list[dict]:
         """返回模型路由器记录的本地用量估算。"""

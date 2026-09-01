@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,7 @@ from app.application.errors import (
     UploadTooLargeError,
 )
 from app.contracts.schemas import (
+    BulkDeleteDocumentsOut,
     DocumentCapabilitiesOut,
     DocumentPageOut,
     DocumentSummaryOut,
@@ -30,6 +32,8 @@ from app.core.config import Settings
 from app.db.models import DocumentVersion, IngestionJob, Project
 from app.knowledge.parsers import DocumentParser
 from app.repositories.documents import DocumentRepository
+
+logger = logging.getLogger(__name__)
 
 
 class ObjectStorage(Protocol):
@@ -121,7 +125,9 @@ class DocumentApplicationService:
         if self.repository.get_project_by_name(db, normalized) is not None:
             raise ResourceConflictError("A project with this name already exists")
         try:
-            return self.repository.create_project(db, normalized)
+            project = self.repository.create_project(db, normalized)
+            logger.info("知识库创建完成 project_id=%s name=%s", project.id, project.name)
+            return project
         except IntegrityError as exc:
             db.rollback()
             if self.repository.get_project_by_name(db, normalized) is not None:
@@ -141,7 +147,9 @@ class DocumentApplicationService:
         if duplicate is not None and duplicate.id != project.id:
             raise ResourceConflictError("A project with this name already exists")
         try:
-            return self.repository.rename_project(db, project, normalized)
+            renamed = self.repository.rename_project(db, project, normalized)
+            logger.info("知识库重命名完成 project_id=%s name=%s", renamed.id, renamed.name)
+            return renamed
         except IntegrityError as exc:
             db.rollback()
             duplicate = self.repository.get_project_by_name(db, normalized)
@@ -218,7 +226,7 @@ class DocumentApplicationService:
         self._validate_upload(command)
         filename = Path(command.filename).name or "document"
         try:
-            path, sha256, _ = self.storage.save(
+            path, sha256, byte_size = self.storage.save(
                 command.stream,
                 filename,
                 self.settings.max_upload_bytes,
@@ -241,6 +249,12 @@ class DocumentApplicationService:
             sha256=sha256,
         )
         if duplicate is not None:
+            logger.info(
+                "检测到重复文档内容 document_id=%s version_id=%s filename=%s",
+                document.id,
+                duplicate.id,
+                filename,
+            )
             return self._reuse_duplicate(db, document.id, duplicate)
 
         version = DocumentVersion(
@@ -264,6 +278,17 @@ class DocumentApplicationService:
             job.status = "running"
             self.repository.commit(db)
             inline_job_id = job.id
+        logger.info(
+            "文档上传已接收 project_id=%s document_id=%s version_id=%s job_id=%s "
+            "filename=%s bytes=%d lifecycle=%s",
+            project.id,
+            document.id,
+            version.id,
+            job.id,
+            filename,
+            byte_size,
+            command.lifecycle_status,
+        )
         return UploadDocumentResult(
             response=UploadResponse(
                 document_id=document.id,
@@ -353,6 +378,12 @@ class DocumentApplicationService:
         if self.settings.run_inline_ingestion:
             retry.status = "running"
         self.repository.commit(db)
+        logger.info(
+            "入库任务已重试 previous_job_id=%s retry_job_id=%s document_id=%s",
+            job_id,
+            retry.id,
+            retry.document_id,
+        )
         return retry
 
     def list_versions(self, db: Session, document_id: str) -> list[DocumentVersion]:
@@ -381,6 +412,7 @@ class DocumentApplicationService:
         )
         self.repository.commit(db)
         self._publish_local_events(db, [event.id])
+        logger.info("文档版本已批准 version_id=%s event_id=%s", version.id, event.id)
         return version
 
     def deprecate_version(self, db: Session, version_id: str) -> DocumentVersion:
@@ -397,6 +429,7 @@ class DocumentApplicationService:
         )
         self.repository.commit(db)
         self._publish_local_events(db, [event.id])
+        logger.info("文档版本已废弃 version_id=%s event_id=%s", version.id, event.id)
         return version
 
     def _get_version(self, db: Session, version_id: str) -> DocumentVersion:
@@ -468,3 +501,61 @@ class DocumentApplicationService:
             events.append(event)
         self.repository.commit(db)
         self._publish_local_events(db, [event.id for event in events])
+        logger.info(
+            "文档已软删除 document_id=%s versions=%d events=%d",
+            document_id,
+            len(document.versions),
+            len(events),
+        )
+
+    def bulk_delete_documents(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        document_ids: list[str],
+    ) -> BulkDeleteDocumentsOut:
+        """在一个事务中软删除当前知识库的多份文档。"""
+
+        if self.repository.get_project(db, project_id) is None:
+            raise ResourceNotFoundError("Project not found")
+        # 保持前端勾选顺序，同时避免重复 ID 产生重复 Outbox 事件。
+        requested_ids = list(dict.fromkeys(document_ids))
+        documents = self.repository.get_active_documents_with_versions(
+            db,
+            project_id=project_id,
+            document_ids=requested_ids,
+        )
+        by_id = {document.id: document for document in documents}
+        deleted_ids = [document_id for document_id in requested_ids if document_id in by_id]
+        skipped_ids = [document_id for document_id in requested_ids if document_id not in by_id]
+        events = []
+        for document_id in deleted_ids:
+            document = by_id[document_id]
+            document.is_deleted = True
+            for version in document.versions:
+                version.is_current = False
+                events.append(
+                    self.repository.add_outbox_event(
+                        db,
+                        version_id=version.id,
+                        event_type="delete_version",
+                    )
+                )
+        self.repository.commit(db)
+        self._publish_local_events(db, [event.id for event in events])
+        logger.info(
+            "文档批量软删除完成 project_id=%s requested=%d deleted=%d skipped=%d events=%d",
+            project_id,
+            len(requested_ids),
+            len(deleted_ids),
+            len(skipped_ids),
+            len(events),
+        )
+        return BulkDeleteDocumentsOut(
+            requested_count=len(requested_ids),
+            deleted_count=len(deleted_ids),
+            skipped_count=len(skipped_ids),
+            deleted_ids=deleted_ids,
+            skipped_ids=skipped_ids,
+        )

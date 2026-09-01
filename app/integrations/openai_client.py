@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import ssl
 import time
 import uuid
@@ -14,6 +15,8 @@ import openai
 import truststore
 
 from app.core.config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class ModelAPIError(RuntimeError):
@@ -118,6 +121,13 @@ class OpenAIModelClient:
 
         if not texts:
             return [], Usage()
+        started = time.perf_counter()
+        logger.info(
+            "Embedding调用开始 model=%s batch_size=%d dimensions=%d",
+            self.settings.embedding_model,
+            len(texts),
+            self.settings.embedding_dimensions,
+        )
         try:
             response = self._client.embeddings.create(
                 model=self.settings.embedding_model,
@@ -126,7 +136,15 @@ class OpenAIModelClient:
                 encoding_format="float",
             )
         except openai.OpenAIError as exc:
-            raise self._translate_error(exc) from exc
+            translated = self._translate_error(exc)
+            logger.warning(
+                "Embedding调用失败 model=%s status=%s code=%s elapsed_ms=%.1f",
+                self.settings.embedding_model,
+                translated.status_code,
+                translated.code,
+                (time.perf_counter() - started) * 1000,
+            )
+            raise translated from exc
         rows = sorted(response.data, key=lambda row: row.index)
         embeddings = [list(row.embedding) for row in rows]
         if len(embeddings) != len(texts):
@@ -143,12 +161,26 @@ class OpenAIModelClient:
             None,
         )
         if invalid_dimension is not None:
+            logger.error(
+                "Embedding响应维度错误 model=%s expected=%d actual=%d",
+                self.settings.embedding_model,
+                self.settings.embedding_dimensions,
+                invalid_dimension,
+            )
             raise ModelAPIError(
                 "Embedding dimension mismatch: expected "
                 f"{self.settings.embedding_dimensions}, got {invalid_dimension}",
                 code="invalid_response",
             )
-        return embeddings, self._usage(response.usage)
+        usage = self._usage(response.usage)
+        logger.info(
+            "Embedding调用完成 model=%s batch_size=%d tokens=%d elapsed_ms=%.1f",
+            self.settings.embedding_model,
+            len(texts),
+            usage.total_tokens,
+            (time.perf_counter() - started) * 1000,
+        )
+        return embeddings, usage
 
     def rerank(self, query: str, documents: list[str], top_n: int) -> list[tuple[int, float]]:
         """明确拒绝 Rerank 调用，保证该版本不会访问不存在的内部接口。"""
@@ -178,10 +210,24 @@ class OpenAIModelClient:
         if self.settings.model_api_json_mode_enabled:
             request["response_format"] = {"type": "json_object"}
         started = time.perf_counter()
+        logger.info(
+            "Chat调用开始 model=%s max_tokens=%d json_mode=%s",
+            model_id,
+            max_tokens,
+            self.settings.model_api_json_mode_enabled,
+        )
         try:
             response = self._client.chat.completions.create(**request)
         except openai.OpenAIError as exc:
-            raise self._translate_error(exc) from exc
+            translated = self._translate_error(exc)
+            logger.warning(
+                "Chat调用失败 model=%s status=%s code=%s elapsed_ms=%.1f",
+                model_id,
+                translated.status_code,
+                translated.code,
+                (time.perf_counter() - started) * 1000,
+            )
+            raise translated from exc
         latency_ms = (time.perf_counter() - started) * 1000
         try:
             content = response.choices[0].message.content
@@ -195,13 +241,21 @@ class OpenAIModelClient:
                 "Chat response did not contain text content",
                 code="invalid_response",
             )
-        return ChatCallResult(
+        result = ChatCallResult(
             model_id=str(response.model or model_id),
             request_id=str(response.id or uuid.uuid4()),
             content=content,
             usage=self._usage(response.usage),
             latency_ms=latency_ms,
         )
+        logger.info(
+            "Chat调用完成 model=%s provider_request_id=%s tokens=%d elapsed_ms=%.1f",
+            result.model_id,
+            result.request_id,
+            result.usage.total_tokens,
+            result.latency_ms,
+        )
+        return result
 
 
 def parse_json_object(content: str) -> dict[str, Any]:

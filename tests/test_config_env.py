@@ -28,6 +28,13 @@ class ModelTokenEnvironmentTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "MODEL_API_KEY"):
             settings.require_model_api_key()
 
+    def test_log_level_is_normalized_and_invalid_value_is_rejected(self) -> None:
+        settings = Settings(_env_file=None, log_level="debug")
+        self.assertEqual(settings.log_level, "DEBUG")
+
+        with self.assertRaisesRegex(ValueError, "LOG_LEVEL"):
+            Settings(_env_file=None, log_level="verbose")
+
 
 if __name__ == "__main__":
     unittest.main()

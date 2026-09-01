@@ -10,16 +10,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.api.request_logging import log_http_request
 from app.api.router import health_router, router
 from app.core.config import get_settings
 from app.core.container import application_container, search_index
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
+from app.core.logging import configure_logging
 
 settings = get_settings()
+configure_logging(settings.log_level)
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -27,15 +26,31 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     """启动时验证搜索结构，退出时释放进程级基础设施资源。"""
 
     # 迁移负责创建 FTS/pgvector 结构；接收流量前验证扩展与索引，让不完整部署尽早失败。
-    search_index().ensure_index()
+    logger.info(
+        "应用启动 app=%s env=%s search_backend=%s embedding_model=%s rerank_enabled=%s",
+        settings.app_name,
+        settings.app_env,
+        settings.search_backend,
+        settings.embedding_model,
+        settings.rerank_enabled,
+    )
+    try:
+        search_index().ensure_index()
+    except Exception:
+        logger.exception("搜索结构启动检查失败")
+        raise
+    logger.info("应用就绪，数据库与搜索结构检查通过")
     try:
         yield
     finally:
         # 滚动部署收到 SIGTERM 时主动释放连接池。
+        logger.info("应用正在关闭，开始释放连接池")
         application_container().close()
+        logger.info("应用已安全关闭")
 
 
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
+app.middleware("http")(log_http_request)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,

@@ -103,6 +103,22 @@ class DocumentPageOut(BaseModel):
     offset: int
 
 
+class BulkDeleteDocumentsIn(BaseModel):
+    """限定在一个知识库内批量软删除的文档 ID。"""
+
+    document_ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class BulkDeleteDocumentsOut(BaseModel):
+    """批量删除结果；过期或越界 ID 会被安全跳过。"""
+
+    requested_count: int
+    deleted_count: int
+    skipped_count: int
+    deleted_ids: list[str]
+    skipped_ids: list[str]
+
+
 class IndexStatusOut(BaseModel):
     """搜索后端健康状态和一致性指标。"""
 

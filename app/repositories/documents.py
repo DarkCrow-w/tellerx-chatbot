@@ -244,6 +244,29 @@ class DocumentRepository:
             .where(Document.id == document_id, Document.is_deleted.is_(False))
         )
 
+    def get_active_documents_with_versions(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        document_ids: list[str],
+    ) -> list[Document]:
+        """批量读取同一项目中仍可见的文档及版本，避免逐条查询。"""
+
+        if not document_ids:
+            return []
+        return list(
+            db.scalars(
+                select(Document)
+                .options(selectinload(Document.versions))
+                .where(
+                    Document.project_id == project_id,
+                    Document.id.in_(document_ids),
+                    Document.is_deleted.is_(False),
+                )
+            )
+        )
+
     @staticmethod
     def add_outbox_event(
         db: Session, *, version_id: str, event_type: str

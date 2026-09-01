@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 
+from app.core.config import get_settings
 from app.core.container import model_client
+from app.core.logging import configure_logging
 from app.integrations.openai_client import ModelAPIError
 
 
@@ -33,6 +36,7 @@ def diagnostics_main() -> None:
     parser.add_argument("--skip-chat", action="store_true")
     parser.add_argument("--skip-embedding", action="store_true")
     args = parser.parse_args()
+    configure_logging(get_settings().log_level, stream=sys.stderr)
     client = model_client()
     failures = 0
     if not args.skip_embedding:

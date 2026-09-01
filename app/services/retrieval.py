@@ -786,7 +786,16 @@ class Retriever:
             logger.warning(
                 "Vector retrieval unavailable; BM25-only fallback: %s", type(exc).__name__
             )
-        return self._rrf(lexical, vector_hits)
+        fused = self._rrf(lexical, vector_hits)
+        logger.debug(
+            "召回通道完成 project_count=%d statuses=%s lexical=%d vector=%d fused=%d",
+            len(project_ids),
+            ",".join(statuses),
+            len(lexical),
+            len(vector_hits),
+            len(fused),
+        )
+        return fused
 
     def _retrieve_linked_identifier_rows(
         self,
@@ -831,14 +840,28 @@ class Retriever:
         """同时执行原问题与语义规划检索，并以原问题召回作为安全基线。"""
 
         if query_plan is None:
-            return self._search_once(query, project_ids, principal_ids, None)
+            result = self._search_once(query, project_ids, principal_ids, None)
+            logger.info(
+                "检索完成 mode=baseline project_count=%d evidence_count=%d",
+                len(project_ids),
+                len(result),
+            )
+            return result
         baseline = self._search_once(query, project_ids, principal_ids, None)
         planned = self._search_once(query, project_ids, principal_ids, query_plan)
-        return self._merge_evidence_channels(
+        result = self._merge_evidence_channels(
             baseline,
             planned,
             limit=max(self.settings.evidence_top_k * 2, self.settings.evidence_top_k + 4),
         )
+        logger.info(
+            "检索完成 mode=semantic project_count=%d baseline=%d planned=%d evidence_count=%d",
+            len(project_ids),
+            len(baseline),
+            len(planned),
+            len(result),
+        )
+        return result
 
     def _search_once(
         self,

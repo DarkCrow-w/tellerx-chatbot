@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 import time
 
 from sqlalchemy import or_, select
@@ -12,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
 from app.core.container import model_client, search_index
+from app.core.logging import configure_logging
 from app.db import SessionLocal
 from app.db.models import (
     Chunk,
@@ -24,6 +26,8 @@ from app.knowledge.chunking import TextChunk
 from app.knowledge.parsers import DocumentParser
 from app.services.indexing import IndexingService
 from app.services.ingestion import IngestionService
+
+logger = logging.getLogger(__name__)
 
 
 def _eligible_versions(db: Session) -> list[DocumentVersion]:
@@ -186,9 +190,11 @@ def main() -> None:
     )
     parser.add_argument("--bm25-only", action="store_true")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     settings = get_settings()
+    # 机器可读的最终 JSON 保留在 stdout，过程日志写 stderr。
+    configure_logging(settings.log_level, stream=sys.stderr)
+    logger.info("全量索引重建开始 bm25_only=%s", args.bm25_only)
     index = search_index()
     index.ensure_index()
     started = time.perf_counter()
@@ -203,14 +209,25 @@ def main() -> None:
         storage,
     )
     with SessionLocal() as db:
-        expected_total, pruned = _rebuild(
-            db,
-            settings=settings,
-            ingestion=ingestion,
-            indexer=indexer,
-            index=index,
-            bm25_only=args.bm25_only,
-        )
+        try:
+            expected_total, pruned = _rebuild(
+                db,
+                settings=settings,
+                ingestion=ingestion,
+                indexer=indexer,
+                index=index,
+                bm25_only=args.bm25_only,
+            )
+        except Exception:
+            logger.exception("全量索引重建失败")
+            raise
+
+    logger.info(
+        "全量索引重建完成 chunks=%d pruned_rows=%d elapsed_seconds=%.3f",
+        expected_total,
+        pruned,
+        time.perf_counter() - started,
+    )
 
     print(
         json.dumps(

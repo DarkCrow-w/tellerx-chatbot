@@ -24,6 +24,7 @@ import {
 
 import {
   approveDocumentVersion,
+  bulkDeleteDocuments,
   createProject,
   deleteDocument,
   deprecateDocumentVersion,
@@ -272,12 +273,29 @@ function VersionList({ document, versions, onAction, busy }) {
   );
 }
 
-function DocumentRow({ document, expanded, versions, busy, onToggle, onAction }) {
+function DocumentRow({
+  document,
+  expanded,
+  versions,
+  busy,
+  selected,
+  onSelect,
+  onToggle,
+  onAction,
+}) {
   const state = documentState(document);
   const warnings = document.latest_job?.warnings || document.latest_version?.parse_warnings || [];
   return (
-    <article className={`document-row ${expanded ? "expanded" : ""}`}>
+    <article className={`document-row ${expanded ? "expanded" : ""} ${selected ? "selected" : ""}`}>
       <div className="document-main">
+        <input
+          className="document-checkbox"
+          type="checkbox"
+          checked={selected}
+          disabled={busy}
+          onChange={onSelect}
+          aria-label={`选择 ${document.filename}`}
+        />
         <button className="document-expand" type="button" onClick={onToggle} aria-label="查看版本">
           <ChevronDown size={15} />
         </button>
@@ -337,6 +355,8 @@ export default function KnowledgeManager({
   const [expandedId, setExpandedId] = useState(null);
   const [versionsByDocument, setVersionsByDocument] = useState({});
   const [busyId, setBusyId] = useState(null);
+  const [selectedDocumentIds, setSelectedDocumentIds] = useState(() => new Set());
+  const [bulkDeleting, setBulkDeleting] = useState(false);
   const fileInputRef = useRef(null);
   const folderInputRef = useRef(null);
   const versionInputRef = useRef(null);
@@ -363,6 +383,11 @@ export default function KnowledgeManager({
       const page = await listDocuments({ projectId, query, limit: PAGE_SIZE, offset });
       setDocuments(page.items);
       setTotal(page.total);
+      const visibleIds = new Set(page.items.map((document) => document.id));
+      setSelectedDocumentIds((current) => {
+        const retained = [...current].filter((documentId) => visibleIds.has(documentId));
+        return retained.length === current.size ? current : new Set(retained);
+      });
     } catch (error) {
       onToast(error.message);
     } finally {
@@ -383,6 +408,7 @@ export default function KnowledgeManager({
   }, [documents, loadDocuments]);
 
   useEffect(() => setOffset(0), [projectId, query]);
+  useEffect(() => setSelectedDocumentIds(new Set()), [projectId, query, offset]);
 
   function updateBatchEntry(id, patch) {
     setBatch((items) => items.map((item) => item.id === id ? { ...item, ...patch } : item));
@@ -470,6 +496,61 @@ export default function KnowledgeManager({
     }
   }
 
+  function toggleDocumentSelection(documentId) {
+    setSelectedDocumentIds((current) => {
+      const next = new Set(current);
+      if (next.has(documentId)) next.delete(documentId);
+      else next.add(documentId);
+      return next;
+    });
+  }
+
+  function toggleCurrentPage() {
+    const allSelected = documents.length > 0
+      && documents.every((document) => selectedDocumentIds.has(document.id));
+    setSelectedDocumentIds(
+      allSelected ? new Set() : new Set(documents.map((document) => document.id)),
+    );
+  }
+
+  async function deleteSelectedDocuments() {
+    if (!selectedProject || !selectedDocumentIds.size || bulkDeleting) return;
+    const selected = documents.filter((document) => selectedDocumentIds.has(document.id));
+    const preview = selected.slice(0, 4).map((document) => `“${document.filename}”`).join("、");
+    const remainder = selected.length > 4 ? `等 ${selected.length} 份文档` : `${selected.length} 份文档`;
+    if (!globalThis.confirm(
+      `确认批量删除${preview ? `${preview} ${remainder}` : remainder}吗？这些文档将从检索中移除。`,
+    )) return;
+
+    setBulkDeleting(true);
+    try {
+      const result = await bulkDeleteDocuments(projectId, [...selectedDocumentIds]);
+      setSelectedDocumentIds(new Set());
+      setVersionsByDocument((items) => {
+        const next = { ...items };
+        result.deleted_ids.forEach((documentId) => delete next[documentId]);
+        return next;
+      });
+      const nextTotal = Math.max(0, total - result.deleted_count);
+      const nextLastPage = Math.max(
+        0,
+        Math.floor(Math.max(nextTotal - 1, 0) / PAGE_SIZE) * PAGE_SIZE,
+      );
+      if (offset > nextLastPage) setOffset(nextLastPage);
+      else await loadDocuments(true);
+      await onProjectsChanged(projectId);
+      onToast(
+        result.skipped_count
+          ? `已删除 ${result.deleted_count} 份，跳过 ${result.skipped_count} 份`
+          : `已删除 ${result.deleted_count} 份文档`,
+      );
+    } catch (error) {
+      onToast(error.message);
+    } finally {
+      setBulkDeleting(false);
+    }
+  }
+
   function selectFiles(event, fixedLogicalKey = null) {
     const files = event.target.files;
     if (files?.length) startBatch(files, fixedLogicalKey);
@@ -478,6 +559,8 @@ export default function KnowledgeManager({
 
   const accept = capabilities?.allowed_extensions.join(",") || undefined;
   const lastPage = Math.max(0, Math.floor(Math.max(total - 1, 0) / PAGE_SIZE) * PAGE_SIZE);
+  const currentPageSelected = documents.length > 0
+    && documents.every((document) => selectedDocumentIds.has(document.id));
 
   return (
     <main className="workspace knowledge-workspace">
@@ -553,8 +636,33 @@ export default function KnowledgeManager({
 
             {selectedProject && (
               <div className="document-toolbar">
-                <label><Search size={14} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索文件名或目录路径" /></label>
+                <label className="document-search"><Search size={14} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索文件名或目录路径" /></label>
                 <button className="mini-icon-button" type="button" onClick={() => loadDocuments()} aria-label="刷新文档列表"><RefreshCw size={14} /></button>
+                {!!documents.length && (
+                  <div className="document-selection">
+                    <label>
+                      <input
+                        ref={(input) => {
+                          if (input) {
+                            input.indeterminate = selectedDocumentIds.size > 0
+                              && !currentPageSelected;
+                          }
+                        }}
+                        type="checkbox"
+                        checked={currentPageSelected}
+                        disabled={bulkDeleting}
+                        onChange={toggleCurrentPage}
+                      />
+                      本页全选
+                    </label>
+                    {selectedDocumentIds.size > 0 && (
+                      <button className="bulk-delete-button" type="button" disabled={bulkDeleting} onClick={deleteSelectedDocuments}>
+                        {bulkDeleting ? <LoaderCircle className="spin" size={13} /> : <Trash2 size={13} />}
+                        删除所选（{selectedDocumentIds.size}）
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
             )}
 
@@ -565,7 +673,9 @@ export default function KnowledgeManager({
                   document={document}
                   expanded={expandedId === document.id}
                   versions={versionsByDocument[document.id]}
-                  busy={busyId === document.id}
+                  busy={bulkDeleting || busyId === document.id}
+                  selected={selectedDocumentIds.has(document.id)}
+                  onSelect={() => toggleDocumentSelection(document.id)}
                   onToggle={() => toggleVersions(document)}
                   onAction={(action, version) => documentAction(action, document, version)}
                 />

@@ -4,13 +4,13 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from app.application.document_service import DocumentApplicationService
 from app.application.errors import ResourceConflictError, ResourceNotFoundError
 from app.db import Base
-from app.db.models import Document, DocumentVersion, IngestionJob
+from app.db.models import Document, DocumentVersion, IngestionJob, OutboxEvent
 from app.repositories.documents import DocumentRepository
 
 
@@ -133,6 +133,76 @@ class KnowledgeManagementTest(unittest.TestCase):
         self.assertIn(".pdf", capabilities.allowed_extensions)
         self.assertEqual(capabilities.max_upload_bytes, 100 * 1024 * 1024)
         self.assertEqual(capabilities.default_lifecycle_status, "approved")
+
+    def test_bulk_delete_is_scoped_deduplicated_and_soft_deletes(self) -> None:
+        project = self.service.create_project(self.db, "待清理知识库")
+        other_project = self.service.create_project(self.db, "其他知识库")
+        selected = Document(
+            project_id=project.id,
+            logical_key="selected.md",
+            filename="selected.md",
+            document_type="text-document",
+        )
+        retained = Document(
+            project_id=project.id,
+            logical_key="retained.md",
+            filename="retained.md",
+            document_type="text-document",
+        )
+        foreign = Document(
+            project_id=other_project.id,
+            logical_key="foreign.md",
+            filename="foreign.md",
+            document_type="text-document",
+        )
+        self.db.add_all([selected, retained, foreign])
+        self.db.flush()
+        versions = [
+            DocumentVersion(
+                document_id=selected.id,
+                sha256=character * 64,
+                storage_path=f"selected-{character}",
+                lifecycle_status="approved",
+                technical_status="searchable",
+                is_current=position == 0,
+            )
+            for position, character in enumerate(("a", "b"))
+        ]
+        self.db.add_all(versions)
+        self.db.commit()
+
+        result = self.service.bulk_delete_documents(
+            self.db,
+            project_id=project.id,
+            document_ids=[selected.id, "missing", foreign.id, selected.id],
+        )
+
+        self.assertEqual(result.requested_count, 3)
+        self.assertEqual(result.deleted_ids, [selected.id])
+        self.assertEqual(result.skipped_ids, ["missing", foreign.id])
+        self.assertTrue(self.db.get(Document, selected.id).is_deleted)
+        self.assertFalse(self.db.get(Document, retained.id).is_deleted)
+        self.assertFalse(self.db.get(Document, foreign.id).is_deleted)
+        self.assertTrue(all(not version.is_current for version in versions))
+        events = list(self.db.scalars(select(OutboxEvent)))
+        self.assertEqual({event.aggregate_id for event in events}, {version.id for version in versions})
+
+        page = self.service.list_documents(
+            self.db,
+            project_id=project.id,
+            query=None,
+            limit=20,
+            offset=0,
+        )
+        self.assertEqual([document.id for document in page.items], [retained.id])
+
+    def test_bulk_delete_rejects_missing_project(self) -> None:
+        with self.assertRaises(ResourceNotFoundError):
+            self.service.bulk_delete_documents(
+                self.db,
+                project_id="missing",
+                document_ids=["document"],
+            )
 
 
 if __name__ == "__main__":

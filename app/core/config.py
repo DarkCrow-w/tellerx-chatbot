@@ -23,6 +23,8 @@ class Settings(BaseSettings):
 
     app_name: str = "TellerX Knowledge Chatbot"
     app_env: str = "development"
+    # INFO 适合日常运行；排障时可临时改为 DEBUG，不需要修改代码。
+    log_level: str = "INFO"
     database_url: str = "postgresql+psycopg://tellerx:tellerx@127.0.0.1:5432/tellerx"
     search_backend: str = "postgresql-pgvector-fts"
     postgres_search_table: str = "chunk_search_index"
@@ -115,12 +117,21 @@ class Settings(BaseSettings):
     def validate_runtime_invariants(self) -> Settings:
         """拒绝不安全、相互矛盾或与数据库结构不兼容的配置。"""
 
+        self._validate_logging_configuration()
         self._validate_search_configuration()
         self._validate_chunk_configuration()
         self._validate_retrieval_configuration()
         self._validate_embedding_configuration()
         self._validate_production_configuration()
         return self
+
+    def _validate_logging_configuration(self) -> None:
+        """规范并校验 Python 标准日志级别。"""
+
+        normalized = self.log_level.strip().upper()
+        if normalized not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            raise ValueError("LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR, or CRITICAL")
+        self.log_level = normalized
 
     def _validate_search_configuration(self) -> None:
         """保证运行配置与当前 PostgreSQL 搜索迁移兼容。"""

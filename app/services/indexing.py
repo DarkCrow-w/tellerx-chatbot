@@ -7,6 +7,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import Settings
@@ -59,15 +60,25 @@ class IndexingService:
             select(IndexGeneration).where(IndexGeneration.physical_index == physical)
         )
         if not generation:
-            generation = IndexGeneration(
-                physical_index=physical,
-                schema_version=str(self.settings.postgres_search_schema_version),
-                embedding_fingerprint=self.settings.embedding_fingerprint,
-                status="active",
-                activated_at=datetime.now(UTC),
-            )
-            db.add(generation)
-            db.flush()
+            try:
+                # 多份文档并发完成入库时可能同时首次登记同一个物理索引；
+                # 用 savepoint 隔离唯一键竞争，失败者随后复用胜出记录。
+                with db.begin_nested():
+                    generation = IndexGeneration(
+                        physical_index=physical,
+                        schema_version=str(self.settings.postgres_search_schema_version),
+                        embedding_fingerprint=self.settings.embedding_fingerprint,
+                        status="active",
+                        activated_at=datetime.now(UTC),
+                    )
+                    db.add(generation)
+                    db.flush()
+            except IntegrityError:
+                generation = db.scalar(
+                    select(IndexGeneration).where(IndexGeneration.physical_index == physical)
+                )
+                if generation is None:
+                    raise
         return generation
 
     def _refresh_generation_counts(self, db: Session) -> None:
@@ -299,10 +310,19 @@ class IndexingService:
 
         event = self._claim_event(db, event_id)
         if event.status == "published":
+            logger.info("索引事件已发布，跳过重复处理 event_id=%s", event_id)
             return True
+        logger.info(
+            "索引事件发布开始 event_id=%s type=%s version_id=%s attempt=%d",
+            event_id,
+            event.event_type,
+            event.aggregate_id,
+            event.attempts,
+        )
         try:
             self._dispatch_event(db, event)
             self._mark_event_published(db, event_id)
+            logger.info("索引事件发布完成 event_id=%s type=%s", event_id, event.event_type)
             return True
         except Exception as exc:
             self._mark_event_failed(db, event_id, exc)
