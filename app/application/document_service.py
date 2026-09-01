@@ -36,7 +36,13 @@ class ObjectStorage(Protocol):
 class IngestionProcessor(Protocol):
     """后台入库处理器接口。"""
 
-    def process(self, db: Session, job_id: str) -> None: ...
+    def process(self, db: Session, job_id: str) -> str: ...
+
+
+class IndexPublisher(Protocol):
+    """把入库产生的 Outbox 事件发布到 PostgreSQL 搜索投影。"""
+
+    def publish_event(self, db: Session, event_id: str) -> bool: ...
 
 
 @dataclass(slots=True)
@@ -84,11 +90,13 @@ class DocumentApplicationService:
         storage: ObjectStorage,
         repository: DocumentRepository,
         ingestion: IngestionProcessor,
+        index_publisher: IndexPublisher | None = None,
     ):
         self.settings = settings
         self.storage = storage
         self.repository = repository
         self.ingestion = ingestion
+        self.index_publisher = index_publisher
 
     def list_projects(self, db: Session) -> list[Project]:
         """返回可供前端选择的知识库项目。"""
@@ -181,8 +189,12 @@ class DocumentApplicationService:
             or job.status == "failed"
             or version.technical_status in {"deleted", "failed_final"}
         )
+        inline_job_id = None
         if needs_retry:
             job = self.repository.create_job(db, document_id, version.id)
+            if self.settings.run_inline_ingestion:
+                job.status = "running"
+                inline_job_id = job.id
             self.repository.commit(db)
         assert job is not None
         return UploadDocumentResult(
@@ -191,13 +203,28 @@ class DocumentApplicationService:
                 version_id=version.id,
                 job_id=job.id,
                 duplicate=True,
-            )
+            ),
+            inline_job_id=inline_job_id,
         )
 
     def process_ingestion_job(self, db: Session, job_id: str) -> None:
-        """供开发模式后台任务调用真实入库处理器。"""
+        """在本地开发进程中依次完成入库和搜索投影发布。"""
 
-        self.ingestion.process(db, job_id)
+        event_id = self.ingestion.process(db, job_id)
+        self._publish_local_events(db, [event_id])
+
+    def _publish_local_events(self, db: Session, event_ids: list[str]) -> None:
+        """本地没有独立 Indexer，因此同步发布并有限重试 Outbox 事件。"""
+
+        if not self.settings.run_inline_ingestion or self.index_publisher is None:
+            return
+        for event_id in event_ids:
+            # 最终状态由 IndexingService 持久化，避免后台任务悄悄丢失索引事件。
+            for _ in range(5):
+                if self.index_publisher.publish_event(db, event_id):
+                    break
+            else:
+                raise RuntimeError(f"Could not publish local index event: {event_id}")
 
     def get_job(self, db: Session, job_id: str) -> IngestionJob:
         """查询入库任务，不存在时返回统一应用异常。"""
@@ -214,6 +241,8 @@ class DocumentApplicationService:
         if job.status not in {"failed", "succeeded"}:
             raise ResourceConflictError("Only completed jobs can be re-queued")
         retry = self.repository.create_job(db, job.document_id, job.version_id)
+        if self.settings.run_inline_ingestion:
+            retry.status = "running"
         self.repository.commit(db)
         return retry
 
@@ -233,30 +262,32 @@ class DocumentApplicationService:
             raise ResourceConflictError(
                 "Only a fully indexed and verified version can be approved"
             )
-        # current 切换必须由 Index Worker 在投影校验通过后原子完成。
+        # current 切换必须由搜索投影发布器在完整性校验通过后原子完成。
         version.lifecycle_status = "approved"
         version.is_current = False
-        self.repository.add_outbox_event(
+        event = self.repository.add_outbox_event(
             db,
             version_id=version.id,
             event_type="index_version",
         )
         self.repository.commit(db)
+        self._publish_local_events(db, [event.id])
         return version
 
     def deprecate_version(self, db: Session, version_id: str) -> DocumentVersion:
-        """废弃版本并通过 Outbox 异步删除搜索投影。"""
+        """废弃版本并通过 Outbox 删除搜索投影。"""
 
         version = self._get_version(db, version_id)
         version.lifecycle_status = "deprecated"
         version.is_current = False
         version.effective_to = datetime.now(version.created_at.tzinfo)
-        self.repository.add_outbox_event(
+        event = self.repository.add_outbox_event(
             db,
             version_id=version.id,
             event_type="delete_version",
         )
         self.repository.commit(db)
+        self._publish_local_events(db, [event.id])
         return version
 
     def _get_version(self, db: Session, version_id: str) -> DocumentVersion:
@@ -317,11 +348,14 @@ class DocumentApplicationService:
         if document is None:
             raise ResourceNotFoundError("Document not found")
         document.is_deleted = True
+        events = []
         for version in document.versions:
             version.is_current = False
-            self.repository.add_outbox_event(
+            event = self.repository.add_outbox_event(
                 db,
                 version_id=version.id,
                 event_type="delete_version",
             )
+            events.append(event)
         self.repository.commit(db)
+        self._publish_local_events(db, [event.id for event in events])

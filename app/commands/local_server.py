@@ -1,0 +1,71 @@
+"""无需 Docker 的本地后端启动入口。"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+
+import uvicorn
+from alembic.config import Config
+
+from alembic import command
+from app.core.config import get_settings
+
+
+def _project_root() -> Path:
+    """定位包含 alembic.ini 的项目根目录并给出可操作的错误。"""
+
+    current = Path.cwd()
+    if (current / "alembic.ini").is_file():
+        return current
+    raise RuntimeError("请在项目根目录运行 tellerx-backend（未找到 alembic.ini）")
+
+
+def _upgrade_database(project_root: Path) -> None:
+    """启动前把目标 PostgreSQL 升级到当前代码所需结构。"""
+
+    alembic_config = Config(str(project_root / "alembic.ini"))
+    alembic_config.set_main_option("script_location", str(project_root / "alembic"))
+    command.upgrade(alembic_config, "head")
+
+
+def _prepare_local_files() -> None:
+    """在监听端口前验证本地运行必需的目录、Token 和模型清单。"""
+
+    settings = get_settings()
+    settings.storage_root.mkdir(parents=True, exist_ok=True)
+    # 属性读取会验证 Token 文件存在且不为空，但不会输出 Secret 内容。
+    _ = settings.model_api_key
+    if not settings.model_registry_path.is_file():
+        raise RuntimeError(f"模型清单不存在: {settings.model_registry_path}")
+
+
+def main() -> None:
+    """准备本地目录、执行迁移并启动 FastAPI。"""
+
+    parser = argparse.ArgumentParser(description="启动 TellerX 本地后端")
+    parser.add_argument("--host", default=os.getenv("TELLERX_API_HOST", "127.0.0.1"))
+    parser.add_argument(
+        "--port",
+        default=int(os.getenv("TELLERX_API_PORT", "8000")),
+        type=int,
+    )
+    parser.add_argument("--reload", action="store_true")
+    parser.add_argument("--skip-migrations", action="store_true")
+    args = parser.parse_args()
+
+    project_root = _project_root()
+    _prepare_local_files()
+    if not args.skip_migrations:
+        _upgrade_database(project_root)
+    uvicorn.run(
+        "app.main:app",
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
+    )
+
+
+if __name__ == "__main__":
+    main()

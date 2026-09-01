@@ -7,7 +7,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.router import health_router, router
@@ -47,11 +47,15 @@ app.include_router(health_router)
 app.include_router(router, prefix="/api/v1")
 
 static_dir = Path(__file__).parent / "static"
-app.mount("/static", StaticFiles(directory=static_dir), name="static")
+static_index = static_dir / "index.html"
+if static_index.is_file():
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
-@app.get("/", include_in_schema=False)
-def index() -> FileResponse:
-    """返回单页应用入口，其余前端资源由 /static 提供。"""
+@app.get("/", include_in_schema=False, response_model=None)
+def index() -> FileResponse | RedirectResponse:
+    """有构建产物时返回前端，否则引导到 API 文档。"""
 
-    return FileResponse(static_dir / "index.html")
+    if static_index.is_file():
+        return FileResponse(static_index)
+    return RedirectResponse(url="/docs")

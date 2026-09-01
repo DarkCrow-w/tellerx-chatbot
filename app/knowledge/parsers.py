@@ -5,9 +5,6 @@ from __future__ import annotations
 import csv
 import html
 import re
-import shutil
-import subprocess
-import tempfile
 from pathlib import Path
 from typing import ClassVar
 
@@ -36,9 +33,7 @@ class DocumentParser:
     revision: ClassVar[str] = "v3"
     allowed_suffixes: ClassVar[set[str]] = {
         ".docx",
-        ".doc",
         ".xlsx",
-        ".xls",
         ".xlsm",
         ".md",
         ".markdown",
@@ -64,8 +59,6 @@ class DocumentParser:
                     "Native OneNote .one files must be exported to DOCX, PDF, or HTML"
                 )
             raise UnsupportedDocument(f"Unsupported file type: {suffix}")
-        if suffix in {".doc", ".xls"}:
-            return self._convert_legacy(path)
         if suffix in {".xlsx", ".xlsm"}:
             return self._parse_excel(path)
         if suffix == ".csv":
@@ -391,32 +384,3 @@ class DocumentParser:
                 )
             )
         return DocumentParser._ensure_content(units), []
-
-    def _convert_legacy(self, path: Path) -> tuple[list[ParsedUnit], list[str]]:
-        """通过 LibreOffice 临时转换旧版 Office 文件，再复用现代格式解析器。"""
-
-        soffice = shutil.which("soffice")
-        if not soffice:
-            raise UnsupportedDocument("LibreOffice is required for legacy .doc/.xls files")
-        target_format = "docx" if path.suffix.lower() == ".doc" else "xlsx"
-        with tempfile.TemporaryDirectory(prefix="knowledge-convert-") as temp_dir:
-            result = subprocess.run(
-                [
-                    soffice,
-                    "--headless",
-                    "--convert-to",
-                    target_format,
-                    "--outdir",
-                    temp_dir,
-                    str(path),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
-            )
-            converted = Path(temp_dir) / f"{path.stem}.{target_format}"
-            if result.returncode != 0 or not converted.exists():
-                raise UnsupportedDocument("LibreOffice could not convert the legacy Office file")
-            units, warnings = self.parse(converted)
-            return units, ["Legacy Office file was converted with LibreOffice", *warnings]

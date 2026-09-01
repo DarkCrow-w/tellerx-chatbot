@@ -145,6 +145,7 @@ class ApplicationContainer:
             self.storage,
             self.document_repository,
             self.ingestion,
+            self.indexing,
         )
 
     @cached_property

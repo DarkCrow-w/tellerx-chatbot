@@ -13,9 +13,12 @@ build/
 *.egg-info/
 *.db
 data/
+.local-data/
+.secrets/
 backup/
 evaluation/generated/
 evaluation/pipeline-storage/
 Qwen/Qwen token.txt
 node_modules/
 frontend/dist/
+app/static/

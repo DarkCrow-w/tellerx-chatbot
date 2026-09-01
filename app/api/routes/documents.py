@@ -73,10 +73,18 @@ def get_job(job_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/ingestion-jobs/{job_id}/retry", response_model=JobOut, status_code=202)
-def retry_job(job_id: str, db: Session = Depends(get_db)):
+def retry_job(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     """为已结束任务创建新的入库尝试。"""
 
-    return run_application(lambda: document_application_service().retry_job(db, job_id))
+    service = document_application_service()
+    retry = run_application(lambda: service.retry_job(db, job_id))
+    if service.settings.run_inline_ingestion:
+        background_tasks.add_task(_run_job, retry.id)
+    return retry
 
 
 @router.get("/documents/{document_id}/versions", response_model=list[VersionOut])

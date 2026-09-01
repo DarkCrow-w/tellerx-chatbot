@@ -162,14 +162,17 @@ class DocumentRepository:
         )
 
     @staticmethod
-    def add_outbox_event(db: Session, *, version_id: str, event_type: str) -> None:
+    def add_outbox_event(
+        db: Session, *, version_id: str, event_type: str
+    ) -> OutboxEvent:
         """把搜索投影变更意图加入当前数据库事务。"""
 
-        db.add(OutboxEvent(aggregate_id=version_id, event_type=event_type, payload={}))
+        event = OutboxEvent(aggregate_id=version_id, event_type=event_type, payload={})
+        db.add(event)
+        return event
 
     @staticmethod
     def commit(db: Session) -> None:
         """提交当前用例事务。"""
 
         db.commit()
-

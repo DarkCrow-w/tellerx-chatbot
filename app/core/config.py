@@ -23,17 +23,17 @@ class Settings(BaseSettings):
 
     app_name: str = "TellerX Knowledge Chatbot"
     app_env: str = "development"
-    database_url: str = "postgresql+psycopg://knowledge:knowledge@postgres:5432/knowledge"
+    database_url: str = "postgresql+psycopg://tellerx:tellerx@127.0.0.1:5432/tellerx"
     search_backend: str = "postgresql-pgvector-fts"
     postgres_search_table: str = "chunk_search_index"
     postgres_search_schema_version: int = 1
     pgvector_hnsw_ef_search: int = 200
-    storage_root: Path = Path("/data/knowledge")
+    storage_root: Path = Path(".local-data/knowledge")
 
     # 内部和本地模型服务都通过 OpenAI 兼容 SDK 接入。旧 QWEN_* 名称保留为迁移别名，
     # 新环境只需要配置 MODEL_API_* / EMBEDDING_*。
     model_api_key_file: Path = Field(
-        default=Path("/run/secrets/model_api_key"),
+        default=Path(".secrets/model_api_key.txt"),
         validation_alias=AliasChoices(
             "MODEL_API_KEY_FILE",
             "QWEN_API_KEY_FILE",
@@ -41,7 +41,7 @@ class Settings(BaseSettings):
         ),
     )
     model_api_base_url: str = Field(
-        default="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        default="https://sdk-endpoint.example.internal/v1",
         validation_alias=AliasChoices(
             "MODEL_API_BASE_URL",
             "QWEN_CHAT_BASE_URL",
@@ -87,10 +87,10 @@ class Settings(BaseSettings):
 
     model_registry_path: Path = Path("config/models.yaml")
     allow_bm25_only: bool = True
-    run_inline_ingestion: bool = False
+    # 本地核心版默认在 API 的后台任务中完成解析、向量化和索引发布，不再要求
+    # 额外启动 ingestion worker 和 indexer 两个常驻进程。
+    run_inline_ingestion: bool = True
     parser_backend: str = "native"
-    worker_poll_seconds: float = 2.0
-    index_reconcile_interval_seconds: int = 3600
     max_upload_bytes: int = 100 * 1024 * 1024
     chunk_target_tokens: int = 450
     chunk_max_tokens: int = 650
@@ -106,7 +106,9 @@ class Settings(BaseSettings):
     query_plan_cache_ttl_seconds: int = 3600
     prompt_version: str = "grounded-qa-v1"
     validate_citations_against_database: bool = True
-    cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:8000"])
+    cors_origins: list[str] = Field(
+        default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"]
+    )
 
     @model_validator(mode="after")
     def validate_runtime_invariants(self) -> Settings:

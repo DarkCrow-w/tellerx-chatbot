@@ -5,12 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tellerx-knowledge-chatbot"
 version = "0.1.0"
-description = "Evidence-first business knowledge chatbot powered by Qwen"
+description = "Evidence-first internal knowledge chatbot with a local Python and Vite runtime"
 requires-python = ">=3.12"
 dependencies = [
-  # Production images pin direct dependencies so a rebuild cannot silently
-  # adopt a new framework or parser release. Upgrade these intentionally and
-  # rerun the parsing/retrieval regression suite together.
+  # 固定直接依赖，保证内部机器重复安装时得到一致运行环境。
   "alembic==1.19.1",
   "beautifulsoup4==4.15.0",
   "fastapi==0.141.1",
@@ -28,35 +26,13 @@ dependencies = [
   "uvicorn[standard]==0.52.1",
 ]
 
-[project.optional-dependencies]
-dev = [
-  "pytest==8.4.2",
-  "pytest-cov==7.1.0",
-  "reportlab==4.5.1",
-  "ruff==0.16.2",
-]
-quality = [
-  "reportlab==4.5.1",
-]
-
 [project.scripts]
-knowledge-worker = "app.jobs.ingestion_worker:main"
-knowledge-indexer = "app.jobs.index_worker:main"
-knowledge-reconcile = "app.jobs.index_worker:reconcile_main"
+tellerx-backend = "app.commands.local_server:main"
 model-diagnostics = "app.commands.diagnostics:diagnostics_main"
-qwen-diagnostics = "app.commands.diagnostics:diagnostics_main"
 knowledge-reindex = "app.commands.reindex:main"
 
 [tool.setuptools.packages.find]
 include = ["app*"]
-
-[tool.setuptools.package-data]
-app = ["static/*"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-q"
-pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
@@ -67,9 +43,6 @@ extend-select = ["C901"]
 
 [tool.ruff.lint.extend-per-file-ignores]
 "app/api/routes/*.py" = ["B008"]
-"app/jobs/*.py" = ["BLE001"]
-# Benchmark 属于独立质量工具；生产包 app/ 仍强制复杂度上限。
-"evaluation/**/*.py" = ["C901"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 10
