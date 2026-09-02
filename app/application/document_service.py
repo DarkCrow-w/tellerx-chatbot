@@ -188,7 +188,13 @@ class DocumentApplicationService:
         latest_versions = []
         sorted_versions: dict[str, list[DocumentVersion]] = {}
         for document in documents:
-            versions = sorted(document.versions, key=lambda item: item.created_at, reverse=True)
+            # 同一事务内多个版本可能得到完全相同的微秒时间戳；ID 作为第二排序键，
+            # 为“最新版本”建立稳定的全序，避免刷新后版本随机切换。
+            versions = sorted(
+                document.versions,
+                key=lambda item: (item.created_at, item.id),
+                reverse=True,
+            )
             sorted_versions[document.id] = versions
             if versions:
                 latest_versions.append(versions[0].id)

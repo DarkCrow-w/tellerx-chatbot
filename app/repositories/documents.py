@@ -175,7 +175,7 @@ class DocumentRepository:
         return db.scalar(
             select(IngestionJob)
             .where(IngestionJob.version_id == version_id)
-            .order_by(IngestionJob.created_at.desc())
+            .order_by(IngestionJob.created_at.desc(), IngestionJob.id.desc())
         )
 
     def create_job(self, db: Session, document_id: str, version_id: str) -> IngestionJob:
@@ -205,7 +205,7 @@ class DocumentRepository:
             db.scalars(
                 select(DocumentVersion)
                 .where(DocumentVersion.document_id == document_id)
-                .order_by(DocumentVersion.created_at.desc())
+                .order_by(DocumentVersion.created_at.desc(), DocumentVersion.id.desc())
             )
         )
 
@@ -227,7 +227,7 @@ class DocumentRepository:
             select(DocumentVersion)
             .options(joinedload(DocumentVersion.document))
             .where(DocumentVersion.document_id == document_id)
-            .order_by(DocumentVersion.created_at.desc())
+            .order_by(DocumentVersion.created_at.desc(), DocumentVersion.id.desc())
         )
         if version_id:
             statement = statement.where(DocumentVersion.id == version_id)

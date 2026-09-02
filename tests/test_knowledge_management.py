@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -98,6 +99,60 @@ class KnowledgeManagementTest(unittest.TestCase):
         self.assertEqual(page.items[0].latest_version.id, latest.id)
         self.assertEqual(page.items[0].latest_job.id, job.id)
         self.assertEqual(page.items[0].latest_job.error_message, "mock failure")
+
+    def test_equal_timestamp_versions_use_id_as_stable_tiebreaker(self) -> None:
+        project = self.service.create_project(self.db, "时间戳并列知识库")
+        document = Document(
+            project_id=project.id,
+            logical_key="并列版本.md",
+            filename="并列版本.md",
+            document_type="text-document",
+        )
+        self.db.add(document)
+        self.db.flush()
+        same_time = datetime(2026, 9, 1, 8, 0, tzinfo=UTC)
+        lower_id = "00000000-0000-4000-8000-000000000001"
+        higher_id = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+        older_by_tiebreaker = DocumentVersion(
+            id=lower_id,
+            document_id=document.id,
+            sha256="c" * 64,
+            storage_path="same-time-lower-id",
+            lifecycle_status="approved",
+            technical_status="searchable",
+            is_current=True,
+            created_at=same_time,
+        )
+        newest_by_tiebreaker = DocumentVersion(
+            id=higher_id,
+            document_id=document.id,
+            sha256="d" * 64,
+            storage_path="same-time-higher-id",
+            lifecycle_status="approved",
+            technical_status="received",
+            is_current=False,
+            created_at=same_time,
+        )
+        self.db.add_all([older_by_tiebreaker, newest_by_tiebreaker])
+        self.db.commit()
+
+        page = self.service.list_documents(
+            self.db,
+            project_id=project.id,
+            query=None,
+            limit=20,
+            offset=0,
+        )
+        versions = self.service.list_versions(self.db, document.id)
+        download_version = self.service.repository.get_download_version(
+            self.db,
+            document_id=document.id,
+            version_id=None,
+        )
+
+        self.assertEqual(page.items[0].latest_version.id, higher_id)
+        self.assertEqual([version.id for version in versions], [higher_id, lower_id])
+        self.assertEqual(download_version.id, higher_id)
 
     def test_search_soft_delete_and_missing_project(self) -> None:
         project = self.service.create_project(self.db, "制度库")
