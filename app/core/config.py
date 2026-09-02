@@ -52,7 +52,7 @@ class Settings(BaseSettings):
         ),
     )
     model_api_json_mode_enabled: bool = True
-    # 内部 qwen3-embedding 必须实际返回 1024 维，否则需要新增数据库迁移。
+    # 公司 qwen3-embedding 默认返回 2560 维；数据库迁移 0005 与此维度一致。
     embedding_model: str = Field(
         default="qwen3-embedding",
         validation_alias=AliasChoices(
@@ -62,7 +62,7 @@ class Settings(BaseSettings):
         ),
     )
     embedding_dimensions: int = Field(
-        default=1024,
+        default=2560,
         validation_alias=AliasChoices(
             "EMBEDDING_DIMENSIONS",
             "QWEN_EMBEDDING_DIMENSIONS",
@@ -140,9 +140,9 @@ class Settings(BaseSettings):
             raise ValueError("SEARCH_BACKEND must be postgresql-pgvector-fts")
         if self.postgres_search_table != "chunk_search_index":
             raise ValueError("POSTGRES_SEARCH_TABLE is fixed to chunk_search_index")
-        if self.database_url.startswith("postgresql") and self.embedding_dimensions != 1024:
+        if self.database_url.startswith("postgresql") and self.embedding_dimensions != 2560:
             raise ValueError(
-                "EMBEDDING_DIMENSIONS must be 1024 for migration 0004; "
+                "EMBEDDING_DIMENSIONS must be 2560 for migration 0005; "
                 "a dimension change requires a new PostgreSQL vector schema migration"
             )
 

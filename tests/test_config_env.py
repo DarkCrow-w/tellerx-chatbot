@@ -35,6 +35,17 @@ class ModelTokenEnvironmentTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "LOG_LEVEL"):
             Settings(_env_file=None, log_level="verbose")
 
+    def test_qwen_embedding_defaults_to_2560_dimensions(self) -> None:
+        # 清空进程环境，避免开发机上的旧配置掩盖代码默认值。
+        with patch.dict("os.environ", {}, clear=True):
+            settings = Settings(_env_file=None)
+
+        self.assertEqual(settings.embedding_dimensions, 2560)
+
+    def test_postgresql_rejects_dimensions_that_do_not_match_schema(self) -> None:
+        with self.assertRaisesRegex(ValueError, "migration 0005"):
+            Settings(_env_file=None, embedding_dimensions=1024)
+
 
 if __name__ == "__main__":
     unittest.main()

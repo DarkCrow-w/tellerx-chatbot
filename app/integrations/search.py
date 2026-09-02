@@ -248,6 +248,13 @@ class SearchIndex:
         self.table_name = settings.postgres_search_table
         self.engine = engine or create_engine(settings.database_url, pool_pre_ping=True)
 
+    @property
+    def embedding_sql_type(self) -> str:
+        """返回与维度匹配的 pgvector 类型；高维向量使用 HNSW 支持的 halfvec。"""
+
+        # pgvector 的 vector HNSW 索引最多支持 2000 维，halfvec 可支持 4000 维。
+        return "halfvec" if self.settings.embedding_dimensions > 2000 else "vector"
+
     def close(self) -> None:
         """释放搜索数据库连接池。"""
 
@@ -387,7 +394,12 @@ class SearchIndex:
                     text(
                         "SELECT to_regclass(:table_name) IS NOT NULL AS table_ready, "
                         "EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') AS vector_ready, "
-                        "EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm') AS trgm_ready"
+                        "EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm') AS trgm_ready, "
+                        "(SELECT format_type(attribute.atttypid, attribute.atttypmod) "
+                        "FROM pg_attribute attribute "
+                        "WHERE attribute.attrelid = to_regclass(:table_name) "
+                        "AND attribute.attname = 'embedding' "
+                        "AND NOT attribute.attisdropped) AS embedding_type"
                     ),
                     {"table_name": self.table_name},
                 )
@@ -405,6 +417,12 @@ class SearchIndex:
         ]
         if missing:
             raise RuntimeError("PostgreSQL search schema is not ready: " + ", ".join(missing))
+        expected_type = f"{self.embedding_sql_type}({self.settings.embedding_dimensions})"
+        if row["embedding_type"] != expected_type:
+            raise RuntimeError(
+                "PostgreSQL embedding dimension mismatch: "
+                f"expected {expected_type}, got {row['embedding_type'] or 'missing column'}"
+            )
 
     def create_index(self, _: str) -> None:
         """兼容搜索端口的建索引入口；实际结构由数据库迁移创建。"""
@@ -455,12 +473,12 @@ class SearchIndex:
         if not documents:
             return
         sql = text(
-            """
+            f"""
             INSERT INTO chunk_search_index (
                 chunk_id, embedding, embedding_fingerprint,
                 raw_text, lexical_text, exact_terms, record_hash, updated_at
             ) VALUES (
-                :chunk_id, CAST(:embedding AS vector), :embedding_fingerprint,
+                :chunk_id, CAST(:embedding AS {self.embedding_sql_type}), :embedding_fingerprint,
                 :raw_text, :lexical_text, :exact_terms, :record_hash, now()
             )
             ON CONFLICT (chunk_id) DO UPDATE SET
@@ -639,17 +657,18 @@ class SearchIndex:
         if self.settings.vector_min_similarity is not None:
             params["minimum_similarity"] = self.settings.vector_min_similarity
             threshold = (
-                "AND (1.0 - (s.embedding <=> CAST(:embedding AS vector))) >= :minimum_similarity"
+                "AND (1.0 - (s.embedding <=> "
+                f"CAST(:embedding AS {self.embedding_sql_type}))) >= :minimum_similarity"
             )
         sql = f"""
             SELECT {self._source_select()},
-                   (1.0 - (s.embedding <=> CAST(:embedding AS vector))) AS score
+                   (1.0 - (s.embedding <=> CAST(:embedding AS {self.embedding_sql_type}))) AS score
             {self._joins()}
             WHERE {scope}
               AND s.embedding IS NOT NULL
               AND s.embedding_fingerprint = :embedding_fingerprint
               {threshold}
-            ORDER BY s.embedding <=> CAST(:embedding AS vector), s.chunk_id
+            ORDER BY s.embedding <=> CAST(:embedding AS {self.embedding_sql_type}), s.chunk_id
             LIMIT :top_k
         """
         with self.engine.begin() as connection:

@@ -15,7 +15,8 @@
 - PostgreSQL 已安装 `vector` 和 `pg_trgm` 扩展；
 - 可以访问公司 OpenAI 兼容 SDK Endpoint。
 
-PostgreSQL 必须支持 1024 维 pgvector。项目固定使用：
+PostgreSQL 必须安装 pgvector 0.7.0 或更高版本。项目使用 `halfvec(2560)` 和 HNSW
+索引，以避开 `vector` 类型 HNSW 最多 2000 维的限制。模型固定使用：
 
 - Embedding：`qwen3-embedding`；
 - Chat：`qwen3.5-122B`；
@@ -75,7 +76,7 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 MODEL_API_BASE_URL=https://公司的SDK-Endpoint/v1
 MODEL_API_KEY="公司模型网关Token"
 EMBEDDING_MODEL=qwen3-embedding
-EMBEDDING_DIMENSIONS=1024
+EMBEDDING_DIMENSIONS=2560
 MODEL_REGISTRY_PATH=config/models.yaml
 RERANK_ENABLED=false
 ```
@@ -85,6 +86,16 @@ RERANK_ENABLED=false
 ```bash
 model-diagnostics
 ```
+
+从旧版 1024 维结构升级时，请先把 `.env` 中的 `EMBEDDING_DIMENSIONS` 改为
+`2560`，再执行 `alembic upgrade head`。迁移会保留关键词搜索数据，但会清除
+不兼容的旧向量。迁移完成后执行以下命令，为已有文档重新生成 2560 维向量：
+
+```bash
+knowledge-reindex
+```
+
+重建完成前已有文档仍可使用关键词检索；新上传文档不受影响。
 
 ## 5. 启动前后端
 
