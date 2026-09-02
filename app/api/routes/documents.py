@@ -17,6 +17,7 @@ from app.contracts.schemas import (
     DocumentCapabilitiesOut,
     DocumentPageOut,
     JobOut,
+    ProjectCleanupOut,
     ProjectNameIn,
     ProjectOut,
     SourceOut,
@@ -69,6 +70,30 @@ def rename_project(
 
     return run_application(
         lambda: document_application_service().rename_project(db, project_id, payload.name)
+    )
+
+
+@router.post("/projects/{project_id}/cleanup", response_model=ProjectCleanupOut)
+def cleanup_project_documents(
+    project_id: str,
+    db: Session = Depends(get_db),
+) -> ProjectCleanupOut:
+    """物理回收知识库中已经软删除的文档残留。"""
+
+    return run_application(
+        lambda: document_application_service().cleanup_project(db, project_id)
+    )
+
+
+@router.delete("/projects/{project_id}", response_model=ProjectCleanupOut)
+def delete_project(
+    project_id: str,
+    db: Session = Depends(get_db),
+) -> ProjectCleanupOut:
+    """彻底删除知识库及其全部文档和无引用对象。"""
+
+    return run_application(
+        lambda: document_application_service().delete_project(db, project_id)
     )
 
 

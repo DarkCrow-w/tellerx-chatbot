@@ -2,19 +2,39 @@
 
 from __future__ import annotations
 
-from sqlalchemy import func, or_, select
+from dataclasses import dataclass
+
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.db.models import (
     Chunk,
+    ChunkEmbedding,
     Document,
+    DocumentAcl,
+    DocumentArtifact,
     DocumentVersion,
+    EmbeddingCache,
+    IndexSyncState,
     IngestionJob,
     OutboxEvent,
     Project,
     utcnow,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectPurgeSnapshot:
+    """一次知识库物理清理产生的计数和可安全删除的对象路径。"""
+
+    project_id: str
+    project_deleted: bool
+    documents_deleted: int
+    versions_deleted: int
+    chunks_deleted: int
+    embedding_cache_deleted: int
+    object_paths: tuple[str, ...]
 
 
 class DocumentRepository:
@@ -29,6 +49,11 @@ class DocumentRepository:
         """按主键读取知识库项目。"""
 
         return db.get(Project, project_id)
+
+    def get_project_for_update(self, db: Session, project_id: str) -> Project | None:
+        """锁定知识库根记录，串行化清空、删除等破坏性操作。"""
+
+        return db.scalar(select(Project).where(Project.id == project_id).with_for_update())
 
     def get_project_by_name(self, db: Session, name: str) -> Project | None:
         """按唯一名称读取知识库项目。"""
@@ -265,6 +290,198 @@ class DocumentRepository:
                     Document.is_deleted.is_(False),
                 )
             )
+        )
+
+    @staticmethod
+    def cancel_active_jobs(db: Session, document_ids: list[str]) -> None:
+        """取消已删除文档尚未结束的任务，阻止 Worker 继续向量化。"""
+
+        if not document_ids:
+            return
+        db.execute(
+            update(IngestionJob)
+            .where(
+                IngestionJob.document_id.in_(document_ids),
+                IngestionJob.status.in_(["queued", "running", "index_pending"]),
+            )
+            .values(
+                status="cancelled",
+                stage="cancelled",
+                lease_until=None,
+                finished_at=utcnow(),
+                error_message="Document was deleted before ingestion completed",
+            )
+        )
+
+    @staticmethod
+    def supersede_pending_index_events(db: Session, version_ids: list[str]) -> None:
+        """让删除前尚未发布的建索引事件失效，避免随后恢复旧投影。"""
+
+        if not version_ids:
+            return
+        db.execute(
+            update(OutboxEvent)
+            .where(
+                OutboxEvent.aggregate_id.in_(version_ids),
+                OutboxEvent.event_type == "index_version",
+                OutboxEvent.status == "pending",
+            )
+            .values(status="superseded", lease_until=None)
+        )
+
+    @staticmethod
+    def _remaining_object_paths(db: Session, candidates: set[str]) -> set[str]:
+        """找出仍被其他文档或共享向量缓存引用的候选对象。"""
+
+        referenced: set[str] = set()
+        values = list(candidates)
+        # 控制 IN 参数数量，兼容 SQLite 测试和不同 PostgreSQL 驱动限制。
+        for start in range(0, len(values), 500):
+            batch = values[start : start + 500]
+            referenced.update(
+                db.scalars(
+                    select(DocumentVersion.storage_path).where(
+                        DocumentVersion.storage_path.in_(batch)
+                    )
+                )
+            )
+            referenced.update(
+                db.scalars(
+                    select(DocumentArtifact.object_uri).where(
+                        DocumentArtifact.object_uri.in_(batch)
+                    )
+                )
+            )
+            referenced.update(
+                db.scalars(
+                    select(EmbeddingCache.object_uri).where(
+                        EmbeddingCache.object_uri.in_(batch)
+                    )
+                )
+            )
+        return referenced
+
+    def purge_project(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        delete_project: bool,
+        deleted_only: bool = False,
+    ) -> ProjectPurgeSnapshot | None:
+        """物理删除指定范围内的文档事实，并仅回收已无引用的共享对象。"""
+
+        project = self.get_project_for_update(db, project_id)
+        if project is None:
+            return None
+
+        document_predicates = [Document.project_id == project_id]
+        if deleted_only:
+            document_predicates.append(Document.is_deleted.is_(True))
+        document_ids = list(db.scalars(select(Document.id).where(*document_predicates)))
+        version_ids = (
+            list(
+                db.scalars(
+                    select(DocumentVersion.id).where(
+                        DocumentVersion.document_id.in_(document_ids)
+                    )
+                )
+            )
+            if document_ids
+            else []
+        )
+        chunk_ids = (
+            list(db.scalars(select(Chunk.id).where(Chunk.version_id.in_(version_ids))))
+            if version_ids
+            else []
+        )
+        source_paths = (
+            set(
+                db.scalars(
+                    select(DocumentVersion.storage_path).where(
+                        DocumentVersion.id.in_(version_ids)
+                    )
+                )
+            )
+            if version_ids
+            else set()
+        )
+        artifact_paths = (
+            set(
+                db.scalars(
+                    select(DocumentArtifact.object_uri).where(
+                        DocumentArtifact.version_id.in_(version_ids)
+                    )
+                )
+            )
+            if version_ids
+            else set()
+        )
+        candidate_cache_ids = (
+            set(
+                db.scalars(
+                    select(ChunkEmbedding.cache_id).where(
+                        ChunkEmbedding.chunk_id.in_(chunk_ids)
+                    )
+                )
+            )
+            if chunk_ids
+            else set()
+        )
+
+        if version_ids:
+            db.execute(delete(IndexSyncState).where(IndexSyncState.version_id.in_(version_ids)))
+            db.execute(
+                delete(DocumentArtifact).where(DocumentArtifact.version_id.in_(version_ids))
+            )
+            db.execute(delete(OutboxEvent).where(OutboxEvent.aggregate_id.in_(version_ids)))
+        if document_ids:
+            db.execute(delete(IngestionJob).where(IngestionJob.document_id.in_(document_ids)))
+            db.execute(delete(DocumentAcl).where(DocumentAcl.document_id.in_(document_ids)))
+        if chunk_ids:
+            db.execute(delete(ChunkEmbedding).where(ChunkEmbedding.chunk_id.in_(chunk_ids)))
+            db.execute(delete(Chunk).where(Chunk.id.in_(chunk_ids)))
+
+        orphan_caches = (
+            list(
+                db.scalars(
+                    select(EmbeddingCache).where(
+                        EmbeddingCache.id.in_(candidate_cache_ids),
+                        ~select(ChunkEmbedding.id)
+                        .where(ChunkEmbedding.cache_id == EmbeddingCache.id)
+                        .exists(),
+                    )
+                )
+            )
+            if candidate_cache_ids
+            else []
+        )
+        embedding_paths = {cache.object_uri for cache in orphan_caches}
+        if orphan_caches:
+            db.execute(
+                delete(EmbeddingCache).where(
+                    EmbeddingCache.id.in_([cache.id for cache in orphan_caches])
+                )
+            )
+        if version_ids:
+            db.execute(delete(DocumentVersion).where(DocumentVersion.id.in_(version_ids)))
+        if document_ids:
+            db.execute(delete(Document).where(Document.id.in_(document_ids)))
+        if delete_project:
+            db.execute(delete(Project).where(Project.id == project_id))
+
+        candidates = source_paths | artifact_paths | embedding_paths
+        referenced = self._remaining_object_paths(db, candidates)
+        object_paths = tuple(sorted(candidates - referenced))
+        db.commit()
+        return ProjectPurgeSnapshot(
+            project_id=project_id,
+            project_deleted=delete_project,
+            documents_deleted=len(document_ids),
+            versions_deleted=len(version_ids),
+            chunks_deleted=len(chunk_ids),
+            embedding_cache_deleted=len(orphan_caches),
+            object_paths=object_paths,
         )
 
     @staticmethod

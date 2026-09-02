@@ -70,6 +70,25 @@ class LocalObjectStorage:
             raise ValueError("Storage path escapes configured root")
         return path
 
+    def delete(self, storage_path: str) -> bool:
+        """删除一个受控对象，并顺带移除存储根目录以内的空父目录。"""
+
+        path = self.resolve(storage_path)
+        if not path.exists():
+            return False
+        if not path.is_file():
+            raise ValueError("Storage object is not a file")
+        path.unlink()
+        root = self.root.resolve()
+        parent = path.parent
+        while parent != root and root in parent.parents:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+        return True
+
     def save_bytes(self, relative_path: str, data: bytes) -> tuple[str, str, int]:
         """以不可覆盖语义保存字节；同路径不同内容视为对象碰撞。"""
 

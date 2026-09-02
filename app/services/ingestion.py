@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 CHUNK_NAMESPACE = uuid.UUID("73ac24df-296f-4532-9dc8-e5890e877564")
 
 
+class IngestionCancelled(Exception):
+    """文档已删除时用于尽快终止解析或向量化的内部控制流。"""
+
+
 def _record_hash(chunk: TextChunk) -> str:
     """计算搜索记录的稳定哈希，用于后续校验索引内容是否发生漂移。"""
 
@@ -86,7 +90,9 @@ class IngestionService:
         now = datetime.now(UTC)
         statement = (
             select(IngestionJob)
+            .join(Document, IngestionJob.document_id == Document.id)
             .where(
+                Document.is_deleted.is_(False),
                 or_(
                     IngestionJob.status == "queued",
                     (
@@ -113,6 +119,18 @@ class IngestionService:
         db.commit()
         logger.info("已领取入库任务 job_id=%s attempt=%d", job.id, job.attempts)
         return job.id
+
+    @staticmethod
+    def _assert_document_active(db: Session, version_id: str) -> None:
+        """在昂贵阶段之间重查删除状态，避免继续调用模型。"""
+
+        is_deleted = db.scalar(
+            select(Document.is_deleted)
+            .join(DocumentVersion, DocumentVersion.document_id == Document.id)
+            .where(DocumentVersion.id == version_id)
+        )
+        if is_deleted is None or is_deleted:
+            raise IngestionCancelled("Document was deleted during ingestion")
 
     def _ensure_embedding_model(self, db: Session) -> None:
         """登记当前向量空间；相同指纹代表向量可以安全复用。"""
@@ -236,10 +254,14 @@ class IngestionService:
         missing: list[TextChunk],
         fingerprint: str,
         cached: dict[str, EmbeddingCache],
+        *,
+        version_id: str | None = None,
     ) -> None:
         """以十条为一批生成缺失向量，避免触发供应商载荷上限。"""
 
         for start in range(0, len(missing), 10):
+            if version_id is not None:
+                self._assert_document_active(db, version_id)
             self._embed_batch(db, missing[start : start + 10], fingerprint, cached)
 
     def _embeddings(
@@ -247,6 +269,8 @@ class IngestionService:
         db: Session,
         chunks: list[TextChunk],
         warnings: list[str],
+        *,
+        version_id: str | None = None,
     ) -> dict[str, EmbeddingCache]:
         """优先复用内容寻址的向量缓存，仅为缺失内容批量请求新向量。"""
 
@@ -262,7 +286,15 @@ class IngestionService:
             fingerprint,
         )
         try:
-            self._generate_missing_embeddings(db, missing_chunks, fingerprint, cached)
+            self._generate_missing_embeddings(
+                db,
+                missing_chunks,
+                fingerprint,
+                cached,
+                version_id=version_id,
+            )
+        except IngestionCancelled:
+            raise
         except Exception as exc:
             db.rollback()
             if not self.settings.allow_bm25_only:
@@ -394,7 +426,7 @@ class IngestionService:
         db.commit()
         return event.id
 
-    def process(self, db: Session, job_id: str) -> str:
+    def process(self, db: Session, job_id: str) -> str | None:
         """执行可重试的解析→切块→向量化流程，并生成待发布索引事件。"""
 
         job = db.get(IngestionJob, job_id)
@@ -415,6 +447,7 @@ class IngestionService:
             version.document.filename,
         )
         try:
+            self._assert_document_active(db, version.id)
             # 每个阶段先持久化状态，进程异常退出后运维端仍能定位失败位置。
             job.status = "running"
             job.stage, job.progress = "parsing", 10
@@ -443,12 +476,19 @@ class IngestionService:
                 len(text_chunks),
                 len(warnings),
             )
+            self._assert_document_active(db, version.id)
             self._save_normalized_artifact(db, version, units, warnings)
             version.technical_status = "chunked"
             job.stage, job.progress = "embedding", 35
             job.warnings = warnings
             db.commit()
-            cache = self._embeddings(db, text_chunks, warnings)
+            cache = self._embeddings(
+                db,
+                text_chunks,
+                warnings,
+                version_id=version.id,
+            )
+            self._assert_document_active(db, version.id)
             version.technical_status = (
                 "embedded"
                 if len(cache) == len({item.content_hash for item in text_chunks})
@@ -465,6 +505,22 @@ class IngestionService:
                 len(cache),
             )
             return event_id
+        except IngestionCancelled:
+            db.rollback()
+            job = db.get(IngestionJob, job_id)
+            if job is not None:
+                job.status = "cancelled"
+                job.stage = "cancelled"
+                job.error_message = "Document was deleted before ingestion completed"
+                job.lease_until = None
+                job.finished_at = datetime.now(UTC)
+                current_version = db.get(DocumentVersion, job.version_id)
+                if current_version is not None:
+                    current_version.technical_status = "deleted"
+                    current_version.is_current = False
+                db.commit()
+            logger.info("入库任务因文档删除而取消 job_id=%s", job_id)
+            return None
         except Exception as exc:
             db.rollback()
             job = db.get(IngestionJob, job_id)

@@ -90,7 +90,9 @@ class IndexingService:
                 select(func.count())
                 .select_from(Chunk)
                 .join(DocumentVersion, Chunk.version_id == DocumentVersion.id)
+                .join(Document, DocumentVersion.document_id == Document.id)
                 .where(
+                    Document.is_deleted.is_(False),
                     DocumentVersion.technical_status == "searchable",
                     (
                         (DocumentVersion.lifecycle_status == "draft")
@@ -333,6 +335,22 @@ class IndexingService:
         """发布并校验完整版本，校验通过后再原子切换当前批准版本。"""
 
         version, documents = self._documents_for_version(db, event.aggregate_id)
+        # 删除与建索引事件可能并发；以当前文档事实为准，禁止旧事件恢复投影。
+        if version.document.is_deleted:
+            self.index.delete_version(version.id)
+            version.technical_status = "deleted"
+            version.is_current = False
+            self._retire_sync_states(db, version.id)
+            self._refresh_generation_counts(db)
+            job_id = (event.payload or {}).get("job_id")
+            job = db.get(IngestionJob, job_id) if job_id else None
+            if job is not None:
+                job.status = "cancelled"
+                job.stage = "cancelled"
+                job.error_message = "Document was deleted before indexing completed"
+                job.lease_until = None
+                job.finished_at = datetime.now(UTC)
+            return
         if not documents:
             raise ValueError(f"Version {version.id} has no chunks")
         self.index.index_chunks(documents)
@@ -420,7 +438,10 @@ class IndexingService:
         generation = self.ensure_generation(db)
         versions = list(
             db.scalars(
-                select(DocumentVersion).where(
+                select(DocumentVersion)
+                .join(Document, DocumentVersion.document_id == Document.id)
+                .where(
+                    Document.is_deleted.is_(False),
                     DocumentVersion.technical_status == "searchable",
                     (
                         (DocumentVersion.lifecycle_status == "draft")

@@ -6,7 +6,14 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.db.models import Chunk, ChunkEmbedding, DocumentVersion, IndexSyncState, OutboxEvent
+from app.db.models import (
+    Chunk,
+    ChunkEmbedding,
+    Document,
+    DocumentVersion,
+    IndexSyncState,
+    OutboxEvent,
+)
 
 
 class OperationsRepository:
@@ -40,7 +47,9 @@ class OperationsRepository:
             select(func.count())
             .select_from(Chunk)
             .join(DocumentVersion, Chunk.version_id == DocumentVersion.id)
+            .join(Document, DocumentVersion.document_id == Document.id)
             .where(
+                Document.is_deleted.is_(False),
                 DocumentVersion.technical_status == "searchable",
                 eligible,
                 ~has_current_embedding,

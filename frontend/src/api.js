@@ -39,6 +39,20 @@ export function renameProject(projectId, name) {
   });
 }
 
+export function cleanupProject(projectId) {
+  /** 物理回收已软删除文档的残留，不影响仍在使用的文档。 */
+  return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}/cleanup`, {
+    method: "POST",
+  });
+}
+
+export function deleteProject(projectId) {
+  /** 彻底删除知识库及其全部文档和派生数据。 */
+  return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}`, {
+    method: "DELETE",
+  });
+}
+
 export function getDocumentCapabilities() {
   /** 获取后端真实支持的格式和单文件体积限制。 */
   return requestJson("/api/v1/documents/capabilities");

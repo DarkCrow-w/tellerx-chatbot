@@ -25,8 +25,10 @@ import {
 import {
   approveDocumentVersion,
   bulkDeleteDocuments,
+  cleanupProject,
   createProject,
   deleteDocument,
+  deleteProject,
   deprecateDocumentVersion,
   documentDownloadUrl,
   getDocumentCapabilities,
@@ -357,6 +359,9 @@ export default function KnowledgeManager({
   const [busyId, setBusyId] = useState(null);
   const [selectedDocumentIds, setSelectedDocumentIds] = useState(() => new Set());
   const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [projectAction, setProjectAction] = useState(null);
+  const [projectConfirmAction, setProjectConfirmAction] = useState(null);
+  const [projectConfirmationName, setProjectConfirmationName] = useState("");
   const fileInputRef = useRef(null);
   const folderInputRef = useRef(null);
   const versionInputRef = useRef(null);
@@ -551,6 +556,52 @@ export default function KnowledgeManager({
     }
   }
 
+  function openProjectConfirmation(action) {
+    if (!selectedProject || projectAction || batchRunning) return;
+    setProjectConfirmationName("");
+    setProjectConfirmAction(action);
+  }
+
+  async function runProjectAction() {
+    if (!selectedProject || !projectConfirmAction || projectAction || batchRunning) return;
+    const action = projectConfirmAction;
+    const deleting = action === "delete";
+    if (projectConfirmationName.trim() !== selectedProject.name) return;
+
+    setProjectAction(action);
+    try {
+      const result = deleting
+        ? await deleteProject(selectedProject.id)
+        : await cleanupProject(selectedProject.id);
+      if (deleting) {
+        setDocuments([]);
+        setTotal(0);
+      } else {
+        await loadDocuments(true);
+      }
+      setBatch([]);
+      setExpandedId(null);
+      setVersionsByDocument({});
+      setSelectedDocumentIds(new Set());
+      setOffset(0);
+      setProjectConfirmAction(null);
+      setProjectConfirmationName("");
+      await onProjectsChanged(deleting ? null : selectedProject.id);
+      const fileWarning = result.files_failed
+        ? `，另有 ${result.files_failed} 个文件清理失败，请查看后端日志`
+        : "";
+      onToast(
+        deleting
+          ? `知识库已彻底删除，共清理 ${result.documents_deleted} 份文档${fileWarning}`
+          : `已清理 ${result.documents_deleted} 份删除残留${fileWarning}`,
+      );
+    } catch (error) {
+      onToast(error.message);
+    } finally {
+      setProjectAction(null);
+    }
+  }
+
   function selectFiles(event, fixedLogicalKey = null) {
     const files = event.target.files;
     if (files?.length) startBatch(files, fixedLogicalKey);
@@ -587,10 +638,16 @@ export default function KnowledgeManager({
                 <p>{selectedProject ? `${total} 份文档` : "创建或选择一个知识库后开始上传"}</p>
               </div>
               <div className="upload-buttons">
-                <button className="secondary-button" type="button" disabled={!selectedProject || batchRunning} onClick={() => fileInputRef.current?.click()}>
+                <button className="secondary-button danger-button" type="button" disabled={!selectedProject || batchRunning || !!projectAction} onClick={() => openProjectConfirmation("cleanup")}>
+                  {projectAction === "cleanup" ? <LoaderCircle className="spin" size={15} /> : <Archive size={15} />}清理删除残留
+                </button>
+                <button className="secondary-button danger-button" type="button" disabled={!selectedProject || batchRunning || !!projectAction} onClick={() => openProjectConfirmation("delete")}>
+                  {projectAction === "delete" ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}删除知识库
+                </button>
+                <button className="secondary-button" type="button" disabled={!selectedProject || batchRunning || !!projectAction} onClick={() => fileInputRef.current?.click()}>
                   <FilePlus2 size={15} />选择文件
                 </button>
-                <button className="primary-button" type="button" disabled={!selectedProject || batchRunning} onClick={() => folderInputRef.current?.click()}>
+                <button className="primary-button" type="button" disabled={!selectedProject || batchRunning || !!projectAction} onClick={() => folderInputRef.current?.click()}>
                   <FolderOpen size={15} />选择文件夹
                 </button>
               </div>
@@ -673,7 +730,7 @@ export default function KnowledgeManager({
                   document={document}
                   expanded={expandedId === document.id}
                   versions={versionsByDocument[document.id]}
-                  busy={bulkDeleting || busyId === document.id}
+                  busy={bulkDeleting || !!projectAction || busyId === document.id}
                   selected={selectedDocumentIds.has(document.id)}
                   onSelect={() => toggleDocumentSelection(document.id)}
                   onToggle={() => toggleVersions(document)}
@@ -698,6 +755,55 @@ export default function KnowledgeManager({
           </section>
         </div>
       </section>
+
+      {projectConfirmAction && selectedProject && (
+        <div className="dialog-backdrop" role="presentation">
+          <section className="danger-dialog" role="dialog" aria-modal="true" aria-labelledby="project-danger-title">
+            <div className="danger-dialog-icon"><AlertTriangle size={20} /></div>
+            <div>
+              <h2 id="project-danger-title">
+                {projectConfirmAction === "delete" ? "彻底删除知识库" : "清理删除残留"}
+              </h2>
+              <p>
+                {projectConfirmAction === "delete"
+                  ? `将永久删除“${selectedProject.name}”中的全部原文件、版本、分块和无引用向量，知识库本身也会被删除。`
+                  : `将永久回收“${selectedProject.name}”中已经删除的文档残留；仍在使用的文档不会受到影响。`}
+                操作无法恢复。
+              </p>
+              <label>
+                <span>请输入知识库名称以确认</span>
+                <input
+                  autoFocus
+                  value={projectConfirmationName}
+                  onChange={(event) => setProjectConfirmationName(event.target.value)}
+                  placeholder={selectedProject.name}
+                  aria-label="输入知识库名称确认"
+                  disabled={!!projectAction}
+                />
+              </label>
+              <div className="danger-dialog-actions">
+                <button
+                  className="secondary-button"
+                  type="button"
+                  disabled={!!projectAction}
+                  onClick={() => setProjectConfirmAction(null)}
+                >
+                  取消
+                </button>
+                <button
+                  className="danger-confirm-button"
+                  type="button"
+                  disabled={!!projectAction || projectConfirmationName.trim() !== selectedProject.name}
+                  onClick={runProjectAction}
+                >
+                  {projectAction && <LoaderCircle className="spin" size={14} />}
+                  {projectConfirmAction === "delete" ? "确认彻底删除" : "确认清理"}
+                </button>
+              </div>
+            </div>
+          </section>
+        </div>
+      )}
     </main>
   );
 }

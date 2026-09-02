@@ -119,6 +119,19 @@ class BulkDeleteDocumentsOut(BaseModel):
     skipped_ids: list[str]
 
 
+class ProjectCleanupOut(BaseModel):
+    """清空或删除知识库后的物理数据清理统计。"""
+
+    project_id: str
+    project_deleted: bool
+    documents_deleted: int
+    versions_deleted: int
+    chunks_deleted: int
+    embedding_cache_deleted: int
+    files_deleted: int
+    files_failed: int
+
+
 class IndexStatusOut(BaseModel):
     """搜索后端健康状态和一致性指标。"""
 

@@ -24,6 +24,7 @@ from app.contracts.schemas import (
     DocumentPageOut,
     DocumentSummaryOut,
     JobOut,
+    ProjectCleanupOut,
     SourceOut,
     UploadResponse,
     VersionOut,
@@ -45,11 +46,13 @@ class ObjectStorage(Protocol):
 
     def resolve(self, storage_path: str) -> Path: ...
 
+    def delete(self, storage_path: str) -> bool: ...
+
 
 class IngestionProcessor(Protocol):
     """后台入库处理器接口。"""
 
-    def process(self, db: Session, job_id: str) -> str: ...
+    def process(self, db: Session, job_id: str) -> str | None: ...
 
 
 class IndexPublisher(Protocol):
@@ -351,7 +354,8 @@ class DocumentApplicationService:
         """在本地开发进程中依次完成入库和搜索投影发布。"""
 
         event_id = self.ingestion.process(db, job_id)
-        self._publish_local_events(db, [event_id])
+        if event_id is not None:
+            self._publish_local_events(db, [event_id])
 
     def _publish_local_events(self, db: Session, event_ids: list[str]) -> None:
         """本地没有独立 Indexer，因此同步发布并有限重试 Outbox 事件。"""
@@ -378,6 +382,8 @@ class DocumentApplicationService:
         """为已结束任务创建新的入库尝试，不覆盖历史记录。"""
 
         job = self.get_job(db, job_id)
+        if self.repository.get_active_document_with_versions(db, job.document_id) is None:
+            raise ResourceNotFoundError("Document not found")
         if job.status not in {"failed", "succeeded"}:
             raise ResourceConflictError("Only completed jobs can be re-queued")
         retry = self.repository.create_job(db, job.document_id, job.version_id)
@@ -499,12 +505,16 @@ class DocumentApplicationService:
         events = []
         for version in document.versions:
             version.is_current = False
+            version.technical_status = "deleted"
             event = self.repository.add_outbox_event(
                 db,
                 version_id=version.id,
                 event_type="delete_version",
             )
             events.append(event)
+        version_ids = [version.id for version in document.versions]
+        self.repository.cancel_active_jobs(db, [document.id])
+        self.repository.supersede_pending_index_events(db, version_ids)
         self.repository.commit(db)
         self._publish_local_events(db, [event.id for event in events])
         logger.info(
@@ -541,6 +551,7 @@ class DocumentApplicationService:
             document.is_deleted = True
             for version in document.versions:
                 version.is_current = False
+                version.technical_status = "deleted"
                 events.append(
                     self.repository.add_outbox_event(
                         db,
@@ -548,6 +559,13 @@ class DocumentApplicationService:
                         event_type="delete_version",
                     )
                 )
+        version_ids = [
+            version.id
+            for document_id in deleted_ids
+            for version in by_id[document_id].versions
+        ]
+        self.repository.cancel_active_jobs(db, deleted_ids)
+        self.repository.supersede_pending_index_events(db, version_ids)
         self.repository.commit(db)
         self._publish_local_events(db, [event.id for event in events])
         logger.info(
@@ -564,4 +582,73 @@ class DocumentApplicationService:
             skipped_count=len(skipped_ids),
             deleted_ids=deleted_ids,
             skipped_ids=skipped_ids,
+        )
+
+    def cleanup_project(self, db: Session, project_id: str) -> ProjectCleanupOut:
+        """物理回收已软删除文档的残留，不影响仍在使用的文档。"""
+
+        return self._purge_project(
+            db,
+            project_id=project_id,
+            delete_project=False,
+            deleted_only=True,
+        )
+
+    def delete_project(self, db: Session, project_id: str) -> ProjectCleanupOut:
+        """物理删除知识库以及全部文档、派生数据和无引用对象。"""
+
+        return self._purge_project(db, project_id=project_id, delete_project=True)
+
+    def _purge_project(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        delete_project: bool,
+        deleted_only: bool = False,
+    ) -> ProjectCleanupOut:
+        """提交数据库删除后回收文件；文件失败不回滚已经完成的数据清理。"""
+
+        snapshot = self.repository.purge_project(
+            db,
+            project_id=project_id,
+            delete_project=delete_project,
+            deleted_only=deleted_only,
+        )
+        if snapshot is None:
+            raise ResourceNotFoundError("Project not found")
+
+        files_deleted = 0
+        files_failed = 0
+        for object_path in snapshot.object_paths:
+            try:
+                files_deleted += int(self.storage.delete(object_path))
+            except (OSError, ValueError):
+                files_failed += 1
+                logger.exception(
+                    "知识库对象删除失败 project_id=%s object_path=%s",
+                    project_id,
+                    object_path,
+                )
+        logger.info(
+            "知识库物理清理完成 project_id=%s project_deleted=%s documents=%d "
+            "versions=%d chunks=%d caches=%d files=%d failed_files=%d",
+            project_id,
+            delete_project,
+            snapshot.documents_deleted,
+            snapshot.versions_deleted,
+            snapshot.chunks_deleted,
+            snapshot.embedding_cache_deleted,
+            files_deleted,
+            files_failed,
+        )
+        return ProjectCleanupOut(
+            project_id=project_id,
+            project_deleted=delete_project,
+            documents_deleted=snapshot.documents_deleted,
+            versions_deleted=snapshot.versions_deleted,
+            chunks_deleted=snapshot.chunks_deleted,
+            embedding_cache_deleted=snapshot.embedding_cache_deleted,
+            files_deleted=files_deleted,
+            files_failed=files_failed,
         )

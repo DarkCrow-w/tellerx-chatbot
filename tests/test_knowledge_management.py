@@ -10,9 +10,37 @@ from sqlalchemy.orm import Session
 
 from app.application.document_service import DocumentApplicationService
 from app.application.errors import ResourceConflictError, ResourceNotFoundError
+from app.commands.reindex import _eligible_versions
 from app.db import Base
-from app.db.models import Document, DocumentVersion, IngestionJob, OutboxEvent
+from app.db.models import (
+    Chunk,
+    ChunkEmbedding,
+    Document,
+    DocumentAcl,
+    DocumentArtifact,
+    DocumentVersion,
+    EmbeddingCache,
+    EmbeddingModel,
+    IndexGeneration,
+    IndexSyncState,
+    IngestionJob,
+    OutboxEvent,
+    Principal,
+    Project,
+)
 from app.repositories.documents import DocumentRepository
+from app.services.ingestion import IngestionService
+
+
+class RecordingStorage:
+    """记录清理请求的内存存储替身。"""
+
+    def __init__(self) -> None:
+        self.deleted: list[str] = []
+
+    def delete(self, object_path: str) -> bool:
+        self.deleted.append(object_path)
+        return True
 
 
 class KnowledgeManagementTest(unittest.TestCase):
@@ -33,6 +61,11 @@ class KnowledgeManagementTest(unittest.TestCase):
             repository=DocumentRepository(),
             ingestion=None,
         )
+
+    def use_recording_storage(self) -> RecordingStorage:
+        storage = RecordingStorage()
+        self.service.storage = storage
+        return storage
 
     def tearDown(self) -> None:
         self.db.close()
@@ -258,6 +291,252 @@ class KnowledgeManagementTest(unittest.TestCase):
                 project_id="missing",
                 document_ids=["document"],
             )
+
+    def test_soft_delete_cancels_jobs_and_prevents_reindexing_deleted_drafts(self) -> None:
+        project = self.service.create_project(self.db, "软删除知识库")
+        document = Document(
+            project_id=project.id,
+            logical_key="draft.md",
+            filename="draft.md",
+            document_type="text-document",
+        )
+        self.db.add(document)
+        self.db.flush()
+        version = DocumentVersion(
+            document_id=document.id,
+            sha256="e" * 64,
+            storage_path="draft-source",
+            lifecycle_status="draft",
+            technical_status="searchable",
+        )
+        self.db.add(version)
+        self.db.flush()
+        job = IngestionJob(document_id=document.id, version_id=version.id, status="queued")
+        pending_event = OutboxEvent(
+            aggregate_id=version.id,
+            event_type="index_version",
+            payload={"job_id": job.id},
+        )
+        self.db.add_all([job, pending_event])
+        active_document = Document(
+            project_id=project.id,
+            logical_key="active.md",
+            filename="active.md",
+            document_type="text-document",
+        )
+        self.db.add(active_document)
+        self.db.flush()
+        active_version = DocumentVersion(
+            document_id=active_document.id,
+            sha256="0" * 64,
+            storage_path="active-source",
+            lifecycle_status="draft",
+            technical_status="searchable",
+        )
+        self.db.add(active_version)
+        self.db.flush()
+        active_job = IngestionJob(
+            document_id=active_document.id,
+            version_id=active_version.id,
+            status="queued",
+        )
+        self.db.add(active_job)
+        self.db.commit()
+
+        self.service.delete_document(self.db, document.id)
+
+        self.assertTrue(document.is_deleted)
+        self.assertEqual(version.technical_status, "deleted")
+        self.assertEqual(job.status, "cancelled")
+        self.assertEqual(pending_event.status, "superseded")
+        self.assertEqual([item.id for item in _eligible_versions(self.db)], [active_version.id])
+        worker = object.__new__(IngestionService)
+        self.assertEqual(worker.claim_next_job(self.db), active_job.id)
+
+    def test_cleanup_project_removes_deleted_residue_and_keeps_active_data(self) -> None:
+        storage = self.use_recording_storage()
+        target = self.service.create_project(self.db, "待清空知识库")
+        retained = self.service.create_project(self.db, "保留知识库")
+        target_document = Document(
+            project_id=target.id,
+            logical_key="target.md",
+            filename="target.md",
+            document_type="text-document",
+        )
+        deleted_document = Document(
+            project_id=target.id,
+            logical_key="deleted.md",
+            filename="deleted.md",
+            document_type="text-document",
+            is_deleted=True,
+        )
+        retained_document = Document(
+            project_id=retained.id,
+            logical_key="retained.md",
+            filename="retained.md",
+            document_type="text-document",
+        )
+        self.db.add_all([target_document, deleted_document, retained_document])
+        self.db.flush()
+        target_version = DocumentVersion(
+            document_id=target_document.id,
+            sha256="f" * 64,
+            storage_path="shared-source",
+            lifecycle_status="approved",
+            technical_status="searchable",
+            is_current=True,
+        )
+        deleted_version = DocumentVersion(
+            document_id=deleted_document.id,
+            sha256="1" * 64,
+            storage_path="deleted-source",
+            lifecycle_status="draft",
+            technical_status="deleted",
+        )
+        retained_version = DocumentVersion(
+            document_id=retained_document.id,
+            sha256="2" * 64,
+            storage_path="shared-source",
+            lifecycle_status="approved",
+            technical_status="searchable",
+            is_current=True,
+        )
+        self.db.add_all([target_version, deleted_version, retained_version])
+        self.db.flush()
+        target_chunk = Chunk(
+            version_id=target_version.id,
+            ordinal=0,
+            content="shared",
+            content_hash="3" * 64,
+            record_hash="4" * 64,
+            token_count=1,
+        )
+        deleted_chunk = Chunk(
+            version_id=deleted_version.id,
+            ordinal=0,
+            content="unique",
+            content_hash="5" * 64,
+            record_hash="6" * 64,
+            token_count=1,
+        )
+        retained_chunk = Chunk(
+            version_id=retained_version.id,
+            ordinal=0,
+            content="shared",
+            content_hash="3" * 64,
+            record_hash="7" * 64,
+            token_count=1,
+        )
+        self.db.add_all([target_chunk, deleted_chunk, retained_chunk])
+        model = EmbeddingModel(
+            fingerprint="model-fingerprint",
+            model_id="embedding-model",
+            dimensions=2560,
+            preprocess_version="v1",
+        )
+        shared_cache = EmbeddingCache(
+            content_hash="3" * 64,
+            embedding_fingerprint=model.fingerprint,
+            object_uri="shared-vector",
+            checksum="8" * 64,
+            dimensions=2560,
+        )
+        unique_cache = EmbeddingCache(
+            content_hash="5" * 64,
+            embedding_fingerprint=model.fingerprint,
+            object_uri="unique-vector",
+            checksum="9" * 64,
+            dimensions=2560,
+        )
+        self.db.add_all([model, shared_cache, unique_cache])
+        self.db.flush()
+        self.db.add_all(
+            [
+                ChunkEmbedding(
+                    chunk_id=target_chunk.id,
+                    embedding_fingerprint=model.fingerprint,
+                    cache_id=shared_cache.id,
+                ),
+                ChunkEmbedding(
+                    chunk_id=deleted_chunk.id,
+                    embedding_fingerprint=model.fingerprint,
+                    cache_id=unique_cache.id,
+                ),
+                ChunkEmbedding(
+                    chunk_id=retained_chunk.id,
+                    embedding_fingerprint=model.fingerprint,
+                    cache_id=shared_cache.id,
+                ),
+                DocumentArtifact(
+                    version_id=deleted_version.id,
+                    artifact_type="normalized",
+                    object_uri="target-artifact",
+                    sha256="a" * 64,
+                    byte_size=10,
+                    fingerprint="parser-v1",
+                ),
+                IngestionJob(
+                    document_id=deleted_document.id,
+                    version_id=deleted_version.id,
+                    status="succeeded",
+                ),
+                OutboxEvent(
+                    aggregate_id=deleted_version.id,
+                    event_type="index_version",
+                    payload={},
+                ),
+            ]
+        )
+        principal = Principal(principal_type="user", external_id="cleanup-test")
+        generation = IndexGeneration(
+            physical_index="cleanup-test-index",
+            schema_version="1",
+            embedding_fingerprint=model.fingerprint,
+        )
+        self.db.add_all([principal, generation])
+        self.db.flush()
+        self.db.add_all(
+            [
+                DocumentAcl(document_id=deleted_document.id, principal_id=principal.id),
+                IndexSyncState(
+                    version_id=deleted_version.id,
+                    generation_id=generation.id,
+                    manifest_hash="b" * 64,
+                ),
+            ]
+        )
+        self.db.commit()
+
+        result = self.service.cleanup_project(self.db, target.id)
+
+        self.assertFalse(result.project_deleted)
+        self.assertEqual(result.documents_deleted, 1)
+        self.assertEqual(result.versions_deleted, 1)
+        self.assertEqual(result.chunks_deleted, 1)
+        self.assertEqual(result.embedding_cache_deleted, 1)
+        self.assertIsNotNone(self.db.get(Project, target.id))
+        self.assertIsNotNone(self.db.get(Document, target_document.id))
+        self.assertIsNone(self.db.get(Document, deleted_document.id))
+        self.assertIsNotNone(self.db.get(Document, retained_document.id))
+        self.assertIsNotNone(self.db.get(EmbeddingCache, shared_cache.id))
+        self.assertIsNone(self.db.get(EmbeddingCache, unique_cache.id))
+        self.assertEqual(
+            set(storage.deleted),
+            {"deleted-source", "target-artifact", "unique-vector"},
+        )
+        self.assertNotIn("shared-source", storage.deleted)
+        self.assertNotIn("shared-vector", storage.deleted)
+
+    def test_delete_project_removes_empty_project_and_missing_project_is_rejected(self) -> None:
+        self.use_recording_storage()
+        project = self.service.create_project(self.db, "空知识库")
+
+        result = self.service.delete_project(self.db, project.id)
+
+        self.assertTrue(result.project_deleted)
+        self.assertIsNone(self.db.get(Project, project.id))
+        with self.assertRaises(ResourceNotFoundError):
+            self.service.delete_project(self.db, "missing")
 
 
 if __name__ == "__main__":

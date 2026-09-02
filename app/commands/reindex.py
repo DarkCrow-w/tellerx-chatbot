@@ -18,6 +18,7 @@ from app.db import SessionLocal
 from app.db.models import (
     Chunk,
     ChunkEmbedding,
+    Document,
     DocumentVersion,
 )
 from app.integrations.search import SearchIndex
@@ -36,7 +37,9 @@ def _eligible_versions(db: Session) -> list[DocumentVersion]:
     return list(
         db.scalars(
             select(DocumentVersion)
+            .join(Document, DocumentVersion.document_id == Document.id)
             .where(
+                Document.is_deleted.is_(False),
                 or_(
                     DocumentVersion.lifecycle_status == "draft",
                     (
@@ -100,7 +103,12 @@ def _ensure_embeddings(
     missing = _missing_embedding_chunks(db, chunks, settings.embedding_fingerprint)
     if not missing:
         return
-    cache_by_hash = ingestion._embeddings(db, [_as_text_chunk(chunk) for chunk in missing], [])
+    cache_by_hash = ingestion._embeddings(
+        db,
+        [_as_text_chunk(chunk) for chunk in missing],
+        [],
+        version_id=missing[0].version_id,
+    )
     for chunk in missing:
         cached = cache_by_hash.get(chunk.content_hash)
         if cached is not None:
