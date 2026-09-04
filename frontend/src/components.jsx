@@ -21,6 +21,8 @@ import {
   ThumbsUp,
 } from "lucide-react";
 
+import { getSectionContext } from "./api";
+
 const STARTERS = [
   {
     icon: FileSearch,
@@ -47,12 +49,28 @@ const STATUS = {
   grounded: { label: "有据可查", className: "grounded" },
   conflict: { label: "存在冲突", className: "conflict" },
   insufficient_evidence: { label: "证据不足", className: "insufficient" },
+  clarification_required: { label: "请选择文档", className: "conflict" },
 };
 
-function SourceList({ sources }) {
+function SourceList({ sources, onToast }) {
   /** 按需展开引用原文，避免长证据列表压过回答主体。 */
   const [open, setOpen] = useState(false);
+  const [contexts, setContexts] = useState({});
+  const [loadingSection, setLoadingSection] = useState(null);
   if (!sources?.length) return null;
+
+  async function loadContext(sectionId) {
+    if (contexts[sectionId]) return;
+    setLoadingSection(sectionId);
+    try {
+      const context = await getSectionContext(sectionId);
+      setContexts((current) => ({ ...current, [sectionId]: context }));
+    } catch (error) {
+      onToast?.(error.message);
+    } finally {
+      setLoadingSection(null);
+    }
+  }
 
   return (
     <div className={`sources ${open ? "is-open" : ""}`}>
@@ -69,7 +87,7 @@ function SourceList({ sources }) {
         <div className="source-list">
           {sources.map((source, index) => {
             const location = [
-              source.heading_path,
+              source.breadcrumb?.length ? source.breadcrumb.join(" › ") : source.heading_path,
               source.page_number && `第 ${source.page_number} 页`,
               source.sheet_name,
               source.cell_range,
@@ -81,6 +99,23 @@ function SourceList({ sources }) {
                   {location && <span>{location}</span>}
                 </header>
                 <p>{source.quote}</p>
+                {source.section_id && (
+                  <button
+                    className="section-context-trigger"
+                    type="button"
+                    onClick={() => loadContext(source.section_id)}
+                  >
+                    {loadingSection === source.section_id ? "正在加载…" : "查看章节上下文"}
+                  </button>
+                )}
+                {contexts[source.section_id] && (
+                  <div className="section-context">
+                    {contexts[source.section_id].chunks.map((chunk) => (
+                      <p key={chunk.chunk_id}>{chunk.content}</p>
+                    ))}
+                    {contexts[source.section_id].truncated && <small>章节过长，仅展示前 100 个内容块。</small>}
+                  </div>
+                )}
               </article>
             );
           })}
@@ -118,7 +153,7 @@ function AnswerActions({ answer, onToast }) {
   );
 }
 
-export function Message({ message, onToast }) {
+export function Message({ message, onToast, onSelectDocument }) {
   /** 根据消息角色和证据状态渲染用户气泡或助手回答。 */
   if (message.role === "user") {
     return (
@@ -134,7 +169,26 @@ export function Message({ message, onToast }) {
       <div className="assistant-avatar"><span>T</span></div>
       <div className="assistant-content">
         <div className="answer-copy">{message.content}</div>
-        <SourceList sources={message.sources} />
+        {(message.resolvedDocument || message.resolvedScope === "global") && (
+          <div className="retrieval-scope">
+            检索范围：{message.resolvedScope === "global" ? "全部知识库" : message.resolvedScope}
+          </div>
+        )}
+        {message.clarificationOptions?.length > 0 && (
+          <div className="document-options" aria-label="请选择文档">
+            {message.clarificationOptions.map((option) => (
+              <button
+                type="button"
+                key={option.document_id}
+                onClick={() => onSelectDocument?.(message.originalQuestion, option)}
+              >
+                <strong>{option.filename}</strong>
+                <span>{option.document_type || "文档"}{option.version_label ? ` · ${option.version_label}` : ""}</span>
+              </button>
+            ))}
+          </div>
+        )}
+        <SourceList sources={message.sources} onToast={onToast} />
         <div className="answer-meta">
           <span className={`answer-status ${status.className}`}><i />{status.label}</span>
           <span>{message.modelId ? `${message.modelId}${message.routeTier ? ` · ${message.routeTier}` : ""}` : "未调用生成模型"}</span>

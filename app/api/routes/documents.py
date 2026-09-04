@@ -14,12 +14,15 @@ from app.application.document_service import UploadDocumentCommand
 from app.contracts.schemas import (
     BulkDeleteDocumentsIn,
     BulkDeleteDocumentsOut,
+    DocumentCandidateOut,
     DocumentCapabilitiesOut,
     DocumentPageOut,
+    DocumentSectionOut,
     JobOut,
     ProjectCleanupOut,
     ProjectNameIn,
     ProjectOut,
+    SectionContextOut,
     SourceOut,
     UploadResponse,
     VersionOut,
@@ -118,11 +121,46 @@ def list_project_documents(
     )
 
 
+@router.get(
+    "/projects/{project_id}/documents/search",
+    response_model=list[DocumentCandidateOut],
+)
+def search_project_documents(
+    project_id: str,
+    hint: str = Query(min_length=1, max_length=500),
+    limit: int = Query(default=8, ge=1, le=20),
+    db: Session = Depends(get_db),
+) -> list[DocumentCandidateOut]:
+    """按文件名片段返回当前有效文档候选。"""
+
+    return run_application(
+        lambda: document_application_service().search_document_candidates(
+            db, project_id=project_id, hint=hint, limit=limit
+        )
+    )
+
+
 @router.get("/documents/capabilities", response_model=DocumentCapabilitiesOut)
 def document_capabilities() -> DocumentCapabilitiesOut:
     """返回前端上传前需要使用的文件类型和大小限制。"""
 
     return document_application_service().document_capabilities()
+
+
+@router.get("/documents/search", response_model=list[DocumentCandidateOut])
+def search_documents(
+    project_id: str,
+    q: str = Query(min_length=1, max_length=500),
+    limit: int = Query(default=8, ge=1, le=20),
+    db: Session = Depends(get_db),
+) -> list[DocumentCandidateOut]:
+    """按升级契约提供文件名片段候选搜索。"""
+
+    return run_application(
+        lambda: document_application_service().search_document_candidates(
+            db, project_id=project_id, hint=q, limit=limit
+        )
+    )
 
 
 @router.post("/documents", response_model=UploadResponse, status_code=202)
@@ -190,6 +228,20 @@ def list_document_versions(document_id: str, db: Session = Depends(get_db)) -> l
     )
 
 
+@router.get(
+    "/documents/{document_id}/outline",
+    response_model=list[DocumentSectionOut],
+)
+def document_outline(
+    document_id: str, db: Session = Depends(get_db)
+) -> list[DocumentSectionOut]:
+    """返回当前有效版本的标题目录树节点。"""
+
+    return run_application(
+        lambda: document_application_service().document_outline(db, document_id)
+    )
+
+
 @router.post("/document-versions/{version_id}/approve", response_model=VersionOut)
 def approve_document_version(version_id: str, db: Session = Depends(get_db)):
     """请求批准已完成索引校验的版本。"""
@@ -213,6 +265,17 @@ def get_source(chunk_id: str, db: Session = Depends(get_db)) -> SourceOut:
     """返回引用分块的原文及定位信息。"""
 
     return run_application(lambda: document_application_service().get_source(db, chunk_id))
+
+
+@router.get("/sections/{section_id}", response_model=SectionContextOut)
+def get_section_context(
+    section_id: str, db: Session = Depends(get_db)
+) -> SectionContextOut:
+    """按需返回章节原文与紧邻上下文。"""
+
+    return run_application(
+        lambda: document_application_service().section_context(db, section_id)
+    )
 
 
 @router.get("/documents/{document_id}/download")

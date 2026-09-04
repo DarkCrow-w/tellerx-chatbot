@@ -14,6 +14,7 @@ from app.db.models import (
     Document,
     DocumentAcl,
     DocumentArtifact,
+    DocumentSection,
     DocumentVersion,
     EmbeddingCache,
     IndexSyncState,
@@ -21,6 +22,11 @@ from app.db.models import (
     OutboxEvent,
     Project,
     utcnow,
+)
+from app.knowledge.document_scope import (
+    meaningful_document_tokens,
+    normalize_document_name,
+    score_document_name,
 )
 
 
@@ -166,6 +172,7 @@ class DocumentRepository:
                 project_id=project_id,
                 logical_key=logical_key,
                 filename=filename,
+                normalized_filename=normalize_document_name(filename),
                 document_type=document_type,
                 owner=owner,
             )
@@ -175,6 +182,7 @@ class DocumentRepository:
         # 逻辑身份稳定，但目录摘要跟随最新上传更新；赋值也会刷新 updated_at。
         document.is_deleted = False
         document.filename = filename
+        document.normalized_filename = normalize_document_name(filename)
         document.document_type = document_type
         document.owner = owner
         document.updated_at = utcnow()
@@ -239,9 +247,153 @@ class DocumentRepository:
 
         return db.scalar(
             select(Chunk)
-            .options(joinedload(Chunk.version).joinedload(DocumentVersion.document))
+            .options(
+                joinedload(Chunk.version).joinedload(DocumentVersion.document),
+                joinedload(Chunk.section),
+            )
             .where(Chunk.id == chunk_id)
         )
+
+    def search_document_candidates(
+        self, db: Session, *, project_id: str, hint: str, limit: int
+    ) -> list[dict]:
+        """在一个知识库内仅按文件名寻找当前已批准、可搜索的文档。"""
+
+        normalized = normalize_document_name(hint)
+        compact = normalized.replace(" ", "")
+        filename_matches = [
+            Document.normalized_filename.contains(normalized),
+            func.replace(Document.normalized_filename, " ", "").contains(compact),
+            *[
+                Document.normalized_filename.contains(token)
+                for token in meaningful_document_tokens(hint)[:8]
+            ],
+        ]
+        documents = list(
+            db.scalars(
+                select(Document)
+                .join(DocumentVersion, DocumentVersion.document_id == Document.id)
+                .where(
+                    Document.project_id == project_id,
+                    Document.is_deleted.is_(False),
+                    Document.visibility == "public",
+                    DocumentVersion.lifecycle_status == "approved",
+                    DocumentVersion.is_current.is_(True),
+                    DocumentVersion.technical_status == "searchable",
+                    or_(*filename_matches),
+                )
+                .options(selectinload(Document.versions))
+                .limit(500)
+            )
+        )
+        candidates = []
+        for document in documents:
+            score = score_document_name(hint, document.filename)
+            if score <= 0:
+                continue
+            version = next(
+                (
+                    item
+                    for item in document.versions
+                    if item.lifecycle_status == "approved"
+                    and item.is_current
+                    and item.technical_status == "searchable"
+                ),
+                None,
+            )
+            if version:
+                candidates.append(
+                    {
+                        "document_id": document.id,
+                        "project_id": document.project_id,
+                        "filename": document.filename,
+                        "version_id": version.id,
+                        "document_type": document.document_type,
+                        "version_label": version.version_label,
+                        "score": score,
+                    }
+                )
+        return sorted(
+            candidates, key=lambda item: (-float(item["score"]), str(item["filename"]))
+        )[:limit]
+
+    def get_current_outline(
+        self, db: Session, *, document_id: str
+    ) -> tuple[Document | None, list[DocumentSection]]:
+        """返回当前已批准版本的有序章节目录。"""
+
+        document = db.get(Document, document_id)
+        if document is None or document.is_deleted or document.visibility != "public":
+            return None, []
+        version = db.scalar(
+            select(DocumentVersion).where(
+                DocumentVersion.document_id == document_id,
+                DocumentVersion.lifecycle_status == "approved",
+                DocumentVersion.is_current.is_(True),
+                DocumentVersion.technical_status == "searchable",
+            )
+        )
+        if version is None:
+            return document, []
+        sections = list(
+            db.scalars(
+                select(DocumentSection)
+                .where(DocumentSection.version_id == version.id)
+                .order_by(DocumentSection.ordinal)
+            )
+        )
+        return document, sections
+
+    def get_section_context(
+        self, db: Session, *, section_id: str, max_section_chunks: int = 100
+    ) -> tuple[DocumentSection | None, list[Chunk], bool]:
+        """读取当前已批准章节的全部块，并在两端各补一个相邻块。"""
+
+        section = db.scalar(
+            select(DocumentSection)
+            .options(joinedload(DocumentSection.version).joinedload(DocumentVersion.document))
+            .where(DocumentSection.id == section_id)
+        )
+        if section is None:
+            return None, [], False
+        version = section.version
+        document = version.document
+        if (
+            document.is_deleted
+            or document.visibility != "public"
+            or version.lifecycle_status != "approved"
+            or not version.is_current
+            or version.technical_status != "searchable"
+        ):
+            return None, [], False
+        section_ordinals = list(
+            db.scalars(
+                select(Chunk.ordinal)
+                .where(Chunk.section_id == section_id)
+                .order_by(Chunk.ordinal)
+                .limit(max_section_chunks + 1)
+            )
+        )
+        if not section_ordinals:
+            return section, [], False
+        truncated = len(section_ordinals) > max_section_chunks
+        included = section_ordinals[:max_section_chunks]
+        chunks = list(
+            db.scalars(
+                select(Chunk)
+                .options(
+                    joinedload(Chunk.version).joinedload(DocumentVersion.document),
+                    joinedload(Chunk.section),
+                )
+                .where(
+                    Chunk.version_id == version.id,
+                    Chunk.ordinal >= max(0, included[0] - 1),
+                    Chunk.ordinal <= included[-1] + 1,
+                )
+                .order_by(Chunk.ordinal)
+            )
+        )
+        return section, chunks, truncated
 
     def get_download_version(
         self, db: Session, *, document_id: str, version_id: str | None

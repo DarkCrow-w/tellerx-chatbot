@@ -143,7 +143,19 @@ export function documentDownloadUrl(documentId, versionId = null) {
   return versionId ? `${path}?version_id=${encodeURIComponent(versionId)}` : path;
 }
 
-export function askKnowledgeBase({ question, conversationId, projectId }) {
+export function getSectionContext(sectionId) {
+  /** 按需加载引用所在章节及其前后相邻块。 */
+  return requestJson(`/api/v1/sections/${encodeURIComponent(sectionId)}`);
+}
+
+export function askKnowledgeBase({
+  question,
+  conversationId,
+  projectId,
+  documentId = null,
+  documentHint = null,
+  sectionPath = [],
+}) {
   /** 提交一次问答，并把前端命名转换为 API 契约字段。 */
   return requestJson("/api/v1/chat", {
     method: "POST",
@@ -152,6 +164,9 @@ export function askKnowledgeBase({ question, conversationId, projectId }) {
       question,
       conversation_id: conversationId,
       project_ids: projectId ? [projectId] : [],
+      document_id: documentId,
+      document_hint: documentHint,
+      section_path: sectionPath,
     }),
   });
 }

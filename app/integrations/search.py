@@ -12,6 +12,11 @@ from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import Settings
+from app.knowledge.document_scope import (
+    meaningful_document_tokens,
+    normalize_document_name,
+    score_document_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +285,10 @@ class SearchIndex:
             v.is_current,
             (v.technical_status = 'searchable' AND NOT d.is_deleted) AS is_searchable,
             c.heading_path AS title_path,
+            c.section_id,
+            ds.level AS section_level,
+            ds.title AS section_title,
+            c.heading_path AS section_path,
             c.page_number,
             c.sheet_name,
             c.cell_range,
@@ -301,6 +310,7 @@ class SearchIndex:
             JOIN chunks c ON c.id = s.chunk_id
             JOIN document_versions v ON v.id = c.version_id
             JOIN documents d ON d.id = v.document_id
+            LEFT JOIN document_sections ds ON ds.id = c.section_id
         """
 
     @staticmethod
@@ -333,6 +343,7 @@ class SearchIndex:
         statuses: list[str],
         principal_ids: list[str] | None,
         params: dict[str, Any],
+        document_ids: list[str] | None = None,
     ) -> tuple[str, list[str]]:
         """统一拼装项目、状态、可搜索性和 ACL 数据权限范围。"""
 
@@ -348,6 +359,10 @@ class SearchIndex:
             params["project_ids"] = list(dict.fromkeys(project_ids))
             clauses.append("d.project_id IN :project_ids")
             expanding.append("project_ids")
+        if document_ids:
+            params["scope_document_ids"] = list(dict.fromkeys(document_ids))
+            clauses.append("d.id IN :scope_document_ids")
+            expanding.append("scope_document_ids")
         if principal_ids:
             params["principal_ids"] = list(dict.fromkeys(principal_ids))
             clauses.append(
@@ -476,10 +491,14 @@ class SearchIndex:
             f"""
             INSERT INTO chunk_search_index (
                 chunk_id, embedding, embedding_fingerprint,
-                raw_text, lexical_text, exact_terms, record_hash, updated_at
+                raw_text, lexical_text, exact_terms, record_hash,
+                filename_normalized, filename_tokens, section_id, section_path,
+                embedding_input_hash, updated_at
             ) VALUES (
                 :chunk_id, CAST(:embedding AS {self.embedding_sql_type}), :embedding_fingerprint,
-                :raw_text, :lexical_text, :exact_terms, :record_hash, now()
+                :raw_text, :lexical_text, :exact_terms, :record_hash,
+                :filename_normalized, :filename_tokens, :section_id, :section_path,
+                :embedding_input_hash, now()
             )
             ON CONFLICT (chunk_id) DO UPDATE SET
                 embedding = EXCLUDED.embedding,
@@ -488,6 +507,11 @@ class SearchIndex:
                 lexical_text = EXCLUDED.lexical_text,
                 exact_terms = EXCLUDED.exact_terms,
                 record_hash = EXCLUDED.record_hash,
+                filename_normalized = EXCLUDED.filename_normalized,
+                filename_tokens = EXCLUDED.filename_tokens,
+                section_id = EXCLUDED.section_id,
+                section_path = EXCLUDED.section_path,
+                embedding_input_hash = EXCLUDED.embedding_input_hash,
                 updated_at = now()
             """
         )
@@ -507,6 +531,17 @@ class SearchIndex:
                     "exact_terms": exact_terms,
                     "record_hash": document.get("record_hash")
                     or hashlib.sha256(raw_text.encode()).hexdigest(),
+                    "filename_normalized": normalize_document_name(
+                        str(document.get("filename") or "")
+                    ),
+                    "filename_tokens": " ".join(
+                        meaningful_document_tokens(str(document.get("filename") or ""))
+                    ),
+                    "section_id": document.get("section_id"),
+                    "section_path": document.get("section_path")
+                    or document.get("title_path")
+                    or "",
+                    "embedding_input_hash": document.get("embedding_input_hash"),
                 }
             )
         with self.engine.begin() as connection:
@@ -571,6 +606,7 @@ class SearchIndex:
         statuses: list[str],
         top_k: int,
         principal_ids: list[str] | None = None,
+        document_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """执行带精确标识提升、中文信号匹配和 ACL 过滤的词法检索。"""
 
@@ -585,7 +621,9 @@ class SearchIndex:
             "raw_query": normalized,
             "top_k": top_k,
         }
-        scope, expanding = self._scope_clause(project_ids, statuses, principal_ids, params)
+        scope, expanding = self._scope_clause(
+            project_ids, statuses, principal_ids, params, document_ids
+        )
         exact_terms = sorted(
             {
                 *[value.casefold() for value in EXACT_IDENTIFIER.findall(normalized)],
@@ -644,6 +682,7 @@ class SearchIndex:
         statuses: list[str],
         top_k: int,
         principal_ids: list[str] | None = None,
+        document_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """在同一数据权限范围内执行余弦相似度向量检索。"""
 
@@ -652,7 +691,9 @@ class SearchIndex:
             "embedding_fingerprint": self.settings.embedding_fingerprint,
             "top_k": top_k,
         }
-        scope, expanding = self._scope_clause(project_ids, statuses, principal_ids, params)
+        scope, expanding = self._scope_clause(
+            project_ids, statuses, principal_ids, params, document_ids
+        )
         threshold = ""
         if self.settings.vector_min_similarity is not None:
             params["minimum_similarity"] = self.settings.vector_min_similarity
@@ -711,6 +752,116 @@ class SearchIndex:
         with self.engine.connect() as connection:
             rows = connection.execute(self._statement(sql, expanding), params).fetchall()
         return [self._hit(row) for row in rows]
+
+    def document_candidates(
+        self,
+        hint: str,
+        project_ids: list[str],
+        principal_ids: list[str] | None = None,
+        *,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """仅依据文件名和显式范围返回当前已批准文档候选。"""
+
+        normalized = normalize_document_name(hint)
+        tokens = meaningful_document_tokens(hint)
+        if not normalized:
+            return []
+        params: dict[str, Any] = {"candidate_limit": 500}
+        clauses = [
+            "d.is_deleted IS FALSE",
+            "v.lifecycle_status = 'approved'",
+            "v.is_current IS TRUE",
+            "v.technical_status = 'searchable'",
+        ]
+        expanding: list[str] = []
+        if project_ids:
+            params["project_ids"] = list(dict.fromkeys(project_ids))
+            clauses.append("d.project_id IN :project_ids")
+            expanding.append("project_ids")
+        if principal_ids:
+            params["principal_ids"] = list(dict.fromkeys(principal_ids))
+            clauses.append(
+                "(d.visibility = 'public' OR EXISTS (SELECT 1 FROM document_acl acl "
+                "WHERE acl.document_id = d.id AND acl.permission = 'read' "
+                "AND acl.principal_id IN :principal_ids))"
+            )
+            expanding.append("principal_ids")
+        else:
+            clauses.append("d.visibility = 'public'")
+        token_clauses = []
+        for index, token in enumerate(tokens[:8]):
+            key = f"filename_token_{index}"
+            params[key] = f"%{token}%"
+            token_clauses.append(f"d.normalized_filename LIKE :{key}")
+        params["filename_hint"] = f"%{normalized}%"
+        params["filename_compact_hint"] = f"%{normalized.replace(' ', '')}%"
+        filename_matches = [
+            "d.normalized_filename LIKE :filename_hint",
+            "replace(d.normalized_filename, ' ', '') LIKE :filename_compact_hint",
+            *token_clauses,
+        ]
+        clauses.append("(" + " OR ".join(filename_matches) + ")")
+        sql = f"""
+            SELECT d.id AS document_id, d.project_id, d.filename, d.normalized_filename,
+                   d.document_type, v.id AS version_id, v.version_label
+            FROM documents d
+            JOIN document_versions v ON v.document_id = d.id
+            WHERE {' AND '.join(clauses)}
+            ORDER BY d.updated_at DESC, d.id
+            LIMIT :candidate_limit
+        """
+        with self.engine.connect() as connection:
+            rows = connection.execute(self._statement(sql, expanding), params).mappings().all()
+        candidates = []
+        for row in rows:
+            score = score_document_name(hint, str(row["filename"]))
+            if score > 0:
+                candidates.append({**dict(row), "score": score})
+        return sorted(candidates, key=lambda item: (-float(item["score"]), item["filename"]))[
+            :limit
+        ]
+
+    def document_by_id(
+        self,
+        document_id: str,
+        project_ids: list[str],
+        principal_ids: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """在相同权限与版本约束下解析显式文档 ID。"""
+
+        params: dict[str, Any] = {"document_id": document_id}
+        clauses = [
+            "d.id = :document_id",
+            "d.is_deleted IS FALSE",
+            "v.lifecycle_status = 'approved'",
+            "v.is_current IS TRUE",
+            "v.technical_status = 'searchable'",
+        ]
+        expanding: list[str] = []
+        if project_ids:
+            params["project_ids"] = list(dict.fromkeys(project_ids))
+            clauses.append("d.project_id IN :project_ids")
+            expanding.append("project_ids")
+        if principal_ids:
+            params["principal_ids"] = list(dict.fromkeys(principal_ids))
+            clauses.append(
+                "(d.visibility = 'public' OR EXISTS (SELECT 1 FROM document_acl acl "
+                "WHERE acl.document_id = d.id AND acl.permission = 'read' "
+                "AND acl.principal_id IN :principal_ids))"
+            )
+            expanding.append("principal_ids")
+        else:
+            clauses.append("d.visibility = 'public'")
+        sql = f"""
+            SELECT d.id AS document_id, d.project_id, d.filename, d.normalized_filename,
+                   d.document_type, v.id AS version_id, v.version_label, 1.0 AS score
+            FROM documents d JOIN document_versions v ON v.document_id = d.id
+            WHERE {' AND '.join(clauses)} LIMIT 1
+        """
+        with self.engine.connect() as connection:
+            row = connection.execute(self._statement(sql, expanding), params).mappings().first()
+        return dict(row) if row else None
 
     def count_version(self, version_id: str, *, target_index: str | None = None) -> int:
         """统计指定文档版本已发布的分块数量。"""

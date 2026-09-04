@@ -22,6 +22,9 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
             project_ids=request.project_ids,
             conversation_id=request.conversation_id,
             pinned_model=request.pinned_model,
+            document_id=request.document_id,
+            document_hint=request.document_hint,
+            section_path=request.section_path,
         )
     )
 

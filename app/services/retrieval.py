@@ -7,6 +7,7 @@ import logging
 import re
 import time
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from app.core.config import Settings
@@ -27,6 +28,19 @@ if TYPE_CHECKING:
     from app.services.query_understanding import QueryPlan
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class RetrievalOutcome:
+    """检索证据以及可向产品层解释的文档范围决策。"""
+
+    evidence: list[Evidence] = field(default_factory=list)
+    retrieval_intent: str = "global_lookup"
+    resolved_document: dict[str, Any] | None = None
+    resolved_scope: str = "global"
+    retrieval_confidence: float = 1.0
+    clarification_options: list[dict[str, Any]] = field(default_factory=list)
+    failure_reason: str | None = None
 
 
 class Retriever:
@@ -578,6 +592,16 @@ class Retriever:
             document_type=source["document_type"],
             content=source["content"],
             heading_path=source.get("title_path") or source.get("heading_path"),
+            section_id=source.get("section_id"),
+            section_level=source.get("section_level"),
+            breadcrumb=tuple(
+                part.strip()
+                for part in str(
+                    source.get("section_path") or source.get("title_path") or ""
+                ).split(">")
+                if part.strip()
+            ),
+            location_confidence=(1.0 if int(source.get("section_level") or 0) > 0 else 0.7),
             page_number=source.get("page_number"),
             sheet_name=source.get("sheet_name"),
             cell_range=source.get("cell_range"),
@@ -760,25 +784,21 @@ class Retriever:
         project_ids: list[str],
         statuses: list[str],
         principal_ids: list[str] | None = None,
+        document_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """对指定文档状态执行词法与向量召回，并在允许时降级为纯 BM25。"""
 
+        scope_kwargs = {"document_ids": document_ids} if document_ids is not None else {}
         lexical = self.index.lexical_search(
-            query,
-            project_ids,
-            statuses,
-            self.settings.retrieval_top_k,
-            principal_ids,
+            query, project_ids, statuses, self.settings.retrieval_top_k, principal_ids,
+            **scope_kwargs,
         )
         vector_hits: list[dict[str, Any]] = []
         try:
             vector = self._query_embedding(query)
             vector_hits = self.index.vector_search(
-                vector,
-                project_ids,
-                statuses,
-                self.settings.retrieval_top_k,
-                principal_ids,
+                vector, project_ids, statuses, self.settings.retrieval_top_k, principal_ids,
+                **scope_kwargs,
             )
         except Exception as exc:
             if not self.settings.allow_bm25_only:
@@ -803,6 +823,7 @@ class Retriever:
         project_ids: list[str],
         statuses: list[str],
         principal_ids: list[str] | None = None,
+        document_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """用精确词法查询逐个扩展已获证据支持的跨文档标识。
 
@@ -817,12 +838,10 @@ class Retriever:
             if normalized.casefold() in seen or not EXACT_IDENTIFIER.fullmatch(normalized):
                 continue
             seen.add(normalized.casefold())
+            scope_kwargs = {"document_ids": document_ids} if document_ids is not None else {}
             hits = self.index.lexical_search(
-                normalized,
-                project_ids,
-                statuses,
-                max(4, self.settings.evidence_top_k),
-                principal_ids,
+                normalized, project_ids, statuses, max(4, self.settings.evidence_top_k),
+                principal_ids, **scope_kwargs,
             )
             if hits:
                 channels.append(hits)
@@ -863,17 +882,136 @@ class Retriever:
         )
         return result
 
+    def search_with_scope(
+        self,
+        query: str,
+        project_ids: list[str],
+        principal_ids: list[str] | None = None,
+        query_plan: QueryPlan | None = None,
+        *,
+        document_id: str | None = None,
+        document_hint: str | None = None,
+        section_path: list[str] | None = None,
+    ) -> RetrievalOutcome:
+        """先解析显式文档范围；没有可靠范围时完整保留全库检索。"""
+
+        if not getattr(self.settings, "hierarchical_retrieval_enabled", True):
+            return RetrievalOutcome(
+                evidence=self.search(query, project_ids, principal_ids, query_plan)
+            )
+        hint = document_hint or (query_plan.document_hint if query_plan else None)
+        resolved: dict[str, Any] | None = None
+        if document_id:
+            resolved = self.index.document_by_id(document_id, project_ids, principal_ids)
+            if resolved is None:
+                logger.info("文档范围解析失败 reason=document_not_found document_id=%s", document_id)
+                return RetrievalOutcome(
+                    retrieval_intent="document_lookup",
+                    resolved_scope="document_not_found",
+                    retrieval_confidence=0.0,
+                    failure_reason="document_not_found",
+                )
+        elif hint:
+            candidates = self.index.document_candidates(
+                hint, project_ids, principal_ids, limit=8
+            )
+            if not candidates:
+                logger.info("文档范围解析失败 reason=document_not_found hint=%s", hint)
+                return RetrievalOutcome(
+                    retrieval_intent="document_lookup",
+                    resolved_scope="document_not_found",
+                    retrieval_confidence=0.0,
+                    failure_reason="document_not_found",
+                )
+            top = candidates[0]
+            top_score = float(top["score"])
+            runner_up = float(candidates[1]["score"]) if len(candidates) > 1 else 0.0
+            if (
+                len(candidates) == 1
+                or (top_score >= 0.98 and runner_up < 0.95)
+                or top_score - runner_up >= 0.12
+            ):
+                resolved = top
+            else:
+                logger.info(
+                    "文档范围需要澄清 hint=%s candidate_count=%d top_score=%.3f",
+                    hint,
+                    len(candidates),
+                    top_score,
+                )
+                return RetrievalOutcome(
+                    retrieval_intent="ambiguous",
+                    resolved_scope="clarification_required",
+                    retrieval_confidence=top_score,
+                    clarification_options=candidates[:5],
+                    failure_reason="ambiguous_document",
+                )
+        if resolved is None:
+            global_intent = (
+                query_plan.retrieval_intent
+                if query_plan
+                and query_plan.retrieval_intent in {"global_lookup", "cross_source"}
+                else "global_lookup"
+            )
+            return RetrievalOutcome(
+                evidence=self.search(query, project_ids, principal_ids, query_plan),
+                retrieval_intent=global_intent,
+            )
+
+        scoped_query = (
+            query_plan.document_question
+            if query_plan and query_plan.document_question
+            else query
+        )
+        hints = tuple(section_path or (query_plan.section_hints if query_plan else ()))
+        evidence = self._search_once(
+            scoped_query,
+            project_ids,
+            principal_ids,
+            query_plan,
+            document_ids=[str(resolved["document_id"])],
+            section_hints=hints,
+        )
+        resolved_id = str(resolved["document_id"])
+        if any(item.document_id != resolved_id for item in evidence):
+            logger.error("文档范围外证据已拦截 document_id=%s", resolved_id)
+            return RetrievalOutcome(
+                retrieval_intent="document_lookup",
+                resolved_document=resolved,
+                resolved_scope=str(resolved.get("filename") or resolved_id),
+                retrieval_confidence=float(resolved.get("score") or 1.0),
+                failure_reason="scope_violation",
+            )
+        logger.info(
+            "文档范围解析完成 document_id=%s filename=%s evidence_count=%d",
+            resolved_id,
+            resolved.get("filename"),
+            len(evidence),
+        )
+        return RetrievalOutcome(
+            evidence=evidence,
+            retrieval_intent="document_lookup",
+            resolved_document=resolved,
+            resolved_scope=str(resolved.get("filename") or resolved_id),
+            retrieval_confidence=float(resolved.get("score") or 1.0),
+        )
+
     def _search_once(
         self,
         query: str,
         project_ids: list[str],
         principal_ids: list[str] | None,
         query_plan: QueryPlan | None,
+        *,
+        document_ids: list[str] | None = None,
+        section_hints: tuple[str, ...] = (),
     ) -> list[Evidence]:
         """执行一次完整检索：召回、关联扩展、重排、覆盖修复与证据整形。"""
 
         query = normalize_query(query)
-        fused = self._retrieve_for_statuses(query, project_ids, ["approved"], principal_ids)
+        fused = self._retrieve_for_statuses(
+            query, project_ids, ["approved"], principal_ids, document_ids
+        )
         focus_terms = list(query_plan.subjects) if query_plan else _query_subject_signals(query)
         focus_query = " ".join(focus_terms)
         retrieval_queries = (
@@ -886,14 +1024,17 @@ class Retriever:
             if not retrieval_query or retrieval_query.casefold() == query.casefold():
                 continue
             focused = self._retrieve_for_statuses(
-                retrieval_query, project_ids, ["approved"], principal_ids
+                retrieval_query, project_ids, ["approved"], principal_ids, document_ids
             )
             fused = self._merge_fused(fused, focused)
+        if section_hints:
+            fused = self._boost_section_matches(fused, section_hints)
         semantic_anchors = query_plan.anchor_signals if query_plan else ()
         fused = self._boost_anchor_matches(fused, semantic_anchors)
         if (
             query_plan
             and query_plan.subjects
+            and document_ids is None
             and not self._has_grounded_subject(fused, query_plan.subject_anchor_signals)
         ):
             logger.info("Semantic subject was not grounded in any candidate; abstaining")
@@ -910,6 +1051,7 @@ class Retriever:
                 project_ids,
                 ["approved"],
                 principal_ids,
+                document_ids,
             )
             fused = self._merge_fused(fused, exact_expansion)
             expanded_query = "\n".join(
@@ -922,17 +1064,9 @@ class Retriever:
                 if part
             )
             expanded = self._retrieve_for_statuses(
-                expanded_query, project_ids, ["approved"], principal_ids
+                expanded_query, project_ids, ["approved"], principal_ids, document_ids
             )
             fused = self._merge_fused(fused, expanded)
-        if len(fused) < 3:
-            fallback = self._retrieve_for_statuses(
-                query, project_ids, ["approved", "draft"], principal_ids
-            )
-            by_id = {row["hit"]["_source"]["chunk_id"]: row for row in fused}
-            for row in fallback:
-                by_id.setdefault(row["hit"]["_source"]["chunk_id"], row)
-            fused = sorted(by_id.values(), key=lambda row: row["score"], reverse=True)
         fused = self._deduplicate_content(fused)
         fused = self._enforce_exact_identifiers(query, fused, linked_identifiers)
         fused = self._prefer_complete_entity_matches(query, fused, linked_identifiers)
@@ -972,3 +1106,20 @@ class Retriever:
             semantic_context=semantic_context,
             semantic_anchors=semantic_anchors,
         )
+
+    @staticmethod
+    def _boost_section_matches(
+        rows: list[dict[str, Any]], section_hints: tuple[str, ...]
+    ) -> list[dict[str, Any]]:
+        """把用户明确提及的标题片段作为软加权，不把它变成硬过滤。"""
+
+        hints = [normalize_query(value).casefold() for value in section_hints if value.strip()]
+        boosted = []
+        for row in rows:
+            source = row.get("hit", {}).get("_source", {})
+            path = str(source.get("section_path") or source.get("title_path") or "").casefold()
+            matches = sum(hint in path for hint in hints)
+            boosted.append(
+                {**row, "score": float(row.get("score") or 0.0) * (1 + 0.2 * matches)}
+            )
+        return sorted(boosted, key=lambda item: item["score"], reverse=True)

@@ -18,6 +18,10 @@ class Evidence:
     document_type: str
     content: str
     heading_path: str | None = None
+    section_id: str | None = None
+    section_level: int | None = None
+    breadcrumb: tuple[str, ...] = ()
+    location_confidence: float | None = None
     page_number: int | None = None
     sheet_name: str | None = None
     cell_range: str | None = None

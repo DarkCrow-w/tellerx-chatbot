@@ -58,6 +58,7 @@ class Document(Base):
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
     logical_key: Mapped[str] = mapped_column(String(500), nullable=False, default=new_id)
     filename: Mapped[str] = mapped_column(String(500), nullable=False)
+    normalized_filename: Mapped[str] = mapped_column(String(500), nullable=False, default="")
     document_type: Mapped[str] = mapped_column(String(100), nullable=False)
     owner: Mapped[str | None] = mapped_column(String(200))
     source_type: Mapped[str] = mapped_column(String(50), default="upload")
@@ -113,6 +114,38 @@ class DocumentVersion(Base):
     chunks: Mapped[list[Chunk]] = relationship(
         back_populates="version", cascade="all, delete-orphan"
     )
+    sections: Mapped[list[DocumentSection]] = relationship(
+        back_populates="version", cascade="all, delete-orphan"
+    )
+
+
+class DocumentSection(Base):
+    """文档版本内可遍历的标题节点；根节点承载无标题正文。"""
+
+    __tablename__ = "document_sections"
+    __table_args__ = (
+        Index("ix_document_section_version_ordinal", "version_id", "ordinal", unique=True),
+        Index("ix_document_section_version_key", "version_id", "section_key", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    version_id: Mapped[str] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="CASCADE"), index=True
+    )
+    parent_section_id: Mapped[str | None] = mapped_column(
+        ForeignKey("document_sections.id", ondelete="CASCADE"), index=True
+    )
+    section_key: Mapped[str] = mapped_column(String(500), nullable=False)
+    level: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(1000), nullable=False)
+    normalized_title: Mapped[str] = mapped_column(String(1000), nullable=False)
+    heading_path: Mapped[str] = mapped_column(String(2000), nullable=False, default="")
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    page_start: Mapped[int | None] = mapped_column(Integer)
+    page_end: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    version: Mapped[DocumentVersion] = relationship(back_populates="sections")
 
 
 class Chunk(Base):
@@ -123,6 +156,9 @@ class Chunk(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     version_id: Mapped[str] = mapped_column(ForeignKey("document_versions.id"), index=True)
+    section_id: Mapped[str | None] = mapped_column(
+        ForeignKey("document_sections.id", ondelete="SET NULL"), index=True
+    )
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
     heading_path: Mapped[str | None] = mapped_column(String(1000))
     page_number: Mapped[int | None] = mapped_column(Integer)
@@ -130,6 +166,12 @@ class Chunk(Base):
     cell_range: Mapped[str | None] = mapped_column(String(100))
     content: Mapped[str] = mapped_column(Text, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    embedding_input_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+        default=lambda context: context.get_current_parameters().get("content_hash", ""),
+    )
     record_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True, default=new_id)
     parent_chunk_id: Mapped[str | None] = mapped_column(String(36))
     previous_chunk_id: Mapped[str | None] = mapped_column(String(36))
@@ -138,6 +180,7 @@ class Chunk(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     version: Mapped[DocumentVersion] = relationship(back_populates="chunks")
+    section: Mapped[DocumentSection | None] = relationship()
 
 
 class IngestionJob(Base):
@@ -282,12 +325,21 @@ class EmbeddingCache(Base):
     __tablename__ = "embedding_cache"
     __table_args__ = (
         Index(
-            "ix_embedding_content_fingerprint", "content_hash", "embedding_fingerprint", unique=True
+            "ix_embedding_input_fingerprint",
+            "embedding_input_hash",
+            "embedding_fingerprint",
+            unique=True,
         ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    embedding_input_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+        default=lambda context: context.get_current_parameters().get("content_hash", ""),
+    )
     embedding_fingerprint: Mapped[str] = mapped_column(
         ForeignKey("embedding_models.fingerprint"), nullable=False, index=True
     )

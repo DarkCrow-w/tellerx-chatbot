@@ -19,6 +19,20 @@ from pypdf import PdfReader
 from app.knowledge.chunking import ParsedUnit
 
 
+def _section_values(headings: list[tuple[str, str, int]]) -> dict[str, object]:
+    """Convert the active heading stack into stable parser metadata."""
+
+    titles = tuple(title for title, _, _ in headings)
+    return {
+        "heading_path": " > ".join(titles),
+        "section_key": headings[-1][1] if headings else None,
+        "parent_section_key": headings[-2][1] if len(headings) > 1 else None,
+        "section_level": headings[-1][2] if headings else 0,
+        "section_title": titles[-1] if titles else None,
+        "section_path": titles,
+    }
+
+
 class UnsupportedDocument(ValueError):
     """文件格式不在支持范围内，或缺少必要的转换工具。"""
 
@@ -30,7 +44,7 @@ class EmptyDocument(ValueError):
 class DocumentParser:
     """按文件格式解析文档，同时尽可能保留标题、页码和表格位置。"""
 
-    revision: ClassVar[str] = "v3"
+    revision: ClassVar[str] = "v4"
     allowed_suffixes: ClassVar[set[str]] = {
         ".docx",
         ".xlsx",
@@ -90,14 +104,15 @@ class DocumentParser:
         """按标题层级切分 Markdown，并把完整标题路径附到正文。"""
 
         units: list[ParsedUnit] = []
-        headings: list[str] = []
+        headings: list[tuple[str, str, int]] = []
         buffer: list[str] = []
+        heading_sequence = 0
 
         def flush() -> None:
             """把当前标题下积累的正文提交为一个逻辑单元。"""
 
             if buffer:
-                units.append(ParsedUnit(text="\n".join(buffer), heading_path=" > ".join(headings)))
+                units.append(ParsedUnit(text="\n".join(buffer), **_section_values(headings)))
                 buffer.clear()
 
         for line in text.splitlines():
@@ -107,7 +122,8 @@ class DocumentParser:
                 level = len(stripped) - len(stripped.lstrip("#"))
                 title = stripped[level:].strip()
                 headings[:] = headings[: level - 1]
-                headings.append(title)
+                heading_sequence += 1
+                headings.append((title, f"heading-{heading_sequence}", level))
             else:
                 buffer.append(line)
         flush()
@@ -119,17 +135,16 @@ class DocumentParser:
 
         document = WordDocument(path)
         units: list[ParsedUnit] = []
-        headings: list[str] = []
+        headings: list[tuple[str, str, int]] = []
         paragraphs: list[str] = []
         table_index = 0
+        heading_sequence = 0
 
         def flush() -> None:
             """在标题或表格边界处提交已积累的 Word 段落。"""
 
             if paragraphs:
-                units.append(
-                    ParsedUnit(text="\n".join(paragraphs), heading_path=" > ".join(headings))
-                )
+                units.append(ParsedUnit(text="\n".join(paragraphs), **_section_values(headings)))
                 paragraphs.clear()
 
         for block in document.iter_inner_content():
@@ -145,7 +160,8 @@ class DocumentParser:
                     except ValueError:
                         level = 1
                     headings[:] = headings[: level - 1]
-                    headings.append(text)
+                    heading_sequence += 1
+                    headings.append((text, f"heading-{heading_sequence}", level))
                 else:
                     paragraphs.append(text)
             elif isinstance(block, Table):
@@ -157,13 +173,15 @@ class DocumentParser:
                 ]
                 if rows:
                     lines = [" | ".join(row) for row in rows]
+                    section = _section_values(headings)
+                    section["heading_path"] = (
+                        f"{section['heading_path']} > Table {table_index}".strip(" >")
+                    )
                     units.append(
                         ParsedUnit(
                             text="\n".join(lines),
-                            heading_path=(
-                                f"{' > '.join(headings)} > Table {table_index}".strip(" >")
-                            ),
                             is_table=True,
+                            **section,
                         )
                     )
         flush()
@@ -186,7 +204,13 @@ class DocumentParser:
             if text.strip():
                 units.append(
                     ParsedUnit(
-                        text=text, page_number=page_number, heading_path=f"Page {page_number}"
+                        text=text,
+                        page_number=page_number,
+                        heading_path=f"Page {page_number}",
+                        section_key=f"page-{page_number}",
+                        section_level=1,
+                        section_title=f"Page {page_number}",
+                        section_path=(f"Page {page_number}",),
                     )
                 )
         return units
@@ -199,17 +223,16 @@ class DocumentParser:
         for element in soup(["script", "style", "noscript"]):
             element.decompose()
         units: list[ParsedUnit] = []
-        headings: list[str] = []
+        headings: list[tuple[str, str, int]] = []
         buffer: list[str] = []
+        heading_sequence = 0
 
         def flush() -> None:
             """提交当前 HTML 标题层级下的可见正文。"""
 
             text = "\n".join(buffer).strip()
             if text:
-                units.append(
-                    ParsedUnit(text=html.unescape(text), heading_path=" > ".join(headings))
-                )
+                units.append(ParsedUnit(text=html.unescape(text), **_section_values(headings)))
             buffer.clear()
 
         for element in soup.find_all(
@@ -234,7 +257,14 @@ class DocumentParser:
                 flush()
                 level = int(element.name[1])
                 headings[:] = headings[: level - 1]
-                headings.append(element.get_text(" ", strip=True))
+                heading_sequence += 1
+                headings.append(
+                    (
+                        element.get_text(" ", strip=True),
+                        f"heading-{heading_sequence}",
+                        level,
+                    )
+                )
             elif element.name == "table":
                 flush()
                 rows = []
@@ -247,7 +277,7 @@ class DocumentParser:
                 if rows:
                     units.append(
                         ParsedUnit(
-                            text="\n".join(rows), heading_path=" > ".join(headings), is_table=True
+                            text="\n".join(rows), is_table=True, **_section_values(headings)
                         )
                     )
             else:
@@ -326,6 +356,10 @@ class DocumentParser:
                 ParsedUnit(
                     text="\n".join(lines),
                     heading_path=f"Worksheet: {sheet_name}",
+                    section_key=f"worksheet:{sheet_name}",
+                    section_level=1,
+                    section_title=f"Worksheet: {sheet_name}",
+                    section_path=(f"Worksheet: {sheet_name}",),
                     sheet_name=sheet_name,
                     cell_range=(
                         f"A{first_row}:{get_column_letter(max_column)}{last_row}"

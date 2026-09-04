@@ -7,7 +7,7 @@ from typing import Protocol
 
 from sqlalchemy.orm import Session
 
-from app.application.errors import InvalidRequestError, ResourceNotFoundError, UpstreamServiceError
+from app.application.errors import ResourceNotFoundError, UpstreamServiceError
 from app.contracts.schemas import ChatResponse, FeedbackIn
 from app.repositories.chat import ChatRepository
 from app.services.answer_contract import AnswerValidationError
@@ -25,6 +25,9 @@ class GroundedAnswerService(Protocol):
         project_ids: list[str],
         conversation_id: str | None,
         pinned_model: str | None,
+        document_id: str | None = None,
+        document_hint: str | None = None,
+        section_path: list[str] | None = None,
     ) -> ChatResponse: ...
 
 
@@ -48,24 +51,28 @@ class ChatApplicationService:
         project_ids: list[str],
         conversation_id: str | None,
         pinned_model: str | None,
+        document_id: str | None = None,
+        document_hint: str | None = None,
+        section_path: list[str] | None = None,
     ) -> ChatResponse:
         """确定知识库范围后执行证据约束问答。"""
 
         scope = list(dict.fromkeys(project_ids))
-        if not scope:
-            # 只读取两个 ID 即可判断是否存在歧义，无需加载全部项目。
-            available = self.repository.list_project_ids(db, limit=2)
-            if len(available) > 1:
-                raise InvalidRequestError("存在多个知识库项目，请先选择一个项目再提问。")
-            scope = available
+        # 空列表是明确的“全部知识库”范围；搜索层仍逐文档执行 ACL 约束。
         try:
-            return self.answering_provider().answer(
-                db,
-                question=question.strip(),
-                project_ids=scope,
-                conversation_id=conversation_id,
-                pinned_model=pinned_model,
-            )
+            arguments = {
+                "question": question.strip(),
+                "project_ids": scope,
+                "conversation_id": conversation_id,
+                "pinned_model": pinned_model,
+            }
+            if document_id or document_hint or section_path:
+                arguments.update(
+                    document_id=document_id,
+                    document_hint=document_hint,
+                    section_path=section_path,
+                )
+            return self.answering_provider().answer(db, **arguments)
         except NoModelAvailable as exc:
             raise UpstreamServiceError(str(exc)) from exc
         except AnswerValidationError as exc:

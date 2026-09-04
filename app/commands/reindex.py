@@ -20,6 +20,7 @@ from app.db.models import (
     ChunkEmbedding,
     Document,
     DocumentVersion,
+    IngestionJob,
 )
 from app.integrations.search import SearchIndex
 from app.integrations.storage import LocalObjectStorage
@@ -96,21 +97,29 @@ def _ensure_embeddings(
     *,
     bm25_only: bool,
 ) -> None:
-    """为缺失分块补齐向量缓存关系；BM25-only 模式直接跳过。"""
+    """刷新上下文化输入身份，并为缺失分块补齐当前向量空间关系。"""
 
+    text_chunks = [_as_text_chunk(chunk) for chunk in chunks]
+    document = chunks[0].version.document
+    ingestion._prepare_embedding_inputs(text_chunks, document)
+    text_by_chunk_id = {
+        chunk.id: text_chunk for chunk, text_chunk in zip(chunks, text_chunks)
+    }
+    for chunk, text_chunk in zip(chunks, text_chunks):
+        chunk.embedding_input_hash = text_chunk.embedding_input_hash or chunk.content_hash
     if bm25_only:
+        db.commit()
         return
     missing = _missing_embedding_chunks(db, chunks, settings.embedding_fingerprint)
     if not missing:
+        db.commit()
         return
+    missing_text_chunks = [text_by_chunk_id[chunk.id] for chunk in missing]
     cache_by_hash = ingestion._embeddings(
-        db,
-        [_as_text_chunk(chunk) for chunk in missing],
-        [],
-        version_id=missing[0].version_id,
+        db, missing_text_chunks, [], version_id=missing[0].version_id
     )
-    for chunk in missing:
-        cached = cache_by_hash.get(chunk.content_hash)
+    for chunk, text_chunk in zip(missing, missing_text_chunks):
+        cached = cache_by_hash.get(text_chunk.embedding_input_hash)
         if cached is not None:
             db.add(
                 ChunkEmbedding(
@@ -190,6 +199,32 @@ def _rebuild(
     return expected_total, pruned
 
 
+def _reparse_versions(
+    db: Session,
+    *,
+    ingestion: IngestionService,
+    indexer: IndexingService,
+) -> int:
+    """通过正式入库链路重建章节、分块和上下文化向量。"""
+
+    versions = _eligible_versions(db)
+    completed = 0
+    for version in versions:
+        job = IngestionJob(
+            document_id=version.document_id,
+            version_id=version.id,
+            status="running",
+            stage="starting",
+        )
+        db.add(job)
+        db.commit()
+        event_id = ingestion.process(db, job.id)
+        if event_id is not None:
+            indexer.publish_event(db, event_id)
+            completed += 1
+    return completed
+
+
 def main() -> None:
     """从数据库事实表离线重建全部词法与向量搜索投影。"""
 
@@ -197,6 +232,11 @@ def main() -> None:
         description="Rebuild PostgreSQL full-text and pgvector search rows"
     )
     parser.add_argument("--bm25-only", action="store_true")
+    parser.add_argument(
+        "--reparse",
+        action="store_true",
+        help="rebuild section trees and contextual chunks from immutable source files",
+    )
     args = parser.parse_args()
 
     settings = get_settings()
@@ -218,6 +258,11 @@ def main() -> None:
     )
     with SessionLocal() as db:
         try:
+            reparsed = (
+                _reparse_versions(db, ingestion=ingestion, indexer=indexer)
+                if args.reparse
+                else 0
+            )
             expected_total, pruned = _rebuild(
                 db,
                 settings=settings,
@@ -249,6 +294,7 @@ def main() -> None:
                 "pruned_rows": pruned,
                 "index": index.trace_index_name(),
                 "bm25_only": args.bm25_only,
+                "reparsed_versions": reparsed,
                 "elapsed_seconds": round(time.perf_counter() - started, 3),
             },
             ensure_ascii=False,

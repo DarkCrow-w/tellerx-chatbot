@@ -207,6 +207,8 @@ class IndexingService:
                 "is_current": version.lifecycle_status == "approved",
                 "is_searchable": version.lifecycle_status != "deprecated",
                 "title_path": chunk.heading_path,
+                "section_id": chunk.section_id,
+                "section_path": chunk.heading_path,
                 "page_number": chunk.page_number,
                 "sheet_name": chunk.sheet_name,
                 "cell_range": chunk.cell_range,
@@ -216,6 +218,7 @@ class IndexingService:
                 "next_chunk_id": chunk.next_chunk_id,
                 "content": chunk.content,
                 "content_hash": chunk.content_hash,
+                "embedding_input_hash": chunk.embedding_input_hash,
                 "record_hash": chunk.record_hash,
             }
             cache = cache_by_chunk.get(chunk.id)

@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://tellerx:tellerx@127.0.0.1:5432/tellerx"
     search_backend: str = "postgresql-pgvector-fts"
     postgres_search_table: str = "chunk_search_index"
-    postgres_search_schema_version: int = 1
+    postgres_search_schema_version: int = 2
     pgvector_hnsw_ef_search: int = 200
     storage_root: Path = Path(".local-data/knowledge")
 
@@ -69,7 +69,7 @@ class Settings(BaseSettings):
             "qwen_embedding_dimensions",
         ),
     )
-    embedding_preprocess_version: str = "normalized-text-v1"
+    embedding_preprocess_version: str = "hierarchical-context-v2"
     rerank_enabled: bool = False
     model_api_timeout_seconds: float = Field(
         default=60.0,
@@ -105,6 +105,7 @@ class Settings(BaseSettings):
     query_embedding_cache_size: int = 500
     query_embedding_cache_ttl_seconds: int = 3600
     semantic_query_understanding_enabled: bool = True
+    hierarchical_retrieval_enabled: bool = True
     query_plan_cache_size: int = 500
     query_plan_cache_ttl_seconds: int = 3600
     prompt_version: str = "grounded-qa-v1"

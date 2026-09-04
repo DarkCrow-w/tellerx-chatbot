@@ -17,6 +17,11 @@ class ParsedUnit:
     sheet_name: str | None = None
     cell_range: str | None = None
     is_table: bool = False
+    section_key: str | None = None
+    parent_section_key: str | None = None
+    section_level: int = 0
+    section_title: str | None = None
+    section_path: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -31,6 +36,13 @@ class TextChunk:
     page_number: int | None
     sheet_name: str | None
     cell_range: str | None
+    section_key: str | None = None
+    parent_section_key: str | None = None
+    section_level: int = 0
+    section_title: str | None = None
+    section_path: tuple[str, ...] = ()
+    embedding_input: str | None = None
+    embedding_input_hash: str | None = None
 
 
 _CJK = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
@@ -122,6 +134,11 @@ def chunk_units(
                     page_number=unit.page_number,
                     sheet_name=unit.sheet_name,
                     cell_range=unit.cell_range,
+                    section_key=unit.section_key,
+                    parent_section_key=unit.parent_section_key,
+                    section_level=unit.section_level,
+                    section_title=unit.section_title,
+                    section_path=unit.section_path,
                 )
             )
             ordinal += 1

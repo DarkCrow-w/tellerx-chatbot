@@ -20,17 +20,21 @@ from app.application.errors import (
 )
 from app.contracts.schemas import (
     BulkDeleteDocumentsOut,
+    DocumentCandidateOut,
     DocumentCapabilitiesOut,
     DocumentPageOut,
+    DocumentSectionOut,
     DocumentSummaryOut,
     JobOut,
     ProjectCleanupOut,
+    SectionContextOut,
     SourceOut,
     UploadResponse,
     VersionOut,
 )
 from app.core.config import Settings
 from app.db.models import DocumentVersion, IngestionJob, Project
+from app.knowledge.document_scope import has_meaningful_document_hint
 from app.knowledge.parsers import DocumentParser
 from app.repositories.documents import DocumentRepository
 
@@ -228,6 +232,49 @@ class DocumentApplicationService:
                 )
             )
         return DocumentPageOut(items=items, total=total, limit=limit, offset=offset)
+
+    def search_document_candidates(
+        self, db: Session, *, project_id: str, hint: str, limit: int
+    ) -> list[DocumentCandidateOut]:
+        """返回可解释的文件名片段候选，不读取正文参与判断。"""
+
+        if self.repository.get_project(db, project_id) is None:
+            raise ResourceNotFoundError("Project not found")
+        if not has_meaningful_document_hint(hint):
+            raise InvalidRequestError("Document hint is too generic")
+        return [
+            DocumentCandidateOut.model_validate(item)
+            for item in self.repository.search_document_candidates(
+                db, project_id=project_id, hint=hint.strip(), limit=limit
+            )
+        ]
+
+    def document_outline(
+        self, db: Session, document_id: str
+    ) -> list[DocumentSectionOut]:
+        """读取文档当前有效版本的完整有序章节目录。"""
+
+        document, sections = self.repository.get_current_outline(
+            db, document_id=document_id
+        )
+        if document is None:
+            raise ResourceNotFoundError("Document not found")
+        return [DocumentSectionOut.model_validate(item, from_attributes=True) for item in sections]
+
+    def section_context(self, db: Session, section_id: str) -> SectionContextOut:
+        """返回章节原文和前后相邻块，供来源卡片按需展开。"""
+
+        section, chunks, truncated = self.repository.get_section_context(
+            db, section_id=section_id
+        )
+        if section is None:
+            raise ResourceNotFoundError("Section not found")
+        return SectionContextOut(
+            section=DocumentSectionOut.model_validate(section, from_attributes=True),
+            filename=section.version.document.filename,
+            chunks=[self._source_out(chunk) for chunk in chunks],
+            truncated=truncated,
+        )
 
     def upload(self, db: Session, command: UploadDocumentCommand) -> UploadDocumentResult:
         """保存不可变原始文件，并创建或复用文档版本和入库任务。"""
@@ -456,8 +503,24 @@ class DocumentApplicationService:
         """返回引用分块的连续原文和来源定位信息。"""
 
         chunk = self.repository.get_source_chunk(db, chunk_id)
-        if chunk is None or chunk.version.document.is_deleted:
+        if chunk is None:
             raise ResourceNotFoundError("Source not found")
+        version = chunk.version
+        document = version.document
+        if (
+            document.is_deleted
+            or document.visibility != "public"
+            or version.lifecycle_status != "approved"
+            or not version.is_current
+            or version.technical_status != "searchable"
+        ):
+            raise ResourceNotFoundError("Source not found")
+        return self._source_out(chunk)
+
+    @staticmethod
+    def _source_out(chunk) -> SourceOut:
+        """把已加载的分块转换为包含章节定位的公开来源。"""
+
         version = chunk.version
         return SourceOut(
             chunk_id=chunk.id,
@@ -466,6 +529,16 @@ class DocumentApplicationService:
             filename=version.document.filename,
             content=chunk.content,
             heading_path=chunk.heading_path,
+            section_id=chunk.section_id,
+            breadcrumb=(
+                [part.strip() for part in chunk.heading_path.split(">") if part.strip()]
+                if chunk.heading_path
+                else []
+            ),
+            section_level=chunk.section.level if chunk.section else None,
+            location_confidence=(
+                1.0 if chunk.section is not None and chunk.section.level > 0 else 0.7
+            ),
             page_number=chunk.page_number,
             sheet_name=chunk.sheet_name,
             cell_range=chunk.cell_range,

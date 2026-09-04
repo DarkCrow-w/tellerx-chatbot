@@ -5,10 +5,12 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 LifecycleStatus = Literal["draft", "approved", "deprecated"]
-AnswerStatus = Literal["answered", "insufficient_evidence", "conflict"]
+AnswerStatus = Literal[
+    "answered", "insufficient_evidence", "conflict", "clarification_required"
+]
 
 
 class ProjectOut(BaseModel):
@@ -157,6 +159,47 @@ class ChatRequest(BaseModel):
     conversation_id: str | None = None
     project_ids: list[str] = Field(default_factory=list)
     pinned_model: str | None = None
+    document_id: str | None = None
+    document_hint: str | None = Field(default=None, max_length=500)
+    section_path: list[str] = Field(default_factory=list, max_length=12)
+
+
+class ResolvedDocumentOut(BaseModel):
+    """被文件名范围解析锁定的当前有效文档。"""
+
+    document_id: str
+    id: str | None = None
+    project_id: str
+    filename: str
+    version_id: str
+    document_type: str | None = None
+    version_label: str | None = None
+    score: float | None = None
+
+    @model_validator(mode="after")
+    def expose_compatible_id(self) -> ResolvedDocumentOut:
+        """同时提供契约示例中的 id 和内部稳定的 document_id。"""
+
+        if self.id is None:
+            self.id = self.document_id
+        return self
+
+
+class DocumentCandidateOut(ResolvedDocumentOut):
+    """名称接近、需要用户选择的候选文档。"""
+
+
+class DocumentSectionOut(BaseModel):
+    """前端目录树使用的单个章节节点。"""
+
+    id: str
+    parent_section_id: str | None = None
+    level: int
+    title: str
+    heading_path: str
+    ordinal: int
+    page_start: int | None = None
+    page_end: int | None = None
 
 
 class CitationOut(BaseModel):
@@ -167,6 +210,10 @@ class CitationOut(BaseModel):
     filename: str
     document_status: str
     heading_path: str | None = None
+    section_id: str | None = None
+    breadcrumb: list[str] = Field(default_factory=list)
+    section_level: int | None = None
+    location_confidence: float | None = None
     page_number: int | None = None
     sheet_name: str | None = None
     cell_range: str | None = None
@@ -192,6 +239,13 @@ class ChatResponse(BaseModel):
     conversation_id: str
     message_id: str
     trace_id: str
+    retrieval_intent: Literal[
+        "document_lookup", "global_lookup", "cross_source", "ambiguous"
+    ] = "global_lookup"
+    resolved_document: ResolvedDocumentOut | None = None
+    resolved_scope: str = "global"
+    retrieval_confidence: float = 1.0
+    clarification_options: list[DocumentCandidateOut] = Field(default_factory=list)
 
 
 class FeedbackIn(BaseModel):
@@ -223,9 +277,22 @@ class SourceOut(BaseModel):
     filename: str
     content: str
     heading_path: str | None = None
+    section_id: str | None = None
+    breadcrumb: list[str] = Field(default_factory=list)
+    section_level: int | None = None
+    location_confidence: float | None = None
     page_number: int | None = None
     sheet_name: str | None = None
     cell_range: str | None = None
     lifecycle_status: str
     version_label: str | None = None
     effective_at: datetime | None = None
+
+
+class SectionContextOut(BaseModel):
+    """一个章节的原文分块以及紧邻的上下文。"""
+
+    section: DocumentSectionOut
+    filename: str
+    chunks: list[SourceOut]
+    truncated: bool = False

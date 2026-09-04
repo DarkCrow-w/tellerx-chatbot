@@ -19,6 +19,11 @@ from app.integrations.search import (
     _query_subject_signals,
     normalize_query,
 )
+from app.knowledge.document_scope import (
+    compact_document_name,
+    has_meaningful_document_hint,
+    normalize_document_name,
+)
 from app.services.model_router import NoModelAvailable
 
 logger = logging.getLogger(__name__)
@@ -46,10 +51,18 @@ Put actions or situations such as high-value authorization, failure handling, or
 Do not invent company-specific aliases, document IDs, rule IDs, values, people, or facts.
 You may normalize generic concepts, for example "who signs off" to "approval role".
 Create 1 to 4 short, standalone retrieval queries. Split multi-part questions when that improves recall.
+When the user explicitly asks about content inside a named document or file, copy the identifying
+filename fragment into document_hint and put the remaining business question in document_question.
+Do not infer a document from generic words such as document, design, architecture, system, or interface.
+Only copy section names explicitly mentioned by the user into section_hints.
 Return exactly one compact JSON object:
 {
   "language": "zh|en|mixed|other",
   "intent": "lookup|compare|summarize|procedure|troubleshoot|unknown",
+  "retrieval_intent": "document_lookup|global_lookup|cross_source|ambiguous",
+  "document_hint": "filename fragment copied from USER_QUERY or empty string",
+  "document_question": "question to ask inside the document or the original query",
+  "section_hints": ["explicit section fragment"],
   "subjects": ["business object or named concept"],
   "scenario_terms": ["operation, action, or situation"],
   "identifiers": ["identifier copied exactly from USER_QUERY"],
@@ -95,6 +108,10 @@ class QueryPlan:
     model_id: str | None = None
     fallback_reason: str | None = None
     scenario_terms: tuple[str, ...] = ()
+    retrieval_intent: str = "global_lookup"
+    document_hint: str | None = None
+    document_question: str | None = None
+    section_hints: tuple[str, ...] = ()
 
     @property
     def anchor_terms(self) -> tuple[str, ...]:
@@ -147,6 +164,13 @@ class QueryPlan:
             "scenario_terms": list(self.scenario_terms),
             "constraints": list(self.constraints),
             "retrieval_queries": list(self.retrieval_queries),
+            "retrieval_intent": self.retrieval_intent,
+            "document_hint": self.document_hint,
+            "normalized_document_hint": (
+                normalize_document_name(self.document_hint) if self.document_hint else None
+            ),
+            "document_question": self.document_question,
+            "section_hints": list(self.section_hints),
             "model_id": self.model_id,
             "fallback_reason": self.fallback_reason,
         }
@@ -178,10 +202,74 @@ def _query_identifiers(question: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(value.upper() for value in values))
 
 
+DOCUMENT_SCOPE_PATTERNS = (
+    re.compile(
+        r"^(?:请|麻烦|烦请)?(?:帮我)?(?:看看|查看|查询|查一下)?\s*"
+        r"(?P<hint>[\u3400-\u9fffA-Za-z0-9_.\-（）() ]{2,80}?)"
+        r"(?:这份)?(?:文档|文件|说明书)(?:(?:中|里)(?:的)?|[，,：:])\s*"
+        r"(?P<question>.+)$"
+    ),
+    re.compile(
+        r"^(?:请|麻烦|烦请)?(?:在|从)?\s*"
+        r"(?P<hint>[\u3400-\u9fffA-Za-z0-9_.\-（）() ]{2,80}?"
+        r"(?:架构设计|系统设计|接口设计|架构方案|设计方案|架构|方案|设计))"
+        r"(?:中|里)(?:的)?[，,：:\s]*(?P<question>.+)$"
+    ),
+)
+DOCUMENT_SECTION_SCOPE_PATTERN = re.compile(
+    r"^(?P<hint>[\u3400-\u9fffA-Za-z0-9_.\-（）() ]{2,60}?)的"
+    r"(?P<section>[\u3400-\u9fffA-Za-z0-9_.\-（）() ]{2,40}?(?:模块|章节|部分))"
+    r"(?:中|里)(?:的)?[，,：:\s]*(?P<question>.+)$"
+)
+DOCUMENT_QUESTION_SECTION_PATTERN = re.compile(
+    r"^(?:关于)?(?P<section>"
+    r"[\u3400-\u9fffA-Za-z0-9_.\-（）() ]{2,40}?(?:模块|章节|部分))"
+    r"(?=(?:中|里|内|下|对|关于|[，,：:\s]|$))"
+)
+
+
+def extract_document_scope(question: str) -> tuple[str | None, str]:
+    """Extract only explicit, user-written document scope expressions."""
+
+    normalized = normalize_query(question)
+    section_match = DOCUMENT_SECTION_SCOPE_PATTERN.match(normalized)
+    if section_match:
+        hint = section_match.group("hint").strip()
+        if has_meaningful_document_hint(hint):
+            return hint, section_match.group("question").strip(" ，,。；;：:")
+    for pattern in DOCUMENT_SCOPE_PATTERNS:
+        match = pattern.match(normalized)
+        if not match:
+            continue
+        hint = match.group("hint").strip(" ，,。.!！?？；;：:")
+        hint = re.sub(r"^(?:在|从|关于)\s*", "", hint).strip()
+        if not has_meaningful_document_hint(hint):
+            continue
+        document_question = match.group("question").strip(" ，,。；;：:")
+        if document_question:
+            return hint, document_question
+    return None, normalized
+
+
+def extract_section_hints(question: str) -> tuple[str, ...]:
+    """从文档范围表达或其后业务问题开头提取显式标题片段。"""
+
+    normalized = normalize_query(question)
+    match = DOCUMENT_SECTION_SCOPE_PATTERN.match(normalized)
+    if match:
+        return (match.group("section").strip(),)
+    document_hint, document_question = extract_document_scope(normalized)
+    if not document_hint:
+        return ()
+    match = DOCUMENT_QUESTION_SECTION_PATTERN.match(document_question)
+    return (match.group("section").strip(),) if match else ()
+
+
 def fallback_query_plan(question: str, reason: str) -> QueryPlan:
     """模型不可用或不适用时，用确定性规则生成最小检索计划。"""
 
     normalized = normalize_query(question)
+    document_hint, document_question = extract_document_scope(normalized)
     subjects = tuple(_query_subject_signals(normalized))
     identifiers = _query_identifiers(normalized)
     focus = " ".join((*subjects, *identifiers)).strip()
@@ -195,6 +283,10 @@ def fallback_query_plan(question: str, reason: str) -> QueryPlan:
         constraints=(),
         retrieval_queries=(focus,) if focus and focus.casefold() != normalized.casefold() else (),
         fallback_reason=reason,
+        retrieval_intent="document_lookup" if document_hint else "global_lookup",
+        document_hint=document_hint,
+        document_question=document_question,
+        section_hints=extract_section_hints(normalized),
     )
 
 
@@ -206,10 +298,13 @@ def _is_bare_lookup(question: str, fallback: QueryPlan) -> bool:
     return len(anchors) == 1 and stripped.casefold() == anchors[0].casefold()
 
 
-def _semantic_plan(question: str, payload: dict[str, Any], model_id: str) -> QueryPlan:
+def _semantic_plan(  # noqa: C901
+    question: str, payload: dict[str, Any], model_id: str
+) -> QueryPlan:
     """校验模型 JSON，并把可能混淆的主题、场景和约束重新归类。"""
 
     normalized = normalize_query(question)
+    deterministic_hint, deterministic_question = extract_document_scope(normalized)
     language = str(payload.get("language") or "other").casefold()
     if language not in {"zh", "en", "mixed", "other"}:
         language = "other"
@@ -230,6 +325,46 @@ def _semantic_plan(question: str, payload: dict[str, Any], model_id: str) -> Que
     scenario_terms = tuple(dict.fromkeys((*explicit_scenarios, *demoted_subjects)))
     identifiers = _query_identifiers(normalized)
     model_queries = _unique_strings(payload.get("retrieval_queries"), limit=4, max_length=220)
+    raw_model_hint = str(payload.get("document_hint") or "").strip()
+    model_hint = None
+    if raw_model_hint and has_meaningful_document_hint(raw_model_hint):
+        query_compact = compact_document_name(normalized)
+        hint_compact = compact_document_name(raw_model_hint)
+        explicit_marker = re.search(
+            re.escape(normalize_query(raw_model_hint))
+            + r".{0,12}(?:文档|文件|说明书|中|里|document|file)",
+            normalized,
+            re.IGNORECASE,
+        )
+        if hint_compact and hint_compact in query_compact and explicit_marker:
+            model_hint = raw_model_hint
+    document_hint = deterministic_hint or model_hint
+    raw_document_question = normalize_query(str(payload.get("document_question") or ""))
+    document_question = deterministic_question
+    if document_hint and deterministic_hint is None and raw_document_question:
+        document_question = raw_document_question
+    if not document_question:
+        document_question = normalized
+    model_section_hints = _unique_strings(
+        payload.get("section_hints"), limit=6, max_length=100
+    )
+    section_hints = tuple(
+        dict.fromkeys((*extract_section_hints(normalized), *model_section_hints))
+    )
+    retrieval_intent = str(payload.get("retrieval_intent") or "").casefold()
+    allowed_retrieval_intents = {
+        "document_lookup",
+        "global_lookup",
+        "cross_source",
+        "ambiguous",
+    }
+    if document_hint:
+        retrieval_intent = "document_lookup"
+    elif (
+        retrieval_intent not in allowed_retrieval_intents
+        or retrieval_intent in {"document_lookup", "ambiguous"}
+    ):
+        retrieval_intent = "cross_source" if intent in {"compare", "summarize"} else "global_lookup"
     keyword_query = " ".join(
         dict.fromkeys((*subjects, *identifiers, *requested_facts, *scenario_terms, *constraints))
     ).strip()
@@ -256,6 +391,10 @@ def _semantic_plan(question: str, payload: dict[str, Any], model_id: str) -> Que
         retrieval_queries=tuple(queries),
         model_id=model_id,
         scenario_terms=scenario_terms,
+        retrieval_intent=retrieval_intent,
+        document_hint=document_hint,
+        document_question=document_question,
+        section_hints=section_hints,
     )
 
 

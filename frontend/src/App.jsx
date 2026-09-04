@@ -34,7 +34,7 @@ export default function App() {
   const selectedProject = projects.find((item) => item.id === projectId);
   const scope = selectedProject
     ? `仅检索：${selectedProject.name}`
-    : projects.length > 1 ? "请先选择知识库项目" : "当前知识库";
+    : "检索全部知识库";
 
   const navigate = useCallback((nextView) => {
     const hash = nextView === "knowledge" ? "#/knowledge" : "#/chat";
@@ -143,23 +143,19 @@ export default function App() {
     showToast("当前对话已清空");
   }
 
-  async function submit(event) {
-    /** 乐观加入用户消息，等待服务端返回经过证据校验的回答。 */
-    event?.preventDefault?.();
-    const question = input.trim();
+  async function runQuestion(question, { documentId = null, visibleText = question } = {}) {
+    /** 乐观加入用户选择或问题，并等待服务端返回经过证据校验的回答。 */
     if (!question || sending) return;
-    if (projects.length > 1 && !projectId) {
-      showToast("请先选择知识库项目");
-      return;
-    }
-    const userMessage = { id: uid(), role: "user", content: question };
+    const userMessage = { id: uid(), role: "user", content: visibleText };
     const pendingMessages = [...messages, userMessage];
     setMessages(pendingMessages);
     setInput("");
     setSending(true);
 
     try {
-      const data = await askKnowledgeBase({ question, conversationId, projectId });
+      const data = await askKnowledgeBase({
+        question, conversationId, projectId, documentId,
+      });
       const answer = {
         id: uid(),
         role: "assistant",
@@ -168,6 +164,11 @@ export default function App() {
         sources: data.sources || [],
         modelId: data.model_id,
         routeTier: data.route_tier,
+        retrievalIntent: data.retrieval_intent,
+        resolvedDocument: data.resolved_document,
+        resolvedScope: data.resolved_scope,
+        clarificationOptions: data.clarification_options || [],
+        originalQuestion: question,
       };
       const completedMessages = [...pendingMessages, answer];
       setConversationId(data.conversation_id);
@@ -186,6 +187,22 @@ export default function App() {
     } finally {
       setSending(false);
     }
+  }
+
+  async function submit(event) {
+    /** 提交输入框中的自然语言问题。 */
+    event?.preventDefault?.();
+    const question = input.trim();
+    if (!question) return;
+    await runQuestion(question);
+  }
+
+  function selectDocument(question, option) {
+    /** 用户确认候选后，用稳定文档 ID 重新执行原问题。 */
+    runQuestion(question, {
+      documentId: option.document_id,
+      visibleText: `选择文档：${option.filename}`,
+    });
   }
 
   return (
@@ -220,7 +237,7 @@ export default function App() {
             <label className="project-picker">
               <span>知识范围</span>
               <select value={projectId} onChange={(event) => setProjectId(event.target.value)} aria-label="选择知识库项目">
-                <option value="">请选择项目</option>
+                <option value="">全部知识库</option>
                 {projects.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
               </select>
             </label>
@@ -231,7 +248,14 @@ export default function App() {
         <section className="chat-scroll" ref={scrollRef} aria-live="polite">
           {!messages.length && !sending ? <EmptyState onPrompt={setInput} /> : (
             <div className="messages">
-              {messages.map((message) => <Message message={message} onToast={showToast} key={message.id} />)}
+              {messages.map((message) => (
+                <Message
+                  message={message}
+                  onToast={showToast}
+                  onSelectDocument={selectDocument}
+                  key={message.id}
+                />
+              ))}
               {sending && (
                 <article className="message assistant-message" aria-label="正在查找答案">
                   <div className="assistant-avatar"><span>T</span></div>

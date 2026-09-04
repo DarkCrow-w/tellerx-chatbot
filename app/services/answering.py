@@ -34,6 +34,7 @@ from app.services.query_understanding import (
     QueryUnderstandingService,
     fallback_query_plan,
 )
+from app.services.retrieval import RetrievalOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,12 @@ class AnswerPreparation:
     evidence: list[Evidence]
     requested_tier: str | None
     user_prompt: str | None
+    retrieval_intent: str = "global_lookup"
+    resolved_document: dict | None = None
+    resolved_scope: str = "global"
+    retrieval_confidence: float = 1.0
+    clarification_options: list[dict] | None = None
+    failure_reason: str | None = None
 
 
 @dataclass(slots=True)
@@ -204,6 +211,10 @@ def attach_cross_document_bridges(
                     filename=bridge.filename,
                     document_status=bridge.document_status,
                     heading_path=bridge.heading_path,
+                    section_id=bridge.section_id,
+                    breadcrumb=list(bridge.breadcrumb),
+                    section_level=bridge.section_level,
+                    location_confidence=bridge.location_confidence,
                     page_number=bridge.page_number,
                     sheet_name=bridge.sheet_name,
                     cell_range=bridge.cell_range,
@@ -256,6 +267,12 @@ class AnswerService:
         requested_tier: str | None,
         actual_tier: str | None,
         query_plan: QueryPlan,
+        retrieval_intent: str,
+        resolved_document: dict | None,
+        resolved_scope: str,
+        retrieval_confidence: float,
+        clarification_options: list[dict],
+        failure_reason: str | None,
     ) -> Message:
         """在同一事务中保存问答消息和完整查询追踪信息。"""
 
@@ -286,12 +303,22 @@ class AnswerService:
                     "actual_tier": actual_tier,
                 },
                 "query_understanding": query_plan.as_trace_dict(),
+                "scope_resolution": {
+                    "retrieval_intent": retrieval_intent,
+                    "resolved_document": resolved_document,
+                    "resolved_scope": resolved_scope,
+                    "retrieval_confidence": retrieval_confidence,
+                    "clarification_options": clarification_options,
+                    "failure_reason": failure_reason,
+                },
                 "embedding_fingerprint": getattr(self.settings, "embedding_fingerprint", None),
                 "evidence": [
                     {
                         "chunk_id": item.chunk_id,
                         "document_id": item.document_id,
                         "version_id": item.version_id,
+                        "section_id": item.section_id,
+                        "breadcrumb": list(item.breadcrumb),
                         "score": item.score,
                     }
                     for item in evidence
@@ -321,29 +348,55 @@ class AnswerService:
         question: str,
         project_ids: list[str],
         pinned_model: str | None,
+        document_id: str | None = None,
+        document_hint: str | None = None,
+        section_path: list[str] | None = None,
     ) -> AnswerPreparation:
         """完成查询理解、检索、路由和证据预算准备。"""
 
         if self.query_understanding is None:
             query_plan = fallback_query_plan(question, "service-not-configured")
-            evidence = self.retriever.search(question, project_ids)
         else:
             query_plan = self.query_understanding.understand(
                 db,
                 question,
                 pinned_model=pinned_model,
             )
-            evidence = self.retriever.search(
+        if hasattr(self.retriever, "search_with_scope"):
+            outcome: RetrievalOutcome = self.retriever.search_with_scope(
                 question,
                 project_ids,
                 query_plan=query_plan,
+                document_id=document_id,
+                document_hint=document_hint,
+                section_path=section_path,
             )
+            evidence = outcome.evidence
+        else:
+            if self.query_understanding is None:
+                evidence = self.retriever.search(question, project_ids)
+            else:
+                evidence = self.retriever.search(
+                    question, project_ids, query_plan=query_plan
+                )
+            outcome = RetrievalOutcome(evidence=evidence)
         if not evidence:
             logger.info(
                 "证据检索完成 evidence_count=0 project_count=%d",
                 len(project_ids),
             )
-            return AnswerPreparation(query_plan, [], None, None)
+            return AnswerPreparation(
+                query_plan,
+                [],
+                None,
+                None,
+                retrieval_intent=outcome.retrieval_intent,
+                resolved_document=outcome.resolved_document,
+                resolved_scope=outcome.resolved_scope,
+                retrieval_confidence=outcome.retrieval_confidence,
+                clarification_options=outcome.clarification_options,
+                failure_reason=outcome.failure_reason,
+            )
 
         version_pairs: dict[str, set[str]] = {}
         for item in evidence:
@@ -368,7 +421,18 @@ class AnswerService:
             tier,
             has_conflict,
         )
-        return AnswerPreparation(query_plan, evidence, tier, prompt)
+        return AnswerPreparation(
+            query_plan,
+            evidence,
+            tier,
+            prompt,
+            retrieval_intent=outcome.retrieval_intent,
+            resolved_document=outcome.resolved_document,
+            resolved_scope=outcome.resolved_scope,
+            retrieval_confidence=outcome.retrieval_confidence,
+            clarification_options=outcome.clarification_options,
+            failure_reason=outcome.failure_reason,
+        )
 
     def _generate_answer(
         self,
@@ -465,6 +529,12 @@ class AnswerService:
             validated=validated,
             model_id=model_id,
             trace_id=trace_id,
+            retrieval_intent=preparation.retrieval_intent,
+            resolved_document=preparation.resolved_document,
+            resolved_scope=preparation.resolved_scope,
+            retrieval_confidence=preparation.retrieval_confidence,
+            clarification_options=preparation.clarification_options or [],
+            failure_reason=preparation.failure_reason,
             started_at=started_at,
             project_ids=project_ids,
             evidence=preparation.evidence,
@@ -482,6 +552,11 @@ class AnswerService:
             conversation_id=conversation.id,
             message_id=message.id,
             trace_id=trace_id,
+            retrieval_intent=preparation.retrieval_intent,
+            resolved_document=preparation.resolved_document,
+            resolved_scope=preparation.resolved_scope,
+            retrieval_confidence=preparation.retrieval_confidence,
+            clarification_options=preparation.clarification_options or [],
         )
         logger.info(
             "问答处理完成 trace_id=%s status=%s model=%s tier=%s evidence_count=%d "
@@ -504,6 +579,9 @@ class AnswerService:
         project_ids: list[str],
         conversation_id: str | None,
         pinned_model: str | None,
+        document_id: str | None = None,
+        document_hint: str | None = None,
+        section_path: list[str] | None = None,
     ) -> ChatResponse:
         """完成一次证据约束问答，并保证失败路径也返回可审计结果。"""
 
@@ -522,13 +600,25 @@ class AnswerService:
             question=question,
             project_ids=project_ids,
             pinned_model=pinned_model,
+            document_id=document_id,
+            document_hint=document_hint,
+            section_path=section_path,
         )
 
         if not preparation.evidence:
             # 无证据时不调用模型，直接返回语言匹配的确定性拒答。
+            if preparation.failure_reason == "ambiguous_document":
+                status = "clarification_required"
+                answer = "匹配到多份名称相近的文档，请先选择要查询的文档。"
+            elif preparation.failure_reason == "document_not_found":
+                status = "insufficient_evidence"
+                answer = "未找到指定的当前有效文档，因此没有从其他文档拼凑答案。"
+            else:
+                status = "insufficient_evidence"
+                answer = refusal_text(question)
             validated = ValidatedAnswer(
-                status="insufficient_evidence",
-                answer=refusal_text(question),
+                status=status,
+                answer=answer,
                 claims=[],
                 sources=[],
             )
