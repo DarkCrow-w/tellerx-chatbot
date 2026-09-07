@@ -106,6 +106,7 @@ class Settings(BaseSettings):
     query_embedding_cache_ttl_seconds: int = 3600
     semantic_query_understanding_enabled: bool = True
     hierarchical_retrieval_enabled: bool = True
+    business_retrieval_enabled: bool = True
     query_plan_cache_size: int = 500
     query_plan_cache_ttl_seconds: int = 3600
     prompt_version: str = "grounded-qa-v1"
@@ -141,10 +142,14 @@ class Settings(BaseSettings):
             raise ValueError("SEARCH_BACKEND must be postgresql-pgvector-fts")
         if self.postgres_search_table != "chunk_search_index":
             raise ValueError("POSTGRES_SEARCH_TABLE is fixed to chunk_search_index")
-        if self.database_url.startswith("postgresql") and self.embedding_dimensions != 2560:
+        if self.database_url.startswith("postgresql") and self.embedding_dimensions not in {
+            1024,
+            2560,
+        }:
             raise ValueError(
-                "EMBEDDING_DIMENSIONS must be 2560 for migration 0005; "
-                "a dimension change requires a new PostgreSQL vector schema migration"
+                "EMBEDDING_DIMENSIONS must be 1024 or 2560; "
+                "a dimension change requires a new PostgreSQL vector schema migration. "
+                "SearchIndex.ensure_index verifies the actual column matches configuration"
             )
 
     def _validate_chunk_configuration(self) -> None:

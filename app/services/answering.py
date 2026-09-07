@@ -34,7 +34,7 @@ from app.services.query_understanding import (
     QueryUnderstandingService,
     fallback_query_plan,
 )
-from app.services.retrieval import RetrievalOutcome
+from app.services.retrieval import RetrievalOutcome, retrieval_diagnostics
 
 logger = logging.getLogger(__name__)
 
@@ -303,6 +303,7 @@ class AnswerService:
                     "actual_tier": actual_tier,
                 },
                 "query_understanding": query_plan.as_trace_dict(),
+                "candidate_stages": retrieval_diagnostics(),
                 "scope_resolution": {
                     "retrieval_intent": retrieval_intent,
                     "resolved_document": resolved_document,
@@ -376,9 +377,7 @@ class AnswerService:
             if self.query_understanding is None:
                 evidence = self.retriever.search(question, project_ids)
             else:
-                evidence = self.retriever.search(
-                    question, project_ids, query_plan=query_plan
-                )
+                evidence = self.retriever.search(question, project_ids, query_plan=query_plan)
             outcome = RetrievalOutcome(evidence=evidence)
         if not evidence:
             logger.info(
@@ -472,8 +471,9 @@ class AnswerService:
                     prompt_version=self.settings.prompt_version,
                 )
                 model_id = call.model_id
+                payload = parse_json_object(call.content)
                 validated = validate_answer(
-                    parse_json_object(call.content),
+                    payload,
                     preparation.evidence,
                 )
                 validated = attach_cross_document_bridges(
@@ -484,6 +484,18 @@ class AnswerService:
                 if validated.status == "insufficient_evidence":
                     validated.answer = refusal_text(question)
                 self._validate_live_sources(db, validated, preparation.evidence)
+                missing = payload.get("unanswered_fields", [])
+                if validated.status == "answered" and isinstance(missing, list):
+                    labels = [
+                        fact for fact in preparation.query_plan.requested_facts if fact in missing
+                    ]
+                    if labels:
+                        prefix = (
+                            "Missing evidence for: "
+                            if preparation.query_plan.language == "en"
+                            else "以下问题项未找到充分证据："
+                        )
+                        validated.answer += "\n" + prefix + "、".join(labels)
                 return GenerationResult(validated, model_id, attempted_tier)
             except NoModelAvailable:
                 failure_kind = "provider"

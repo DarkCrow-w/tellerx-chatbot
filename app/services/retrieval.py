@@ -7,6 +7,7 @@ import logging
 import re
 import time
 from collections import OrderedDict
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -20,6 +21,7 @@ from app.integrations.search import (
     _lexical_signals,
     _query_subject_signals,
     _source_status,
+    lexical_tokens,
     normalize_query,
 )
 from app.knowledge.evidence import Evidence
@@ -28,6 +30,13 @@ if TYPE_CHECKING:
     from app.services.query_understanding import QueryPlan
 
 logger = logging.getLogger(__name__)
+_RETRIEVAL_DIAGNOSTICS: ContextVar[list[dict] | None] = ContextVar(
+    "retrieval_diagnostics", default=None
+)
+
+
+def retrieval_diagnostics() -> list[dict]:
+    return list(_RETRIEVAL_DIAGNOSTICS.get() or [])
 
 
 @dataclass(slots=True)
@@ -201,17 +210,13 @@ class Retriever:
     ) -> list[Evidence]:
         """保留原问题召回顺序，同时允许语义规划补充不重复的证据。"""
 
-        merged: list[Evidence] = []
-        seen: set[str] = set()
+        scores: dict[str, float] = {}
+        items: dict[str, Evidence] = {}
         for channel in (baseline, planned):
-            for item in channel:
-                if item.chunk_id in seen:
-                    continue
-                seen.add(item.chunk_id)
-                merged.append(item)
-                if len(merged) >= limit:
-                    return merged
-        return merged
+            for rank, item in enumerate(channel, 1):
+                items[item.chunk_id] = item
+                scores[item.chunk_id] = scores.get(item.chunk_id, 0.0) + 1.0 / (60 + rank)
+        return [items[key] for key in sorted(scores, key=lambda key: -scores[key])[:limit]]
 
     @classmethod
     def _boost_anchor_matches(
@@ -468,20 +473,38 @@ class Retriever:
         query: str,
         rows: list[dict[str, Any]],
         linked_identifiers: list[str] | None = None,
+        *,
+        subject_signals: tuple[str, ...] | None = None,
+        subject_document_ids: tuple[str, ...] = (),
     ) -> list[dict[str, Any]]:
-        """单一实体查询只保留完整实体或已验证关联标识的候选。"""
-
-        entity_signals = _query_subject_signals(query)
-        if len(entity_signals) != 1:
+        """Ground subject filters in retrieved data, retaining document inheritance and bridges."""
+        signals = (
+            subject_signals if subject_signals is not None else tuple(_query_subject_signals(query))
+        )
+        signals = tuple(
+            s.casefold()
+            for s in signals
+            if s not in {"业务", "系统", "项目", "模块", "规则", "接口", "文档", "策略"}
+        )
+        if not signals:
             return rows
-        signal = entity_signals[0].casefold()
-        if signal in {"业务", "系统", "项目", "模块", "规则", "接口", "文档", "策略"}:
+        # An ungrounded rule fragment must never veto already-recalled facts.
+        if not subject_document_ids and not all(
+            any(signal in cls._source_text(row) for row in rows) for signal in signals
+        ):
             return rows
+        documents = set(subject_document_ids)
+        documents.update(
+            str(row["hit"]["_source"].get("document_id") or "")
+            for row in rows
+            if any(signal in cls._source_text(row) for signal in signals)
+        )
         linked = {value.casefold() for value in linked_identifiers or []}
         return [
             row
             for row in rows
-            if signal in cls._source_text(row)
+            if str(row["hit"]["_source"].get("document_id") or "") in documents - {""}
+            or any(signal in cls._source_text(row) for signal in signals)
             or any(identifier in cls._source_text(row) for identifier in linked)
         ]
 
@@ -596,9 +619,9 @@ class Retriever:
             section_level=source.get("section_level"),
             breadcrumb=tuple(
                 part.strip()
-                for part in str(
-                    source.get("section_path") or source.get("title_path") or ""
-                ).split(">")
+                for part in str(source.get("section_path") or source.get("title_path") or "").split(
+                    ">"
+                )
                 if part.strip()
             ),
             location_confidence=(1.0 if int(source.get("section_level") or 0) > 0 else 0.7),
@@ -790,14 +813,22 @@ class Retriever:
 
         scope_kwargs = {"document_ids": document_ids} if document_ids is not None else {}
         lexical = self.index.lexical_search(
-            query, project_ids, statuses, self.settings.retrieval_top_k, principal_ids,
+            query,
+            project_ids,
+            statuses,
+            self.settings.retrieval_top_k,
+            principal_ids,
             **scope_kwargs,
         )
         vector_hits: list[dict[str, Any]] = []
         try:
             vector = self._query_embedding(query)
             vector_hits = self.index.vector_search(
-                vector, project_ids, statuses, self.settings.retrieval_top_k, principal_ids,
+                vector,
+                project_ids,
+                statuses,
+                self.settings.retrieval_top_k,
+                principal_ids,
                 **scope_kwargs,
             )
         except Exception as exc:
@@ -840,8 +871,12 @@ class Retriever:
             seen.add(normalized.casefold())
             scope_kwargs = {"document_ids": document_ids} if document_ids is not None else {}
             hits = self.index.lexical_search(
-                normalized, project_ids, statuses, max(4, self.settings.evidence_top_k),
-                principal_ids, **scope_kwargs,
+                normalized,
+                project_ids,
+                statuses,
+                max(4, self.settings.evidence_top_k),
+                principal_ids,
+                **scope_kwargs,
             )
             if hits:
                 channels.append(hits)
@@ -866,6 +901,10 @@ class Retriever:
                 len(result),
             )
             return result
+        if self.settings.business_retrieval_enabled:
+            # _search_once merges original-query, planned and business-fact candidates
+            # before applying one shared subject decision and final evidence budget.
+            return self._search_once(query, project_ids, principal_ids, query_plan)
         baseline = self._search_once(query, project_ids, principal_ids, None)
         planned = self._search_once(query, project_ids, principal_ids, query_plan)
         result = self._merge_evidence_channels(
@@ -895,6 +934,7 @@ class Retriever:
     ) -> RetrievalOutcome:
         """先解析显式文档范围；没有可靠范围时完整保留全库检索。"""
 
+        _RETRIEVAL_DIAGNOSTICS.set([])
         if not getattr(self.settings, "hierarchical_retrieval_enabled", True):
             return RetrievalOutcome(
                 evidence=self.search(query, project_ids, principal_ids, query_plan)
@@ -904,7 +944,9 @@ class Retriever:
         if document_id:
             resolved = self.index.document_by_id(document_id, project_ids, principal_ids)
             if resolved is None:
-                logger.info("文档范围解析失败 reason=document_not_found document_id=%s", document_id)
+                logger.info(
+                    "文档范围解析失败 reason=document_not_found document_id=%s", document_id
+                )
                 return RetrievalOutcome(
                     retrieval_intent="document_lookup",
                     resolved_scope="document_not_found",
@@ -912,9 +954,7 @@ class Retriever:
                     failure_reason="document_not_found",
                 )
         elif hint:
-            candidates = self.index.document_candidates(
-                hint, project_ids, principal_ids, limit=8
-            )
+            candidates = self.index.document_candidates(hint, project_ids, principal_ids, limit=8)
             if not candidates:
                 logger.info("文档范围解析失败 reason=document_not_found hint=%s", hint)
                 return RetrievalOutcome(
@@ -949,8 +989,7 @@ class Retriever:
         if resolved is None:
             global_intent = (
                 query_plan.retrieval_intent
-                if query_plan
-                and query_plan.retrieval_intent in {"global_lookup", "cross_source"}
+                if query_plan and query_plan.retrieval_intent in {"global_lookup", "cross_source"}
                 else "global_lookup"
             )
             return RetrievalOutcome(
@@ -959,9 +998,7 @@ class Retriever:
             )
 
         scoped_query = (
-            query_plan.document_question
-            if query_plan and query_plan.document_question
-            else query
+            query_plan.document_question if query_plan and query_plan.document_question else query
         )
         hints = tuple(section_path or (query_plan.section_hints if query_plan else ()))
         evidence = self._search_once(
@@ -996,6 +1033,197 @@ class Retriever:
             retrieval_confidence=float(resolved.get("score") or 1.0),
         )
 
+    @staticmethod
+    def _subject_signals(query: str, query_plan: QueryPlan | None) -> tuple[str, ...]:
+        """Prefer one plan, and only trust names actually present in the user's question."""
+        values = query_plan.subjects if query_plan else tuple(_query_subject_signals(query))
+        normalized = normalize_query(query).casefold()
+        return tuple(dict.fromkeys(s for s in values if len(s) >= 2 and s.casefold() in normalized))
+
+    @staticmethod
+    def _fact_queries(
+        query: str, query_plan: QueryPlan | None, subjects: tuple[str, ...]
+    ) -> list[str]:
+        constraints = " ".join(query_plan.constraints) if query_plan else ""
+        facts = list(query_plan.requested_facts) if query_plan else []
+        stripped = query
+        for subject in subjects:
+            stripped = re.sub(re.escape(subject), " ", stripped, flags=re.IGNORECASE)
+        queries = [normalize_query(f"{fact} {constraints}") for fact in facts[:3]]
+        queries.append(normalize_query(stripped))
+        return list(dict.fromkeys(q for q in queries if len(q) > 1))[:4]
+
+    @staticmethod
+    def _grounded_subject_prefix(subject, rows, query_plan):
+        """Repair an action accidentally appended to a name only with filename evidence."""
+        if not query_plan:
+            return None
+        context = " ".join(
+            (*query_plan.scenario_terms, *query_plan.requested_facts, *query_plan.constraints)
+        )
+        candidates = []
+        for row in rows:
+            filename = str(row["hit"]["_source"].get("filename") or "")
+            size = 0
+            for left, right in zip(subject, filename):
+                if left.casefold() != right.casefold():
+                    break
+                size += 1
+            prefix, suffix = subject[:size], subject[size:]
+            # Restrict this repair to Chinese names with a scenario-bearing suffix.
+            # Similar names differing by region, digits or English letters must not collapse.
+            if size >= 4 and suffix and re.fullmatch(r"[\u3400-\u9fff]+", prefix):
+                terms = [t for t in lexical_tokens(suffix) if len(t) >= 2]
+                operational_suffix = re.fullmatch(
+                    r"(?:同步|异步|生产|测试|线上|线下)(?:处理|环境)?", suffix
+                )
+                if operational_suffix or any(term in context for term in terms):
+                    candidates.append(prefix)
+        return max(candidates, key=len) if candidates else None
+
+    def _business_channel(self, query, project_ids, principal_ids, query_plan, fused, document_ids):
+        """Add fact searches within subject documents without replacing the global channel."""
+        subjects = self._subject_signals(query, query_plan)
+        resolved_subjects = list(subjects)
+        groups = list(document_ids or [])
+        discovery = getattr(self.index, "business_documents", None)
+        if document_ids is None and callable(discovery):
+            for subject in subjects[:3]:
+                found = discovery(subject, project_ids, ["approved"], principal_ids, limit=10)
+                if isinstance(found, list) and not found:
+                    repaired = self._grounded_subject_prefix(subject, fused, query_plan)
+                    if repaired:
+                        found = discovery(
+                            repaired, project_ids, ["approved"], principal_ids, limit=10
+                        )
+                        if isinstance(found, list) and found:
+                            resolved_subjects[resolved_subjects.index(subject)] = repaired
+                if isinstance(found, list):
+                    groups.extend(found)
+        original_subjects = subjects
+        subjects = tuple(resolved_subjects)
+        groups = list(dict.fromkeys(groups))[:30]
+        if not groups:
+            return fused, subjects, groups
+        facts = self._fact_queries(query, query_plan, subjects)
+        for fact in facts:
+            recalled = self._retrieve_for_statuses(
+                fact, project_ids, ["approved"], principal_ids, groups
+            )
+            fused = self._merge_fused(fused, recalled)
+        trace = _RETRIEVAL_DIAGNOSTICS.get()
+        if trace is not None:
+            trace.append(
+                {
+                    "stage": "business_facts",
+                    "subjects": list(subjects),
+                    "original_subjects": list(original_subjects),
+                    "document_ids": groups,
+                    "queries": facts,
+                }
+            )
+        return fused, subjects, groups
+
+    @staticmethod
+    def _fact_coverage(row, fact):
+        source = row["hit"]["_source"]
+        text = normalize_query(
+            str(source.get("title_path") or "") + " " + str(source.get("content") or "")
+        ).casefold()
+        normalized = normalize_query(fact).casefold()
+        if normalized in text:
+            return 1.0
+        terms = [term for term in lexical_tokens(fact) if len(term) >= 2]
+        return sum(term in text for term in terms) / len(terms) if terms else 0.0
+
+    def _prioritize_facts(self, rows, query_plan):
+        """Reserve evidence for distinct requested facts; keep all remaining candidates ranked."""
+        if not rows or not query_plan:
+            return rows
+        selected = []
+        covered = []
+        for fact in query_plan.requested_facts[:6]:
+            best = max(rows, key=lambda row: (self._fact_coverage(row, fact), row["score"]))
+            coverage = self._fact_coverage(best, fact)
+            covered.append(
+                {
+                    "fact": fact,
+                    "lexical_coverage": coverage,
+                    "chunk_id": best["hit"]["_source"].get("chunk_id") if coverage >= 0.5 else None,
+                }
+            )
+            if coverage >= 0.5 and best not in selected:
+                selected.append(best)
+        trace = _RETRIEVAL_DIAGNOSTICS.get()
+        if trace is not None:
+            trace.append({"stage": "fact_coverage", "facts": covered})
+        return selected + [row for row in rows if row not in selected]
+
+    @staticmethod
+    def _trace_candidates(stage, rows):
+        trace = _RETRIEVAL_DIAGNOSTICS.get()
+        if trace is not None:
+            trace.append(
+                {
+                    "stage": stage,
+                    "count": len(rows),
+                    "candidates": [
+                        {
+                            "chunk_id": r["hit"]["_source"].get("chunk_id"),
+                            "document_id": r["hit"]["_source"].get("document_id"),
+                            "rank": i + 1,
+                        }
+                        for i, r in enumerate(rows[:60])
+                    ],
+                }
+            )
+
+    def _related_evidence(self, fused, project_ids, principal_ids, enabled):
+        """Choose bounded local expansion, retaining the legacy adapter fallback."""
+        related_document_ids = list(
+            dict.fromkeys(
+                str(row["hit"].get("_source", {}).get("document_id") or "")
+                for row in fused
+                if row["hit"].get("_source", {}).get("document_id")
+            )
+        )[: self.settings.evidence_top_k * 2]
+        related_hits: list[dict[str, Any]] = []
+        neighbors = getattr(self.index, "evidence_neighbors", None)
+        if related_document_ids and not (enabled and callable(neighbors)):
+            related_hits = self.index.document_chunks(
+                related_document_ids,
+                project_ids,
+                ["approved"],
+                max(
+                    self.settings.rerank_candidates * 4,
+                    len(related_document_ids) * 12,
+                ),
+                principal_ids,
+            )
+        if enabled and callable(neighbors):
+            local = neighbors(
+                [
+                    str(row["hit"]["_source"]["chunk_id"])
+                    for row in fused[: self.settings.evidence_top_k]
+                ],
+                project_ids,
+                ["approved"],
+                principal_ids,
+            )
+            if isinstance(local, list):
+                related_hits = local
+        return related_hits
+
+    def _link_seeds(self, fused, query_plan, enabled):
+        seeds = fused
+        if enabled and query_plan and query_plan.requested_facts:
+            seeds = [
+                row
+                for row in fused
+                if any(self._fact_coverage(row, fact) >= 0.5 for fact in query_plan.requested_facts)
+            ]
+        return seeds
+
     def _search_once(
         self,
         query: str,
@@ -1029,19 +1257,30 @@ class Retriever:
             fused = self._merge_fused(fused, focused)
         if section_hints:
             fused = self._boost_section_matches(fused, section_hints)
-        semantic_anchors = query_plan.anchor_signals if query_plan else ()
+        enabled = self.settings.business_retrieval_enabled
+        subjects = self._subject_signals(query, query_plan)
+        subject_documents = []
+        if enabled:
+            fused, subjects, subject_documents = self._business_channel(
+                query, project_ids, principal_ids, query_plan, fused, document_ids
+            )
+        semantic_anchors = (
+            subjects if enabled else (query_plan.anchor_signals if query_plan else ())
+        )
         fused = self._boost_anchor_matches(fused, semantic_anchors)
         if (
             query_plan
-            and query_plan.subjects
+            and subjects
             and document_ids is None
-            and not self._has_grounded_subject(fused, query_plan.subject_anchor_signals)
+            and not subject_documents
+            and not self._has_grounded_subject(fused, subjects)
         ):
             logger.info("Semantic subject was not grounded in any candidate; abstaining")
             return []
+        seeds = self._link_seeds(fused, query_plan, enabled)
         linked_identifiers = self._discover_linked_identifiers(
             query,
-            fused,
+            seeds,
             anchor_signals=semantic_anchors or None,
         )
         semantic_context = query_plan.rerank_context() if query_plan else ""
@@ -1069,26 +1308,19 @@ class Retriever:
             fused = self._merge_fused(fused, expanded)
         fused = self._deduplicate_content(fused)
         fused = self._enforce_exact_identifiers(query, fused, linked_identifiers)
-        fused = self._prefer_complete_entity_matches(query, fused, linked_identifiers)
-        related_document_ids = list(
-            dict.fromkeys(
-                str(row["hit"].get("_source", {}).get("document_id") or "")
-                for row in fused
-                if row["hit"].get("_source", {}).get("document_id")
+        self._trace_candidates("before_subject_filter", fused)
+        if document_ids is None:
+            fused = self._prefer_complete_entity_matches(
+                query,
+                fused,
+                linked_identifiers,
+                subject_signals=subjects if enabled else None,
+                subject_document_ids=tuple(subject_documents),
             )
-        )[: self.settings.evidence_top_k * 2]
-        related_hits: list[dict[str, Any]] = []
-        if related_document_ids:
-            related_hits = self.index.document_chunks(
-                related_document_ids,
-                project_ids,
-                ["approved"],
-                max(
-                    self.settings.rerank_candidates * 4,
-                    len(related_document_ids) * 12,
-                ),
-                principal_ids,
-            )
+        self._trace_candidates("after_subject_filter", fused)
+        if enabled:
+            fused = self._prioritize_facts(fused, query_plan)
+        related_hits = self._related_evidence(fused, project_ids, principal_ids, enabled)
         candidates = self._select_rerank_candidate_pool(
             fused,
             related_hits,
@@ -1096,6 +1328,7 @@ class Retriever:
             expansion_slots=self.settings.evidence_top_k,
             query=query,
         )
+        self._trace_candidates("final_candidates", candidates)
         if not candidates:
             return []
         return self._rank_candidates(
@@ -1119,7 +1352,5 @@ class Retriever:
             source = row.get("hit", {}).get("_source", {})
             path = str(source.get("section_path") or source.get("title_path") or "").casefold()
             matches = sum(hint in path for hint in hints)
-            boosted.append(
-                {**row, "score": float(row.get("score") or 0.0) * (1 + 0.2 * matches)}
-            )
+            boosted.append({**row, "score": float(row.get("score") or 0.0) * (1 + 0.2 * matches)})
         return sorted(boosted, key=lambda item: item["score"], reverse=True)

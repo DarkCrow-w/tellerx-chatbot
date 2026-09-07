@@ -181,7 +181,13 @@ def _query_subject_signals(query: str) -> list[str]:
     normalized = normalize_query(query)
     cleaned = _strip_polite_prefixes(normalized)
     values = [match.group(1) for match in ZH_QUOTED_SUBJECT.finditer(normalized)]
-    subject = _structured_subject(cleaned) or _bare_subject(cleaned)
+    # Possessive questions must stop at the subject, before the requested facts.
+    possessive = re.match(r"^([\u3400-\u9fffA-Za-z0-9_. -]{2,30}?)的", cleaned)
+    subject = (
+        possessive.group(1)
+        if possessive
+        else (_structured_subject(cleaned) or _bare_subject(cleaned))
+    )
     if subject is not None:
         values.append(subject)
     else:
@@ -753,6 +759,65 @@ class SearchIndex:
             rows = connection.execute(self._statement(sql, expanding), params).fetchall()
         return [self._hit(row) for row in rows]
 
+    def business_documents(
+        self,
+        subject: str,
+        project_ids: list[str],
+        statuses: list[str],
+        principal_ids: list[str] | None = None,
+        *,
+        limit: int = 10,
+    ) -> list[str]:
+        """Discover a subject in filenames OR body text, inheriting all search scope rules."""
+        normalized = normalize_search_text(subject).strip()
+        if len(normalized) < 2:
+            return []
+        params = {"subject": normalized, "limit": limit}
+        scope, expanding = self._scope_clause(project_ids, statuses, principal_ids, params)
+        sql = f"""
+            SELECT d.id, max(CASE WHEN position(:subject in lower(d.filename)) > 0
+                                THEN 1 ELSE 0 END) AS filename_match
+            {self._joins()}
+            WHERE {scope} AND position(:subject in s.raw_text) > 0
+            GROUP BY d.id ORDER BY filename_match DESC, d.id LIMIT :limit
+        """
+        with self.engine.connect() as connection:
+            return list(connection.execute(self._statement(sql, expanding), params).scalars())
+
+    def evidence_neighbors(
+        self,
+        chunk_ids: list[str],
+        project_ids: list[str],
+        statuses: list[str],
+        principal_ids: list[str] | None = None,
+        *,
+        per_anchor: int = 4,
+    ) -> list[dict[str, Any]]:
+        """Read same-section/table and immediate neighbors with a separate budget per anchor."""
+        if not chunk_ids:
+            return []
+        params = {"anchors": chunk_ids, "per_anchor": per_anchor}
+        scope, expanding = self._scope_clause(project_ids, statuses, principal_ids, params)
+        expanding.append("anchors")
+        sql = f"""
+            WITH neighbors AS (
+                SELECT {self._source_select()}, 0.0 AS score,
+                       row_number() OVER (PARTITION BY anchor.id ORDER BY
+                         CASE WHEN c.section_id = anchor.section_id THEN 0 ELSE 1 END,
+                         abs(c.ordinal-anchor.ordinal), c.ordinal) AS neighbor_rank
+                {self._joins()}
+                JOIN chunks anchor ON anchor.version_id=c.version_id
+                WHERE {scope} AND anchor.id IN :anchors
+                  AND c.id != anchor.id
+                  AND (c.section_id=anchor.section_id OR c.id=anchor.next_chunk_id
+                       OR c.id=anchor.previous_chunk_id OR c.id=anchor.parent_chunk_id)
+            ) SELECT * FROM neighbors WHERE neighbor_rank <= :per_anchor
+              ORDER BY neighbor_rank, chunk_id
+        """
+        with self.engine.connect() as connection:
+            rows = connection.execute(self._statement(sql, expanding), params).fetchall()
+        return [self._hit(row) for row in rows]
+
     def document_candidates(
         self,
         hint: str,
@@ -807,7 +872,7 @@ class SearchIndex:
                    d.document_type, v.id AS version_id, v.version_label
             FROM documents d
             JOIN document_versions v ON v.document_id = d.id
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             ORDER BY d.updated_at DESC, d.id
             LIMIT :candidate_limit
         """
@@ -857,7 +922,7 @@ class SearchIndex:
             SELECT d.id AS document_id, d.project_id, d.filename, d.normalized_filename,
                    d.document_type, v.id AS version_id, v.version_label, 1.0 AS score
             FROM documents d JOIN document_versions v ON v.document_id = d.id
-            WHERE {' AND '.join(clauses)} LIMIT 1
+            WHERE {" AND ".join(clauses)} LIMIT 1
         """
         with self.engine.connect() as connection:
             row = connection.execute(self._statement(sql, expanding), params).mappings().first()
