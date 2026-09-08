@@ -1,11 +1,13 @@
+from app.services import business_queries, candidate_ranking, candidate_selection
+
 """Regression coverage for business identity, scope inheritance and evidence budgets."""
 
 from dataclasses import replace
 from unittest.mock import Mock
 
 from app.core.config import Settings
-from app.integrations.search import _query_subject_signals
 from app.knowledge.evidence import Evidence
+from app.knowledge.search_text import _query_subject_signals
 from app.services.query_understanding import fallback_query_plan
 from app.services.retrieval import Retriever
 
@@ -32,7 +34,7 @@ def test_possessive_business_name_does_not_include_requested_facts():
 def test_weak_ungrounded_rule_cannot_delete_initial_recall():
     rows = [row("answer", "a", "长风容量.docx", "生产环境并发上限为600。")]
     assert (
-        Retriever._prefer_complete_entity_matches(
+        candidate_selection.prefer_complete_entity_matches(
             "长风容量生产环境与测试环境的并发上限各是多少？", rows
         )
         == rows
@@ -45,7 +47,7 @@ def test_verified_subject_inherits_document_and_rejects_other_business():
         row("answer", "a", "overview.docx", "密钥轮换周期为33天。"),
         row("wrong", "b", "澄海支付.docx", "密钥轮换周期为32天。"),
     ]
-    actual = Retriever._prefer_complete_entity_matches(
+    actual = candidate_selection.prefer_complete_entity_matches(
         "原始口语问题", rows, subject_signals=("青禾清算",)
     )
     assert [r["hit"]["_source"]["chunk_id"] for r in actual] == ["intro", "answer"]
@@ -57,7 +59,7 @@ def test_multi_business_comparison_keeps_both_verified_documents():
         row("b", "b", "澄海支付.docx", "重试3次"),
         row("c", "c", "其他.docx", "重试9次"),
     ]
-    actual = Retriever._prefer_complete_entity_matches(
+    actual = candidate_selection.prefer_complete_entity_matches(
         "比较两个业务", rows, subject_signals=("青禾清算", "澄海支付")
     )
     assert len(actual) == 2
@@ -66,7 +68,7 @@ def test_multi_business_comparison_keeps_both_verified_documents():
 def test_invented_model_subject_is_not_a_scope_constraint():
     query = "签名失败怎么办？"
     plan = replace(fallback_query_plan(query, "test"), subjects=("不存在的业务",))
-    assert Retriever._subject_signals(query, plan) == ()
+    assert business_queries.subject_signals(query, plan) == ()
 
 
 def test_business_group_channel_preserves_acl_and_multiple_documents():
@@ -115,7 +117,7 @@ def evidence(key):
 def test_planned_fact_is_not_starved_by_full_baseline_budget():
     baseline = [evidence(str(i)) for i in range(12)]
     planned = [evidence("new-fact")]
-    result = Retriever._merge_evidence_channels(baseline, planned, limit=8)
+    result = candidate_ranking.merge_evidence_channels(baseline, planned, limit=8)
     assert "new-fact" in {r.chunk_id for r in result}
     assert len(result) == 8
 
@@ -152,10 +154,10 @@ def test_action_appended_to_subject_is_repaired_only_with_document_evidence():
         requested_facts=("目标队列",),
     )
     rows = [row("a", "a", "碧湖计费二期_架构设计.docx", "碧湖计费业务规范。")]
-    assert Retriever._grounded_subject_prefix("碧湖计费同步处理", rows, plan) == "碧湖计费"
-    assert Retriever._grounded_subject_prefix("碧湖计费香港", rows, plan) is None
-    assert Retriever._grounded_subject_prefix("碧湖计费2", rows, plan) is None
-    assert Retriever._grounded_subject_prefix("不存在同步处理", rows, plan) is None
+    assert business_queries.grounded_subject_prefix("碧湖计费同步处理", rows, plan) == "碧湖计费"
+    assert business_queries.grounded_subject_prefix("碧湖计费香港", rows, plan) is None
+    assert business_queries.grounded_subject_prefix("碧湖计费2", rows, plan) is None
+    assert business_queries.grounded_subject_prefix("不存在同步处理", rows, plan) is None
 
 
 def test_repaired_subject_is_verified_again_before_filtering():
@@ -184,5 +186,5 @@ def test_sync_qualifier_does_not_become_part_of_the_business_identity():
         scenario_terms=("处理超时",),
     )
     rows = [row("a", "a", "玄鹭通知二期.docx", "玄鹭通知业务规范")]
-    assert Retriever._grounded_subject_prefix("玄鹭通知同步", rows, plan) == "玄鹭通知"
-    assert Retriever._grounded_subject_prefix("玄鹭通知香港", rows, plan) is None
+    assert business_queries.grounded_subject_prefix("玄鹭通知同步", rows, plan) == "玄鹭通知"
+    assert business_queries.grounded_subject_prefix("玄鹭通知香港", rows, plan) is None

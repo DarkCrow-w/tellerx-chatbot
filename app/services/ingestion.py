@@ -8,23 +8,18 @@ provider or cluster outage cannot lose accepted document uploads.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
-import uuid
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import Settings
 from app.db.models import (
-    Chunk,
-    ChunkEmbedding,
     Document,
     DocumentArtifact,
-    DocumentSection,
     DocumentVersion,
     EmbeddingCache,
     EmbeddingModel,
@@ -35,37 +30,15 @@ from app.integrations.openai_client import OpenAIModelClient
 from app.integrations.search import SearchIndex
 from app.integrations.storage import LocalObjectStorage
 from app.knowledge.chunking import TextChunk, chunk_units
-from app.knowledge.document_scope import normalize_document_name
 from app.knowledge.parsers import DocumentParser
+from app.repositories import ingestion_records
 from app.services.indexing import IndexingService
 
 logger = logging.getLogger(__name__)
-CHUNK_NAMESPACE = uuid.UUID("73ac24df-296f-4532-9dc8-e5890e877564")
 
 
 class IngestionCancelled(Exception):
     """文档已删除时用于尽快终止解析或向量化的内部控制流。"""
-
-
-def _record_hash(chunk: TextChunk) -> str:
-    """计算搜索记录的稳定哈希，用于后续校验索引内容是否发生漂移。"""
-
-    payload = json.dumps(
-        {
-            "content": chunk.content,
-            "heading_path": chunk.heading_path,
-            "page_number": chunk.page_number,
-            "sheet_name": chunk.sheet_name,
-            "cell_range": chunk.cell_range,
-            "section_key": chunk.section_key,
-            "section_path": chunk.section_path,
-            "embedding_input_hash": chunk.embedding_input_hash,
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class IngestionService:
@@ -121,7 +94,7 @@ class IngestionService:
                         & (IngestionJob.lease_until.is_not(None))
                         & (IngestionJob.lease_until < now)
                     ),
-                )
+                ),
             )
             .order_by(IngestionJob.created_at, IngestionJob.id)
             .with_for_update(skip_locked=True)
@@ -220,9 +193,7 @@ class IngestionService:
 
         if not chunk.embedding_input_hash:
             raise ValueError("Chunk is missing contextual embedding identity")
-        uri, checksum, _ = self.storage.save_vector(
-            fingerprint, chunk.embedding_input_hash, vector
-        )
+        uri, checksum, _ = self.storage.save_vector(fingerprint, chunk.embedding_input_hash, vector)
         new_cache = EmbeddingCache(
             content_hash=chunk.content_hash,
             embedding_input_hash=chunk.embedding_input_hash,
@@ -382,7 +353,7 @@ class IngestionService:
             artifact.sha256 = sha256
             artifact.byte_size = byte_size
 
-    def _persist_chunks_and_event(  # noqa: C901
+    def _persist_chunks_and_event(
         self,
         db: Session,
         job: IngestionJob,
@@ -393,125 +364,11 @@ class IngestionService:
     ) -> str:
         """原子写入分块、向量关联和 Outbox 事件，并推进任务状态。"""
 
-        old_ids = list(db.scalars(select(Chunk.id).where(Chunk.version_id == version.id)))
-        if old_ids:
-            db.execute(delete(ChunkEmbedding).where(ChunkEmbedding.chunk_id.in_(old_ids)))
-            db.execute(delete(Chunk).where(Chunk.id.in_(old_ids)))
-        db.execute(delete(DocumentSection).where(DocumentSection.version_id == version.id))
-
-        root_id = str(uuid.uuid5(CHUNK_NAMESPACE, f"{version.id}:section:root"))
-        root = DocumentSection(
-            id=root_id,
-            version_id=version.id,
-            section_key="root",
-            level=0,
-            title=version.document.filename,
-            normalized_title=normalize_document_name(version.document.filename),
-            heading_path="",
-            ordinal=0,
-            page_start=min(
-                (item.page_number for item in text_chunks if item.page_number is not None),
-                default=None,
-            ),
-            page_end=max(
-                (item.page_number for item in text_chunks if item.page_number is not None),
-                default=None,
-            ),
+        ingestion_records.remove_version_chunks(db, version.id)
+        section_ids = ingestion_records.write_sections(db, version, text_chunks)
+        ingestion_records.write_chunks(
+            db, version, text_chunks, section_ids, cache, self.settings.embedding_fingerprint
         )
-        db.add(root)
-        db.flush()
-
-        section_chunks: dict[str, list[TextChunk]] = {}
-        section_order: list[str] = []
-        for item in text_chunks:
-            key = item.section_key or "root"
-            if key not in section_chunks:
-                section_order.append(key)
-                section_chunks[key] = []
-            section_chunks[key].append(item)
-        section_ids = {"root": root_id}
-        for key in section_order:
-            if key == "root":
-                continue
-            section_ids[key] = str(uuid.uuid5(CHUNK_NAMESPACE, f"{version.id}:section:{key}"))
-        for ordinal, key in enumerate(section_order, start=1):
-            if key == "root":
-                continue
-            items = section_chunks[key]
-            sample = items[0]
-            page_numbers = [item.page_number for item in items if item.page_number is not None]
-            db.add(
-                DocumentSection(
-                    id=section_ids[key],
-                    version_id=version.id,
-                    parent_section_id=section_ids.get(sample.parent_section_key or "root", root_id),
-                    section_key=key,
-                    level=max(1, sample.section_level),
-                    title=sample.section_title or sample.heading_path or version.document.filename,
-                    normalized_title=normalize_document_name(
-                        sample.section_title or sample.heading_path or version.document.filename
-                    ),
-                    heading_path=sample.heading_path or "",
-                    ordinal=ordinal,
-                    page_start=min(page_numbers, default=None),
-                    page_end=max(page_numbers, default=None),
-                )
-            )
-            db.flush()
-        chunk_ids = [
-            str(
-                uuid.uuid5(
-                    CHUNK_NAMESPACE,
-                    f"{version.id}:{item.ordinal}:{item.content_hash}",
-                )
-            )
-            for item in text_chunks
-        ]
-        embedding_links: list[tuple[str, EmbeddingCache]] = []
-        lead_chunk_by_section: dict[str, str] = {}
-        for text_chunk, chunk_id in zip(text_chunks, chunk_ids):
-            lead_chunk_by_section.setdefault(text_chunk.section_key or "root", chunk_id)
-        for position, (text_chunk, chunk_id) in enumerate(zip(text_chunks, chunk_ids)):
-            section_key = text_chunk.section_key or "root"
-            section_lead = lead_chunk_by_section[section_key]
-            parent_chunk_id = None
-            if section_lead != chunk_id:
-                parent_chunk_id = section_lead
-            elif text_chunk.parent_section_key:
-                parent_chunk_id = lead_chunk_by_section.get(text_chunk.parent_section_key)
-            chunk = Chunk(
-                id=chunk_id,
-                version_id=version.id,
-                section_id=section_ids.get(section_key, root_id),
-                ordinal=text_chunk.ordinal,
-                heading_path=text_chunk.heading_path,
-                page_number=text_chunk.page_number,
-                sheet_name=text_chunk.sheet_name,
-                cell_range=text_chunk.cell_range,
-                content=text_chunk.content,
-                content_hash=text_chunk.content_hash,
-                embedding_input_hash=text_chunk.embedding_input_hash or text_chunk.content_hash,
-                record_hash=_record_hash(text_chunk),
-                token_count=text_chunk.token_count,
-                parent_chunk_id=parent_chunk_id,
-                previous_chunk_id=chunk_ids[position - 1] if position else None,
-                next_chunk_id=chunk_ids[position + 1] if position + 1 < len(chunk_ids) else None,
-            )
-            db.add(chunk)
-            embedding = cache.get(text_chunk.embedding_input_hash or text_chunk.content_hash)
-            if embedding:
-                embedding_links.append((chunk_id, embedding))
-        # ChunkEmbedding 只保存标量外键、没有 ORM relationship，SQLAlchemy 无法推断
-        # 插入顺序；先 flush 父 Chunk，才能安全写入向量关联。
-        db.flush()
-        for chunk_id, embedding in embedding_links:
-            db.add(
-                ChunkEmbedding(
-                    chunk_id=chunk_id,
-                    embedding_fingerprint=self.settings.embedding_fingerprint,
-                    cache_id=embedding.id,
-                )
-            )
         event = OutboxEvent(
             aggregate_id=version.id,
             event_type=(
@@ -552,41 +409,7 @@ class IngestionService:
         )
         try:
             self._assert_document_active(db, version.id)
-            # 每个阶段先持久化状态，进程异常退出后运维端仍能定位失败位置。
-            job.status = "running"
-            job.stage, job.progress = "parsing", 10
-            job.lease_until = datetime.now(UTC) + timedelta(minutes=15)
-            version.technical_status = "parsing"
-            version.parser_fingerprint = f"{self.settings.parser_backend}-{DocumentParser.revision}"
-            version.chunker_fingerprint = (
-                f"structure-v2-t{self.settings.chunk_target_tokens}"
-                f"-m{self.settings.chunk_max_tokens}-o{self.settings.chunk_overlap_tokens}"
-            )
-            db.commit()
-            source_path = self.storage.resolve(version.storage_path)
-            units, warnings = self.parser.parse(source_path)
-            text_chunks = chunk_units(
-                units,
-                target_tokens=self.settings.chunk_target_tokens,
-                max_tokens=self.settings.chunk_max_tokens,
-                overlap_tokens=self.settings.chunk_overlap_tokens,
-            )
-            if not text_chunks:
-                raise ValueError("Parser produced no chunks")
-            self._prepare_embedding_inputs(text_chunks, version.document)
-            logger.info(
-                "文档解析切块完成 job_id=%s units=%d chunks=%d warnings=%d",
-                job_id,
-                len(units),
-                len(text_chunks),
-                len(warnings),
-            )
-            self._assert_document_active(db, version.id)
-            self._save_normalized_artifact(db, version, units, warnings)
-            version.technical_status = "chunked"
-            job.stage, job.progress = "embedding", 35
-            job.warnings = warnings
-            db.commit()
+            text_chunks, warnings = self._parse_document(db, job, version)
             cache = self._embeddings(
                 db,
                 text_chunks,
@@ -641,3 +464,47 @@ class IngestionService:
                 db.commit()
             logger.exception("Ingestion job %s failed", job_id)
             raise
+
+    def _parse_document(
+        self,
+        db: Session,
+        job: IngestionJob,
+        version: DocumentVersion,
+    ) -> tuple[list[TextChunk], list[str]]:
+        """持久化解析阶段，保存规范化原文，并准备有上下文的向量输入。"""
+        # 每个阶段先持久化状态，进程异常退出后运维端仍能定位失败位置。
+        job.status = "running"
+        job.stage, job.progress = "parsing", 10
+        job.lease_until = datetime.now(UTC) + timedelta(minutes=15)
+        version.technical_status = "parsing"
+        version.parser_fingerprint = f"{self.settings.parser_backend}-{DocumentParser.revision}"
+        version.chunker_fingerprint = (
+            f"structure-v2-t{self.settings.chunk_target_tokens}"
+            f"-m{self.settings.chunk_max_tokens}-o{self.settings.chunk_overlap_tokens}"
+        )
+        db.commit()
+        source_path = self.storage.resolve(version.storage_path)
+        units, warnings = self.parser.parse(source_path)
+        text_chunks = chunk_units(
+            units,
+            target_tokens=self.settings.chunk_target_tokens,
+            max_tokens=self.settings.chunk_max_tokens,
+            overlap_tokens=self.settings.chunk_overlap_tokens,
+        )
+        if not text_chunks:
+            raise ValueError("Parser produced no chunks")
+        self._prepare_embedding_inputs(text_chunks, version.document)
+        logger.info(
+            "文档解析切块完成 job_id=%s units=%d chunks=%d warnings=%d",
+            job.id,
+            len(units),
+            len(text_chunks),
+            len(warnings),
+        )
+        self._assert_document_active(db, version.id)
+        self._save_normalized_artifact(db, version, units, warnings)
+        version.technical_status = "chunked"
+        job.stage, job.progress = "embedding", 35
+        job.warnings = warnings
+        db.commit()
+        return text_chunks, warnings

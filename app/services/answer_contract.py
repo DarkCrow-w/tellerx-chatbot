@@ -14,9 +14,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.contracts.schemas import CitationOut, ClaimOut
-from app.integrations.search import EXACT_IDENTIFIER
 from app.knowledge.chunking import estimate_tokens
 from app.knowledge.evidence import Evidence
+from app.knowledge.search_text import EXACT_IDENTIFIER
 
 SYSTEM_PROMPT = """You are an evidence-bound enterprise knowledge assistant.
 Use only the EVIDENCE provided by the user. Never use web knowledge, memory, or unstated assumptions.

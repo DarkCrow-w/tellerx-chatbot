@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import re
 import time
 from collections import OrderedDict
 from contextvars import ContextVar
@@ -13,21 +12,18 @@ from typing import TYPE_CHECKING, Any
 
 from app.core.config import Settings
 from app.integrations.openai_client import ModelAPIError, OpenAIModelClient
-from app.integrations.search import (
-    ACRONYM,
-    CONTROLLED_ALIAS,
+from app.integrations.search import SearchIndex
+from app.knowledge.evidence import Evidence
+from app.knowledge.search_text import (
     EXACT_IDENTIFIER,
-    SearchIndex,
-    _lexical_signals,
     _query_subject_signals,
-    _source_status,
-    lexical_tokens,
     normalize_query,
 )
-from app.knowledge.evidence import Evidence
 
 if TYPE_CHECKING:
     from app.services.query_understanding import QueryPlan
+
+from app.services import business_queries, candidate_ranking, candidate_selection
 
 logger = logging.getLogger(__name__)
 _RETRIEVAL_DIAGNOSTICS: ContextVar[list[dict] | None] = ContextVar(
@@ -85,578 +81,6 @@ class Retriever:
         self._query_cache[key] = (now, embeddings[0])
         return embeddings[0]
 
-    @staticmethod
-    def _rrf(*ranked_lists: list[dict[str, Any]], k: int = 60) -> list[dict[str, Any]]:
-        """用倒数排名融合多个召回通道，避免不同分值尺度直接相加。"""
-
-        combined: dict[str, dict[str, Any]] = {}
-        for channel, ranked in enumerate(ranked_lists):
-            for rank, hit in enumerate(ranked, start=1):
-                chunk_id = hit.get("_source", {}).get("chunk_id") or hit.get("_id")
-                if not chunk_id:
-                    continue
-                row = combined.setdefault(
-                    chunk_id,
-                    {"hit": hit, "score": 0.0, "channels": set(), "raw_scores": {}},
-                )
-                row["score"] += 1.0 / (k + rank)
-                row["channels"].add(channel)
-                row["raw_scores"][channel] = float(hit.get("_score") or 0.0)
-        for row in combined.values():
-            source = row["hit"].get("_source", {})
-            if _source_status(source) == "approved":
-                row["score"] *= 1.08
-        return sorted(combined.values(), key=lambda row: row["score"], reverse=True)
-
-    @staticmethod
-    def _enforce_exact_identifiers(
-        query: str,
-        rows: list[dict[str, Any]],
-        linked_identifiers: list[str] | None = None,
-    ) -> list[dict[str, Any]]:
-        """强制结果覆盖问题中的全部精确标识符，防止部分命中误答。"""
-
-        identifiers = {
-            match.casefold()
-            for pattern in (EXACT_IDENTIFIER, ACRONYM)
-            for match in pattern.findall(normalize_query(query))
-        }
-        if not identifiers:
-            return rows
-        matched: list[dict[str, Any]] = []
-        covered: set[str] = set()
-        linked = {value.casefold() for value in linked_identifiers or []}
-        for row in rows:
-            searchable = Retriever._source_text(row)
-            row_identifiers = {identifier for identifier in identifiers if identifier in searchable}
-            if row_identifiers or any(identifier in searchable for identifier in linked):
-                matched.append(row)
-            covered.update(row_identifiers)
-        return matched if covered == identifiers else []
-
-    @classmethod
-    def _discover_linked_identifiers(
-        cls,
-        query: str,
-        rows: list[dict[str, Any]],
-        limit: int = 12,
-        anchor_signals: tuple[str, ...] | None = None,
-    ) -> list[str]:
-        """从已命中主题锚点中提取受控别名和跨文档引用标识。"""
-
-        query_identifiers = {
-            match.casefold()
-            for pattern in (EXACT_IDENTIFIER, ACRONYM)
-            for match in pattern.findall(normalize_query(query))
-        }
-        signals = [value.casefold() for value in (anchor_signals or tuple(_lexical_signals(query)))]
-        anchors = [
-            row for row in rows if any(signal in cls._source_text(row) for signal in signals)
-        ]
-        if not anchors:
-            return []
-        discovered: list[str] = []
-        for row in anchors[:8]:
-            for value in EXACT_IDENTIFIER.findall(cls._source_text(row)):
-                normalized = value.casefold()
-                if normalized not in query_identifiers and normalized not in {
-                    item.casefold() for item in discovered
-                }:
-                    discovered.append(value.upper())
-                    if len(discovered) >= limit:
-                        return discovered
-            source = row.get("hit", {}).get("_source", {})
-            alias_text = "\n".join(
-                str(source.get(field) or "") for field in ("title_path", "heading_path", "content")
-            )
-            for value in CONTROLLED_ALIAS.findall(alias_text):
-                normalized = value.casefold().strip()
-                if (
-                    normalized
-                    and normalized not in query_identifiers
-                    and normalized not in {item.casefold() for item in discovered}
-                ):
-                    discovered.append(value.strip())
-                    if len(discovered) >= limit:
-                        return discovered
-        return discovered
-
-    @staticmethod
-    def _merge_fused(
-        primary: list[dict[str, Any]], secondary: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        """合并原问题与语义规划通道，并略微降低扩展通道权重。"""
-
-        merged: dict[str, dict[str, Any]] = {}
-        for channel, rows in enumerate((primary, secondary)):
-            weight = 1.0 if channel == 0 else 0.92
-            for row in rows:
-                source = row.get("hit", {}).get("_source", {})
-                chunk_id = str(source.get("chunk_id") or row.get("hit", {}).get("_id") or "")
-                if not chunk_id:
-                    continue
-                if chunk_id not in merged:
-                    merged[chunk_id] = {
-                        **row,
-                        "score": float(row.get("score") or 0.0) * weight,
-                    }
-                else:
-                    merged[chunk_id]["score"] += float(row.get("score") or 0.0) * weight
-        return sorted(merged.values(), key=lambda row: row["score"], reverse=True)
-
-    @staticmethod
-    def _merge_evidence_channels(
-        baseline: list[Evidence], planned: list[Evidence], *, limit: int
-    ) -> list[Evidence]:
-        """保留原问题召回顺序，同时允许语义规划补充不重复的证据。"""
-
-        scores: dict[str, float] = {}
-        items: dict[str, Evidence] = {}
-        for channel in (baseline, planned):
-            for rank, item in enumerate(channel, 1):
-                items[item.chunk_id] = item
-                scores[item.chunk_id] = scores.get(item.chunk_id, 0.0) + 1.0 / (60 + rank)
-        return [items[key] for key in sorted(scores, key=lambda key: -scores[key])[:limit]]
-
-    @classmethod
-    def _boost_anchor_matches(
-        cls, rows: list[dict[str, Any]], anchor_signals: tuple[str, ...]
-    ) -> list[dict[str, Any]]:
-        """提升命中主题锚点的候选，降低语义相似但主题错误的概率。"""
-
-        signals = [value.casefold() for value in anchor_signals if value.strip()]
-        if not signals:
-            return rows
-        boosted = []
-        for row in rows:
-            score = float(row.get("score") or 0.0)
-            if any(signal in cls._source_text(row) for signal in signals):
-                score *= 1.35
-            boosted.append({**row, "score": score})
-        return sorted(boosted, key=lambda row: row["score"], reverse=True)
-
-    @classmethod
-    def _has_grounded_subject(
-        cls, rows: list[dict[str, Any]], subject_signals: tuple[str, ...]
-    ) -> bool:
-        """判断候选集中是否存在能直接落地问题主题的文本。"""
-
-        signals = [value.casefold() for value in subject_signals if value.strip()]
-        return bool(signals) and any(
-            signal in cls._source_text(row) for row in rows for signal in signals
-        )
-
-    @staticmethod
-    def _deduplicate_content(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """按内容哈希去重，避免相同段落挤占证据预算。"""
-
-        unique = []
-        seen: set[str] = set()
-        for row in rows:
-            source = row.get("hit", {}).get("_source", {})
-            key = str(source.get("content_hash") or source.get("chunk_id") or "")
-            if key and key in seen:
-                continue
-            if key:
-                seen.add(key)
-            unique.append(row)
-        return unique
-
-    @classmethod
-    def _select_rerank_candidate_pool(
-        cls,
-        fused: list[dict[str, Any]],
-        related_hits: list[dict[str, Any]],
-        *,
-        limit: int,
-        expansion_slots: int,
-        query: str,
-    ) -> list[dict[str, Any]]:
-        """为已证明相关文档的相邻分块预留重排名额。"""
-
-        if limit <= 0:
-            return []
-        reserve = min(max(0, expansion_slots), max(0, limit - 1))
-        base_count = max(1, limit - reserve)
-        base = fused[:base_count]
-        seen = {str(row.get("hit", {}).get("_source", {}).get("chunk_id") or "") for row in base}
-        origins: dict[str, list[int]] = {}
-        document_order: list[str] = []
-        for row in base:
-            source = row.get("hit", {}).get("_source", {})
-            document_id = str(source.get("document_id") or "")
-            if not document_id:
-                continue
-            if document_id not in origins:
-                origins[document_id] = []
-                document_order.append(document_id)
-            origins[document_id].append(int(source.get("chunk_ordinal") or 0))
-
-        by_document: dict[str, list[dict[str, Any]]] = {}
-        for hit in related_hits:
-            source = hit.get("_source", {})
-            chunk_id = str(source.get("chunk_id") or "")
-            document_id = str(source.get("document_id") or "")
-            if not chunk_id or chunk_id in seen or document_id not in origins:
-                continue
-            by_document.setdefault(document_id, []).append(
-                {
-                    "hit": hit,
-                    "score": 0.0,
-                    "channels": {"document_expansion"},
-                    "raw_scores": {},
-                }
-            )
-
-        expanded: list[dict[str, Any]] = []
-        for document_id in document_order:
-            options = by_document.get(document_id, [])
-            if not options or len(expanded) >= reserve:
-                continue
-            origin_ordinals = origins[document_id]
-            selected = min(
-                options,
-                key=lambda row: (
-                    min(
-                        abs(int(row["hit"].get("_source", {}).get("chunk_ordinal") or 0) - ordinal)
-                        for ordinal in origin_ordinals
-                    ),
-                    -cls._authority_quality(query, row),
-                    int(row["hit"].get("_source", {}).get("chunk_ordinal") or 0),
-                ),
-            )
-            expanded.append(selected)
-            seen.add(str(selected["hit"].get("_source", {}).get("chunk_id") or ""))
-
-        remaining = [
-            row
-            for row in fused[base_count:]
-            if str(row.get("hit", {}).get("_source", {}).get("chunk_id") or "") not in seen
-        ]
-        return cls._deduplicate_content([*base, *expanded, *remaining])[:limit]
-
-    @classmethod
-    def _attach_short_chunk_neighbors(
-        cls,
-        selected: list[dict[str, Any]],
-        related_hits: list[dict[str, Any]],
-        *,
-        max_extra: int = 4,
-        short_threshold: int = 180,
-    ) -> list[dict[str, Any]]:
-        """当选中分块过短、疑似只有标题时，补充最近的正文值块。"""
-
-        if max_extra <= 0:
-            return selected
-        seen = {
-            str(row.get("hit", {}).get("_source", {}).get("chunk_id") or "") for row in selected
-        }
-        extras: list[dict[str, Any]] = []
-        for row in selected:
-            if len(extras) >= max_extra:
-                break
-            source = row.get("hit", {}).get("_source", {})
-            if len(str(source.get("content") or "").strip()) >= short_threshold:
-                continue
-            document_id = str(source.get("document_id") or "")
-            origin = int(source.get("chunk_ordinal") or 0)
-            options = [
-                hit
-                for hit in related_hits
-                if str(hit.get("_source", {}).get("document_id") or "") == document_id
-                and str(hit.get("_source", {}).get("chunk_id") or "") not in seen
-            ]
-            if not options:
-                continue
-            hit = min(
-                options,
-                key=lambda candidate: (
-                    abs(int(candidate.get("_source", {}).get("chunk_ordinal") or 0) - origin),
-                    int(candidate.get("_source", {}).get("chunk_ordinal") or 0) < origin,
-                ),
-            )
-            wrapped = {
-                "hit": hit,
-                "score": float(row.get("score") or 0.0) * 0.99,
-                "channels": {"selected_neighbor"},
-                "raw_scores": {},
-            }
-            extras.append(wrapped)
-            seen.add(str(hit.get("_source", {}).get("chunk_id") or ""))
-        return cls._deduplicate_content([*selected, *extras])
-
-    @classmethod
-    def _attach_provenance_bridge_chunks(
-        cls,
-        query: str,
-        selected: list[dict[str, Any]],
-        related_hits: list[dict[str, Any]],
-        linked_identifiers: list[str],
-        *,
-        max_extra: int = 2,
-    ) -> list[dict[str, Any]]:
-        """在下游事实旁保留“主题→引用标识”的来源桥接分块。
-
-        重排器天然偏好含最终值的段落，跨文档查询时可能因此丢掉证明二者关系的
-        需求或注册表段落。这里仅保留已召回的确定性映射，不推断或创造新关系。
-        """
-
-        if max_extra <= 0 or not selected or not related_hits:
-            return selected
-        query_ids = {
-            value.casefold()
-            for pattern in (EXACT_IDENTIFIER, ACRONYM)
-            for value in pattern.findall(normalize_query(query))
-        }
-        subject_signals = query_ids or {
-            value.casefold()
-            for value in (*_query_subject_signals(query), *_lexical_signals(query))
-            if len(value.strip()) >= 2
-        }
-        downstream_ids = {
-            value.casefold()
-            for row in selected
-            for value in EXACT_IDENTIFIER.findall(cls._source_text(row))
-            if value.casefold() not in query_ids
-        }
-        downstream_ids.update(value.casefold() for value in linked_identifiers)
-        if not subject_signals or not downstream_ids:
-            return selected
-
-        seen = {
-            str(row.get("hit", {}).get("_source", {}).get("chunk_id") or "") for row in selected
-        }
-        preferred_types = {
-            "business-requirement",
-            "requirement",
-            "terminology-registry",
-            "mapping",
-            "reference-index",
-        }
-        options: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
-        for position, hit in enumerate(related_hits):
-            source = hit.get("_source", {})
-            chunk_id = str(source.get("chunk_id") or "")
-            if not chunk_id or chunk_id in seen or _source_status(source) != "approved":
-                continue
-            wrapped = {"hit": hit}
-            text = cls._source_text(wrapped)
-            matched_subjects = sum(signal in text for signal in subject_signals)
-            matched_links = sum(identifier in text for identifier in downstream_ids)
-            if not matched_subjects or not matched_links:
-                continue
-            document_type = str(source.get("document_type") or "").casefold()
-            options.append(
-                (
-                    (
-                        int(document_type in preferred_types),
-                        matched_subjects,
-                        matched_links,
-                        -position,
-                    ),
-                    {
-                        "hit": hit,
-                        "score": 0.0,
-                        "channels": {"provenance_bridge"},
-                        "raw_scores": {},
-                    },
-                )
-            )
-        if not options:
-            return selected
-        extras = [row for _, row in sorted(options, key=lambda item: item[0], reverse=True)]
-        return cls._deduplicate_content([*selected, *extras[:max_extra]])
-
-    @classmethod
-    def _prefer_complete_entity_matches(
-        cls,
-        query: str,
-        rows: list[dict[str, Any]],
-        linked_identifiers: list[str] | None = None,
-        *,
-        subject_signals: tuple[str, ...] | None = None,
-        subject_document_ids: tuple[str, ...] = (),
-    ) -> list[dict[str, Any]]:
-        """Ground subject filters in retrieved data, retaining document inheritance and bridges."""
-        signals = (
-            subject_signals if subject_signals is not None else tuple(_query_subject_signals(query))
-        )
-        signals = tuple(
-            s.casefold()
-            for s in signals
-            if s not in {"业务", "系统", "项目", "模块", "规则", "接口", "文档", "策略"}
-        )
-        if not signals:
-            return rows
-        # An ungrounded rule fragment must never veto already-recalled facts.
-        if not subject_document_ids and not all(
-            any(signal in cls._source_text(row) for row in rows) for signal in signals
-        ):
-            return rows
-        documents = set(subject_document_ids)
-        documents.update(
-            str(row["hit"]["_source"].get("document_id") or "")
-            for row in rows
-            if any(signal in cls._source_text(row) for signal in signals)
-        )
-        linked = {value.casefold() for value in linked_identifiers or []}
-        return [
-            row
-            for row in rows
-            if str(row["hit"]["_source"].get("document_id") or "") in documents - {""}
-            or any(signal in cls._source_text(row) for signal in signals)
-            or any(identifier in cls._source_text(row) for identifier in linked)
-        ]
-
-    @staticmethod
-    def _authority_quality(query: str, row: dict[str, Any]) -> int:
-        """按问题意图评价时效权威性，默认优先正式当前值而非历史描述。"""
-
-        normalized_query = normalize_query(query).casefold()
-        text = Retriever._source_text(row)
-        authoritative = (
-            "approved",
-            "current",
-            "effective date",
-            "signed",
-            "authoritative",
-            "正式",
-            "当前",
-            "生效",
-            "已批准",
-        )
-        historical = (
-            "not the approval page",
-            "not current",
-            "not the final decision",
-            "retired",
-            "historical",
-            "superseded",
-            "deprecated",
-            "draft",
-            "candidate",
-            "never approved",
-            "旧值",
-            "退役",
-            "历史",
-            "草稿",
-            "候选",
-            "作废",
-        )
-        asks_for_history = any(
-            term in normalized_query for term in ("历史", "旧值", "过去", "退役")
-        ) or bool(re.search(r"\b(?:historical|old|retired)\b", normalized_query))
-        if asks_for_history:
-            return 2 * sum(term in text for term in historical) - 2 * sum(
-                term in text for term in authoritative
-            )
-        return 2 * sum(term in text for term in authoritative) - 3 * sum(
-            term in text for term in historical
-        )
-
-    @staticmethod
-    def _diversify_documents(
-        candidates: list[dict[str, Any]],
-        ranked: list[tuple[int, float]],
-        top_k: int,
-        query: str = "",
-    ) -> list[tuple[int, float]]:
-        """先为每份文档保留一个权威代表，再追加同文档的其他候选。"""
-
-        valid = [(index, score) for index, score in ranked if 0 <= index < len(candidates)]
-        seen_indexes: set[int] = set()
-        document_order: list[str] = []
-        by_document: dict[str, list[tuple[int, tuple[int, float]]]] = {}
-        deduplicated: list[tuple[int, float]] = []
-        for position, item in enumerate(valid):
-            index = item[0]
-            if index in seen_indexes:
-                continue
-            seen_indexes.add(index)
-            deduplicated.append(item)
-            source = candidates[index]["hit"].get("_source", {})
-            document_id = str(source.get("document_id") or source.get("filename") or index)
-            if document_id not in by_document:
-                document_order.append(document_id)
-                by_document[document_id] = []
-            by_document[document_id].append((position, item))
-        representatives = [
-            max(
-                by_document[document_id],
-                key=lambda positioned: (
-                    Retriever._authority_quality(query, candidates[positioned[1][0]]),
-                    len(
-                        str(
-                            candidates[positioned[1][0]]["hit"].get("_source", {}).get("content")
-                            or ""
-                        ).strip()
-                    )
-                    >= 100,
-                    -positioned[0],
-                ),
-            )[1]
-            for document_id in document_order
-        ]
-        representative_indexes = {item[0] for item in representatives}
-        deferred = [item for item in deduplicated if item[0] not in representative_indexes]
-        return [*representatives, *deferred][:top_k]
-
-    @staticmethod
-    def _to_evidence(source: dict[str, Any], score: float) -> Evidence:
-        """把搜索后端记录转换成业务层稳定的证据对象。"""
-
-        return Evidence(
-            chunk_id=source["chunk_id"],
-            document_id=source["document_id"],
-            version_id=source["version_id"],
-            project_id=source["project_id"],
-            filename=source["filename"],
-            document_status=_source_status(source),
-            document_type=source["document_type"],
-            content=source["content"],
-            heading_path=source.get("title_path") or source.get("heading_path"),
-            section_id=source.get("section_id"),
-            section_level=source.get("section_level"),
-            breadcrumb=tuple(
-                part.strip()
-                for part in str(source.get("section_path") or source.get("title_path") or "").split(
-                    ">"
-                )
-                if part.strip()
-            ),
-            location_confidence=(1.0 if int(source.get("section_level") or 0) > 0 else 0.7),
-            page_number=source.get("page_number"),
-            sheet_name=source.get("sheet_name"),
-            cell_range=source.get("cell_range"),
-            version_label=source.get("version_label"),
-            score=score,
-        )
-
-    @staticmethod
-    def _source_text(row: dict[str, Any]) -> str:
-        """拼接可用于规则判断的来源文本，并统一为大小写不敏感形式。"""
-
-        source = row["hit"].get("_source", {})
-        return " ".join(
-            str(source.get(field) or "")
-            for field in ("filename", "title_path", "heading_path", "content")
-        ).casefold()
-
-    @staticmethod
-    def _rerank_passage(row: dict[str, Any]) -> str:
-        """为重排模型序列化正文及必要的来源、版本和状态上下文。"""
-
-        source = row["hit"]["_source"]
-        return "\n".join(
-            [
-                f"file={source.get('filename', '')}",
-                f"status={_source_status(source)}",
-                f"version={source.get('version_label', '')}",
-                f"heading={source.get('title_path') or source.get('heading_path', '')}",
-                str(source.get("content") or ""),
-            ]
-        )
-
     def _select_rrf_evidence(
         self,
         query: str,
@@ -666,12 +90,12 @@ class Retriever:
     ) -> list[Evidence]:
         """在禁用或无法使用 Rerank 时，按 RRF 顺序完成邻居与来源桥接。"""
 
-        selected_rows = self._attach_short_chunk_neighbors(
+        selected_rows = candidate_selection.attach_short_chunk_neighbors(
             candidates[: self.settings.evidence_top_k],
             related_hits,
             max_extra=max(1, self.settings.evidence_top_k // 2),
         )
-        selected_rows = self._attach_provenance_bridge_chunks(
+        selected_rows = candidate_selection.attach_provenance_bridge_chunks(
             query,
             selected_rows,
             related_hits,
@@ -679,7 +103,7 @@ class Retriever:
             max_extra=2,
         )
         return [
-            self._to_evidence(row["hit"]["_source"], float(row.get("score") or 0.0))
+            candidate_ranking.to_evidence(row["hit"]["_source"], float(row.get("score") or 0.0))
             for row in selected_rows
         ]
 
@@ -702,7 +126,7 @@ class Retriever:
                 related_hits,
                 linked_identifiers,
             )
-        passages = [self._rerank_passage(row) for row in candidates]
+        passages = [candidate_ranking.rerank_passage(row) for row in candidates]
         rerank_query = "\n".join(
             part
             for part in [
@@ -730,14 +154,14 @@ class Retriever:
                 related_hits,
                 linked_identifiers,
             )
-        ranked = self._ensure_signal_coverage(
+        ranked = candidate_ranking.ensure_signal_coverage(
             query,
             candidates,
             ranked,
             rerank_top_n,
             additional_signals=semantic_anchors,
         )
-        ranked = self._diversify_documents(
+        ranked = candidate_ranking.diversify_documents(
             candidates, ranked, self.settings.evidence_top_k, query=query
         )
         selected_rows = [
@@ -745,12 +169,12 @@ class Retriever:
             for index, score in ranked[: self.settings.evidence_top_k]
             if 0 <= index < len(candidates)
         ]
-        selected_rows = self._attach_short_chunk_neighbors(
+        selected_rows = candidate_selection.attach_short_chunk_neighbors(
             selected_rows,
             related_hits,
             max_extra=max(1, self.settings.evidence_top_k // 2),
         )
-        selected_rows = self._attach_provenance_bridge_chunks(
+        selected_rows = candidate_selection.attach_provenance_bridge_chunks(
             query,
             selected_rows,
             related_hits,
@@ -758,48 +182,9 @@ class Retriever:
             max_extra=2,
         )
         return [
-            self._to_evidence(row["hit"]["_source"], float(row.get("score") or 0.0))
+            candidate_ranking.to_evidence(row["hit"]["_source"], float(row.get("score") or 0.0))
             for row in selected_rows
         ]
-
-    @classmethod
-    def _ensure_signal_coverage(
-        cls,
-        query: str,
-        candidates: list[dict[str, Any]],
-        ranked: list[tuple[int, float]],
-        top_k: int,
-        additional_signals: tuple[str, ...] = (),
-    ) -> list[tuple[int, float]]:
-        """在重排结果中补回关键字信号覆盖，避免模型漏掉精确条件。"""
-
-        selected = [(index, score) for index, score in ranked if 0 <= index < len(candidates)]
-        selected = list(dict.fromkeys(selected))
-        mandatory_indexes: list[int] = []
-        signals = tuple(dict.fromkeys((*_lexical_signals(query), *additional_signals)))
-        for signal in (value.casefold() for value in signals):
-            if any(signal in cls._source_text(candidates[index]) for index in mandatory_indexes):
-                continue
-            mandatory = next(
-                (
-                    index
-                    for index, candidate in enumerate(candidates)
-                    if signal in cls._source_text(candidate)
-                ),
-                None,
-            )
-            if mandatory is not None:
-                mandatory_indexes.append(mandatory)
-        mandatory_rows = [
-            (index, candidates[index]["score"]) for index in mandatory_indexes[:top_k]
-        ]
-        remaining = []
-        seen = set(mandatory_indexes)
-        for item in selected:
-            if item[0] not in seen:
-                seen.add(item[0])
-                remaining.append(item)
-        return [*mandatory_rows, *remaining[: max(0, top_k - len(mandatory_rows))]]
 
     def _retrieve_for_statuses(
         self,
@@ -837,7 +222,7 @@ class Retriever:
             logger.warning(
                 "Vector retrieval unavailable; BM25-only fallback: %s", type(exc).__name__
             )
-        fused = self._rrf(lexical, vector_hits)
+        fused = candidate_ranking.rrf(lexical, vector_hits)
         logger.debug(
             "召回通道完成 project_count=%d statuses=%s lexical=%d vector=%d fused=%d",
             len(project_ids),
@@ -882,7 +267,7 @@ class Retriever:
                 channels.append(hits)
             if len(channels) >= 10:
                 break
-        return self._rrf(*channels) if channels else []
+        return candidate_ranking.rrf(*channels) if channels else []
 
     def search(
         self,
@@ -907,7 +292,7 @@ class Retriever:
             return self._search_once(query, project_ids, principal_ids, query_plan)
         baseline = self._search_once(query, project_ids, principal_ids, None)
         planned = self._search_once(query, project_ids, principal_ids, query_plan)
-        result = self._merge_evidence_channels(
+        result = candidate_ranking.merge_evidence_channels(
             baseline,
             planned,
             limit=max(self.settings.evidence_top_k * 2, self.settings.evidence_top_k + 4),
@@ -1033,57 +418,17 @@ class Retriever:
             retrieval_confidence=float(resolved.get("score") or 1.0),
         )
 
-    @staticmethod
-    def _subject_signals(query: str, query_plan: QueryPlan | None) -> tuple[str, ...]:
-        """Prefer one plan, and only trust names actually present in the user's question."""
-        values = query_plan.subjects if query_plan else tuple(_query_subject_signals(query))
-        normalized = normalize_query(query).casefold()
-        return tuple(dict.fromkeys(s for s in values if len(s) >= 2 and s.casefold() in normalized))
-
-    @staticmethod
-    def _fact_queries(
-        query: str, query_plan: QueryPlan | None, subjects: tuple[str, ...]
-    ) -> list[str]:
-        constraints = " ".join(query_plan.constraints) if query_plan else ""
-        facts = list(query_plan.requested_facts) if query_plan else []
-        stripped = query
-        for subject in subjects:
-            stripped = re.sub(re.escape(subject), " ", stripped, flags=re.IGNORECASE)
-        queries = [normalize_query(f"{fact} {constraints}") for fact in facts[:3]]
-        queries.append(normalize_query(stripped))
-        return list(dict.fromkeys(q for q in queries if len(q) > 1))[:4]
-
-    @staticmethod
-    def _grounded_subject_prefix(subject, rows, query_plan):
-        """Repair an action accidentally appended to a name only with filename evidence."""
-        if not query_plan:
-            return None
-        context = " ".join(
-            (*query_plan.scenario_terms, *query_plan.requested_facts, *query_plan.constraints)
-        )
-        candidates = []
-        for row in rows:
-            filename = str(row["hit"]["_source"].get("filename") or "")
-            size = 0
-            for left, right in zip(subject, filename):
-                if left.casefold() != right.casefold():
-                    break
-                size += 1
-            prefix, suffix = subject[:size], subject[size:]
-            # Restrict this repair to Chinese names with a scenario-bearing suffix.
-            # Similar names differing by region, digits or English letters must not collapse.
-            if size >= 4 and suffix and re.fullmatch(r"[\u3400-\u9fff]+", prefix):
-                terms = [t for t in lexical_tokens(suffix) if len(t) >= 2]
-                operational_suffix = re.fullmatch(
-                    r"(?:同步|异步|生产|测试|线上|线下)(?:处理|环境)?", suffix
-                )
-                if operational_suffix or any(term in context for term in terms):
-                    candidates.append(prefix)
-        return max(candidates, key=len) if candidates else None
-
-    def _business_channel(self, query, project_ids, principal_ids, query_plan, fused, document_ids):
-        """Add fact searches within subject documents without replacing the global channel."""
-        subjects = self._subject_signals(query, query_plan)
+    def _business_channel(
+        self,
+        query: str,
+        project_ids: list[str],
+        principal_ids: list[str] | None,
+        query_plan: QueryPlan | None,
+        fused: list[dict[str, Any]],
+        document_ids: list[str] | None,
+    ) -> tuple[list[dict[str, Any]], tuple[str, ...], list[str]]:
+        """在业务文档组内逐项查询事实，再与全库候选合并。"""
+        subjects = business_queries.subject_signals(query, query_plan)
         resolved_subjects = list(subjects)
         groups = list(document_ids or [])
         discovery = getattr(self.index, "business_documents", None)
@@ -1091,7 +436,7 @@ class Retriever:
             for subject in subjects[:3]:
                 found = discovery(subject, project_ids, ["approved"], principal_ids, limit=10)
                 if isinstance(found, list) and not found:
-                    repaired = self._grounded_subject_prefix(subject, fused, query_plan)
+                    repaired = business_queries.grounded_subject_prefix(subject, fused, query_plan)
                     if repaired:
                         found = discovery(
                             repaired, project_ids, ["approved"], principal_ids, limit=10
@@ -1105,12 +450,12 @@ class Retriever:
         groups = list(dict.fromkeys(groups))[:30]
         if not groups:
             return fused, subjects, groups
-        facts = self._fact_queries(query, query_plan, subjects)
+        facts = business_queries.fact_queries(query, query_plan, subjects)
         for fact in facts:
             recalled = self._retrieve_for_statuses(
                 fact, project_ids, ["approved"], principal_ids, groups
             )
-            fused = self._merge_fused(fused, recalled)
+            fused = candidate_ranking.merge_fused(fused, recalled)
         trace = _RETRIEVAL_DIAGNOSTICS.get()
         if trace is not None:
             trace.append(
@@ -1124,27 +469,19 @@ class Retriever:
             )
         return fused, subjects, groups
 
-    @staticmethod
-    def _fact_coverage(row, fact):
-        source = row["hit"]["_source"]
-        text = normalize_query(
-            str(source.get("title_path") or "") + " " + str(source.get("content") or "")
-        ).casefold()
-        normalized = normalize_query(fact).casefold()
-        if normalized in text:
-            return 1.0
-        terms = [term for term in lexical_tokens(fact) if len(term) >= 2]
-        return sum(term in text for term in terms) / len(terms) if terms else 0.0
-
-    def _prioritize_facts(self, rows, query_plan):
-        """Reserve evidence for distinct requested facts; keep all remaining candidates ranked."""
+    def _prioritize_facts(
+        self, rows: list[dict[str, Any]], query_plan: QueryPlan | None
+    ) -> list[dict[str, Any]]:
+        """为不同问题项预留证据，其余候选继续保留原有排名。"""
         if not rows or not query_plan:
             return rows
         selected = []
         covered = []
         for fact in query_plan.requested_facts[:6]:
-            best = max(rows, key=lambda row: (self._fact_coverage(row, fact), row["score"]))
-            coverage = self._fact_coverage(best, fact)
+            best = max(
+                rows, key=lambda row: (business_queries.fact_coverage(row, fact), row["score"])
+            )
+            coverage = business_queries.fact_coverage(best, fact)
             covered.append(
                 {
                     "fact": fact,
@@ -1160,7 +497,7 @@ class Retriever:
         return selected + [row for row in rows if row not in selected]
 
     @staticmethod
-    def _trace_candidates(stage, rows):
+    def _trace_candidates(stage: str, rows: list[dict[str, Any]]) -> None:
         trace = _RETRIEVAL_DIAGNOSTICS.get()
         if trace is not None:
             trace.append(
@@ -1178,8 +515,14 @@ class Retriever:
                 }
             )
 
-    def _related_evidence(self, fused, project_ids, principal_ids, enabled):
-        """Choose bounded local expansion, retaining the legacy adapter fallback."""
+    def _related_evidence(
+        self,
+        fused: list[dict[str, Any]],
+        project_ids: list[str],
+        principal_ids: list[str] | None,
+        enabled: bool,
+    ) -> list[dict[str, Any]]:
+        """优先读取命中位置附近的分块；旧适配器沿用文档级扩展。"""
         related_document_ids = list(
             dict.fromkeys(
                 str(row["hit"].get("_source", {}).get("document_id") or "")
@@ -1214,13 +557,21 @@ class Retriever:
                 related_hits = local
         return related_hits
 
-    def _link_seeds(self, fused, query_plan, enabled):
+    def _link_seeds(
+        self,
+        fused: list[dict[str, Any]],
+        query_plan: QueryPlan | None,
+        enabled: bool,
+    ) -> list[dict[str, Any]]:
         seeds = fused
         if enabled and query_plan and query_plan.requested_facts:
             seeds = [
                 row
                 for row in fused
-                if any(self._fact_coverage(row, fact) >= 0.5 for fact in query_plan.requested_facts)
+                if any(
+                    business_queries.fact_coverage(row, fact) >= 0.5
+                    for fact in query_plan.requested_facts
+                )
             ]
         return seeds
 
@@ -1240,25 +591,13 @@ class Retriever:
         fused = self._retrieve_for_statuses(
             query, project_ids, ["approved"], principal_ids, document_ids
         )
-        focus_terms = list(query_plan.subjects) if query_plan else _query_subject_signals(query)
-        focus_query = " ".join(focus_terms)
-        retrieval_queries = (
-            list(query_plan.retrieval_queries)
-            if query_plan
-            else ([focus_query] if focus_query else [])
+        fused = self._recall_planned_queries(
+            query, project_ids, principal_ids, query_plan, document_ids, fused
         )
-        for retrieval_query in retrieval_queries[:4]:
-            retrieval_query = normalize_query(retrieval_query)
-            if not retrieval_query or retrieval_query.casefold() == query.casefold():
-                continue
-            focused = self._retrieve_for_statuses(
-                retrieval_query, project_ids, ["approved"], principal_ids, document_ids
-            )
-            fused = self._merge_fused(fused, focused)
         if section_hints:
-            fused = self._boost_section_matches(fused, section_hints)
+            fused = candidate_ranking.boost_section_matches(fused, section_hints)
         enabled = self.settings.business_retrieval_enabled
-        subjects = self._subject_signals(query, query_plan)
+        subjects = business_queries.subject_signals(query, query_plan)
         subject_documents = []
         if enabled:
             fused, subjects, subject_documents = self._business_channel(
@@ -1267,50 +606,38 @@ class Retriever:
         semantic_anchors = (
             subjects if enabled else (query_plan.anchor_signals if query_plan else ())
         )
-        fused = self._boost_anchor_matches(fused, semantic_anchors)
+        fused = candidate_ranking.boost_anchor_matches(fused, semantic_anchors)
         if (
             query_plan
             and subjects
             and document_ids is None
             and not subject_documents
-            and not self._has_grounded_subject(fused, subjects)
+            and not candidate_selection.has_grounded_subject(fused, subjects)
         ):
             logger.info("Semantic subject was not grounded in any candidate; abstaining")
             return []
         seeds = self._link_seeds(fused, query_plan, enabled)
-        linked_identifiers = self._discover_linked_identifiers(
+        linked_identifiers = candidate_selection.discover_linked_identifiers(
             query,
             seeds,
             anchor_signals=semantic_anchors or None,
         )
         semantic_context = query_plan.rerank_context() if query_plan else ""
         if linked_identifiers:
-            exact_expansion = self._retrieve_linked_identifier_rows(
+            fused = self._recall_references(
+                query,
+                semantic_context,
                 linked_identifiers,
                 project_ids,
-                ["approved"],
                 principal_ids,
                 document_ids,
+                fused,
             )
-            fused = self._merge_fused(fused, exact_expansion)
-            expanded_query = "\n".join(
-                part
-                for part in [
-                    query,
-                    semantic_context,
-                    "Approved cross-document references: " + " ".join(linked_identifiers),
-                ]
-                if part
-            )
-            expanded = self._retrieve_for_statuses(
-                expanded_query, project_ids, ["approved"], principal_ids, document_ids
-            )
-            fused = self._merge_fused(fused, expanded)
-        fused = self._deduplicate_content(fused)
-        fused = self._enforce_exact_identifiers(query, fused, linked_identifiers)
+        fused = candidate_ranking.deduplicate_content(fused)
+        fused = candidate_selection.enforce_exact_identifiers(query, fused, linked_identifiers)
         self._trace_candidates("before_subject_filter", fused)
         if document_ids is None:
-            fused = self._prefer_complete_entity_matches(
+            fused = candidate_selection.prefer_complete_entity_matches(
                 query,
                 fused,
                 linked_identifiers,
@@ -1321,7 +648,7 @@ class Retriever:
         if enabled:
             fused = self._prioritize_facts(fused, query_plan)
         related_hits = self._related_evidence(fused, project_ids, principal_ids, enabled)
-        candidates = self._select_rerank_candidate_pool(
+        candidates = candidate_selection.select_rerank_candidate_pool(
             fused,
             related_hits,
             limit=self.settings.rerank_candidates,
@@ -1340,17 +667,63 @@ class Retriever:
             semantic_anchors=semantic_anchors,
         )
 
-    @staticmethod
-    def _boost_section_matches(
-        rows: list[dict[str, Any]], section_hints: tuple[str, ...]
+    def _recall_planned_queries(
+        self,
+        query: str,
+        project_ids: list[str],
+        principal_ids: list[str] | None,
+        query_plan: QueryPlan | None,
+        document_ids: list[str] | None,
+        fused: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """把用户明确提及的标题片段作为软加权，不把它变成硬过滤。"""
+        """原问题召回之后，再合并查询计划给出的有限个改写。"""
+        focus_terms = list(query_plan.subjects) if query_plan else _query_subject_signals(query)
+        focus_query = " ".join(focus_terms)
+        retrieval_queries = (
+            list(query_plan.retrieval_queries)
+            if query_plan
+            else ([focus_query] if focus_query else [])
+        )
+        for retrieval_query in retrieval_queries[:4]:
+            retrieval_query = normalize_query(retrieval_query)
+            if not retrieval_query or retrieval_query.casefold() == query.casefold():
+                continue
+            focused = self._retrieve_for_statuses(
+                retrieval_query, project_ids, ["approved"], principal_ids, document_ids
+            )
+            fused = candidate_ranking.merge_fused(fused, focused)
+        return fused
 
-        hints = [normalize_query(value).casefold() for value in section_hints if value.strip()]
-        boosted = []
-        for row in rows:
-            source = row.get("hit", {}).get("_source", {})
-            path = str(source.get("section_path") or source.get("title_path") or "").casefold()
-            matches = sum(hint in path for hint in hints)
-            boosted.append({**row, "score": float(row.get("score") or 0.0) * (1 + 0.2 * matches)})
-        return sorted(boosted, key=lambda item: item["score"], reverse=True)
+    def _recall_references(
+        self,
+        query: str,
+        semantic_context: str,
+        linked_identifiers: list[str],
+        project_ids: list[str],
+        principal_ids: list[str] | None,
+        document_ids: list[str] | None,
+        fused: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """沿已命中的编号补充原文，同时保持原有文档和权限范围。"""
+        exact_expansion = self._retrieve_linked_identifier_rows(
+            linked_identifiers,
+            project_ids,
+            ["approved"],
+            principal_ids,
+            document_ids,
+        )
+        fused = candidate_ranking.merge_fused(fused, exact_expansion)
+        expanded_query = "\n".join(
+            part
+            for part in [
+                query,
+                semantic_context,
+                "Approved cross-document references: " + " ".join(linked_identifiers),
+            ]
+            if part
+        )
+        expanded = self._retrieve_for_statuses(
+            expanded_query, project_ids, ["approved"], principal_ids, document_ids
+        )
+        fused = candidate_ranking.merge_fused(fused, expanded)
+        return fused

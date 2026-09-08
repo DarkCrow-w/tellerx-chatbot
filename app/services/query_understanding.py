@@ -13,16 +13,16 @@ from typing import Any, Protocol
 from sqlalchemy.orm import Session
 
 from app.integrations.openai_client import ChatCallResult, parse_json_object
-from app.integrations.search import (
-    ACRONYM,
-    EXACT_IDENTIFIER,
-    _query_subject_signals,
-    normalize_query,
-)
 from app.knowledge.document_scope import (
     compact_document_name,
     has_meaningful_document_hint,
     normalize_document_name,
+)
+from app.knowledge.search_text import (
+    ACRONYM,
+    EXACT_IDENTIFIER,
+    _query_subject_signals,
+    normalize_query,
 )
 from app.services.model_router import NoModelAvailable
 

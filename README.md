@@ -250,3 +250,7 @@ ruff check app
 设置为 `false` 可关闭新增业务检索通道及事实排序，保留原有全库召回路径；主体解析的错误修复仍生效，因此此开关不代表逐字节恢复旧版本。检索追踪中的 `candidate_stages` 记录文档组、查询项、过滤前后候选排名和最终候选。`fact_coverage` 是词法诊断，不等于事实已被语义验证。
 
 设计与测试见 [业务关键词检索方案](docs/global-business-keyword-retrieval-plan.md)。
+
+### 阅读和维护代码
+
+从 [代码阅读与维护指南](docs/code-navigation.md) 开始，了解问答、检索、入库和知识库页面的调用顺序，以及每类规则应该修改的位置。

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -12,13 +11,14 @@ from typing import Protocol
 
 from sqlalchemy.orm import Session
 
-from app.contracts.schemas import ChatResponse, CitationOut
+from app.contracts.schemas import ChatResponse
 from app.core.config import Settings
 from app.db.models import Conversation, Message
 from app.integrations.openai_client import ChatCallResult, parse_json_object
-from app.integrations.search import _lexical_signals, normalize_query
 from app.knowledge.evidence import Evidence
+from app.knowledge.search_text import normalize_query
 from app.repositories.chat import ChatRepository
+from app.services.answer_bridges import attach_cross_document_bridges
 from app.services.answer_contract import (
     SYSTEM_PROMPT,
     AnswerValidationError,
@@ -99,14 +99,6 @@ class GenerationResult:
     failure_kind: str = "validation"
 
 
-BRIDGE_IDENTIFIER = re.compile(
-    r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]{1,12}-\d{2,}(?:-[A-Za-z0-9]+)*)",
-    re.IGNORECASE,
-)
-ZH_BRIDGE_SUBJECT = re.compile(
-    r"^([\u3400-\u9fff]{2,20}?)\s*(?:当前|的|在|受|使用|由|如果|若|最新)"
-)
-
 CITATION_CORRECTION_PROMPT = """
 
 PREVIOUS_OUTPUT_REJECTED: Return a fresh JSON object. Copy each quote exactly and
@@ -116,113 +108,6 @@ compact. Prioritize the most important supported facts instead of producing an
 exhaustive answer. For cross-document joins, cite the subject-to-identifier bridge
 evidence together with the downstream value evidence.
 """
-
-
-def attach_cross_document_bridges(
-    question: str, validated: ValidatedAnswer, evidence: list[Evidence]
-) -> ValidatedAnswer:
-    """为跨文档声明补充确定性的来源桥接，但不新增或改写事实。"""
-
-    if validated.status not in {"answered", "conflict"}:
-        return validated
-    query_ids = {value.casefold() for value in BRIDGE_IDENTIFIER.findall(question)}
-    subject_anchors = {
-        *query_ids,
-        *(value.casefold() for value in _lexical_signals(question)),
-        *(match.group(1).casefold() for match in ZH_BRIDGE_SUBJECT.finditer(question)),
-    }
-    if not subject_anchors:
-        return validated
-    by_id = {item.chunk_id: item for item in evidence}
-    source_keys = {(source.chunk_id, source.quote) for source in validated.sources}
-    for claim in validated.claims:
-        cited = [by_id[citation] for citation in claim.citations if citation in by_id]
-        downstream_ids = {
-            value.casefold()
-            for item in cited
-            for value in BRIDGE_IDENTIFIER.findall(
-                " ".join([item.heading_path or "", item.content])
-            )
-            if value.casefold() not in query_ids
-        }
-        if not downstream_ids:
-            continue
-        bridge_candidates = [
-            item
-            for item in evidence
-            if item.chunk_id not in claim.citations
-            and any(
-                anchor
-                in " ".join([item.filename, item.heading_path or "", item.content]).casefold()
-                for anchor in subject_anchors
-            )
-            and any(
-                identifier
-                in " ".join([item.filename, item.heading_path or "", item.content]).casefold()
-                for identifier in downstream_ids
-            )
-        ]
-        preferred_bridge_types = {
-            "business-requirement",
-            "requirement",
-            "terminology-registry",
-            "mapping",
-            "reference-index",
-        }
-        bridge = max(
-            bridge_candidates,
-            key=lambda item: (
-                item.document_type.casefold() in preferred_bridge_types,
-                sum(
-                    anchor in " ".join([item.heading_path or "", item.content]).casefold()
-                    for anchor in subject_anchors
-                ),
-                sum(
-                    identifier in " ".join([item.heading_path or "", item.content]).casefold()
-                    for identifier in downstream_ids
-                ),
-            ),
-            default=None,
-        )
-        if bridge is None:
-            continue
-        quote_parts = [
-            part.strip()
-            for part in re.split(r"(?<=[。！？.!?])\s*|\n+", bridge.content)
-            if part.strip()
-        ]
-        quote = next(
-            (
-                part
-                for part in quote_parts
-                if any(identifier in part.casefold() for identifier in downstream_ids)
-            ),
-            quote_parts[0] if quote_parts else bridge.content.strip(),
-        )
-        if not quote:
-            continue
-        claim.citations = list(dict.fromkeys([*claim.citations, bridge.chunk_id]))
-        key = (bridge.chunk_id, quote)
-        if key not in source_keys:
-            validated.sources.append(
-                CitationOut(
-                    chunk_id=bridge.chunk_id,
-                    document_id=bridge.document_id,
-                    filename=bridge.filename,
-                    document_status=bridge.document_status,
-                    heading_path=bridge.heading_path,
-                    section_id=bridge.section_id,
-                    breadcrumb=list(bridge.breadcrumb),
-                    section_level=bridge.section_level,
-                    location_confidence=bridge.location_confidence,
-                    page_number=bridge.page_number,
-                    sheet_name=bridge.sheet_name,
-                    cell_range=bridge.cell_range,
-                    quote=quote,
-                )
-            )
-            source_keys.add(key)
-    return validated
 
 
 class AnswerService:
@@ -617,57 +502,47 @@ class AnswerService:
             section_path=section_path,
         )
 
-        if not preparation.evidence:
-            # 无证据时不调用模型，直接返回语言匹配的确定性拒答。
-            if preparation.failure_reason == "ambiguous_document":
-                status = "clarification_required"
-                answer = "匹配到多份名称相近的文档，请先选择要查询的文档。"
-            elif preparation.failure_reason == "document_not_found":
-                status = "insufficient_evidence"
-                answer = "未找到指定的当前有效文档，因此没有从其他文档拼凑答案。"
-            else:
-                status = "insufficient_evidence"
-                answer = refusal_text(question)
-            validated = ValidatedAnswer(
-                status=status,
-                answer=answer,
-                claims=[],
-                sources=[],
-            )
-            return self._persist_response(
+        if preparation.evidence:
+            generation = self._generate_answer(
                 db,
-                conversation=conversation,
                 question=question,
-                validated=validated,
-                model_id=None,
-                trace_id=trace_id,
-                started_at=started_at,
-                project_ids=project_ids,
                 preparation=preparation,
-                actual_tier=None,
+                pinned_model=pinned_model,
             )
+            validated = generation.validated or self._generation_refusal(question, generation)
+        else:
+            # 范围不明确或没有证据时，无需请求生成模型。
+            generation = GenerationResult(None, None, None)
+            validated = self._retrieval_refusal(question, preparation.failure_reason)
 
-        generation = self._generate_answer(
+        return self._persist_response(
             db,
+            conversation=conversation,
             question=question,
+            validated=validated,
+            model_id=generation.model_id,
+            trace_id=trace_id,
+            started_at=started_at,
+            project_ids=project_ids,
             preparation=preparation,
-            pinned_model=pinned_model,
+            actual_tier=generation.actual_tier,
         )
-        if generation.validated is not None:
-            return self._persist_response(
-                db,
-                conversation=conversation,
-                question=question,
-                validated=generation.validated,
-                model_id=generation.model_id,
-                trace_id=trace_id,
-                started_at=started_at,
-                project_ids=project_ids,
-                preparation=preparation,
-                actual_tier=generation.actual_tier,
-            )
 
-        refusal = ValidatedAnswer(
+    @staticmethod
+    def _retrieval_refusal(question: str, failure_reason: str | None) -> ValidatedAnswer:
+        status = "insufficient_evidence"
+        if failure_reason == "ambiguous_document":
+            status = "clarification_required"
+            answer = "匹配到多份名称相近的文档，请先选择要查询的文档。"
+        elif failure_reason == "document_not_found":
+            answer = "未找到指定的当前有效文档，因此没有从其他文档拼凑答案。"
+        else:
+            answer = refusal_text(question)
+        return ValidatedAnswer(status=status, answer=answer, claims=[], sources=[])
+
+    @staticmethod
+    def _generation_refusal(question: str, generation: GenerationResult) -> ValidatedAnswer:
+        return ValidatedAnswer(
             status="insufficient_evidence",
             answer=refusal_text(
                 question,
@@ -676,16 +551,4 @@ class AnswerService:
             ),
             claims=[],
             sources=[],
-        )
-        return self._persist_response(
-            db,
-            conversation=conversation,
-            question=question,
-            validated=refusal,
-            model_id=generation.model_id,
-            trace_id=trace_id,
-            started_at=started_at,
-            project_ids=project_ids,
-            preparation=preparation,
-            actual_tier=generation.actual_tier,
         )
