@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
@@ -288,13 +289,13 @@ class IndexingService:
         db.commit()
 
     @staticmethod
-    def _mark_event_failed(db: Session, event_id: str, exc: Exception) -> None:
+    def _mark_event_failed(db: Session, event_id: str, exc: Exception) -> str:
         """记录指数退避；达到五次失败后把事件和任务转为最终失败。"""
 
         db.rollback()
         event = db.get(OutboxEvent, event_id)
         if event is None:
-            return
+            return "missing"
         event.status = "dead" if event.attempts >= 5 else "pending"
         event.available_at = datetime.now(UTC) + timedelta(
             seconds=min(300, 2 ** min(event.attempts, 8))
@@ -308,30 +309,48 @@ class IndexingService:
             job.status = "failed" if event.status == "dead" else "index_pending"
             job.stage = "indexing_failed" if event.status == "dead" else "indexing_retry"
             job.error_message = event.last_error
+        status = event.status
         db.commit()
+        return status
 
     def publish_event(self, db: Session, event_id: str) -> bool:
         """幂等发布 Outbox 事件，并用退避策略记录可重试或最终失败。"""
 
         event = self._claim_event(db, event_id)
         if event.status == "published":
-            logger.info("索引事件已发布，跳过重复处理 event_id=%s", event_id)
+            logger.debug("索引事件已发布，跳过重复处理 event_id=%s", event_id)
             return True
+        started = time.perf_counter()
+        event_type = event.event_type
         logger.info(
-            "索引事件发布开始 event_id=%s type=%s version_id=%s attempt=%d",
+            "索引事件发布开始 event_id=%s type=%s attempt=%d",
             event_id,
             event.event_type,
-            event.aggregate_id,
             event.attempts,
         )
+        logger.debug("索引事件关联 event_id=%s version_id=%s", event_id, event.aggregate_id)
         try:
             self._dispatch_event(db, event)
             self._mark_event_published(db, event_id)
-            logger.info("索引事件发布完成 event_id=%s type=%s", event_id, event.event_type)
+            logger.info(
+                "索引事件发布完成 event_id=%s type=%s elapsed_ms=%.1f",
+                event_id,
+                event_type,
+                (time.perf_counter() - started) * 1000,
+            )
             return True
         except Exception as exc:
-            self._mark_event_failed(db, event_id, exc)
-            logger.exception("Could not publish outbox event %s", event_id)
+            status = self._mark_event_failed(db, event_id, exc)
+            logger.exception(
+                "索引事件发布失败 event_id=%s type=%s status=%s "
+                "retry_scheduled=%s error=%s elapsed_ms=%.1f",
+                event_id,
+                event_type,
+                status,
+                status == "pending",
+                type(exc).__name__,
+                (time.perf_counter() - started) * 1000,
+            )
             return False
 
     def _publish_version(self, db: Session, event: OutboxEvent) -> None:
@@ -368,6 +387,12 @@ class IndexingService:
                 f"PostgreSQL search verification failed for {version.id}: "
                 f"expected={expected}, actual={actual}"
             )
+        logger.info(
+            "搜索分块校验完成 event_id=%s expected_chunks=%d indexed_chunks=%d",
+            event.id,
+            expected,
+            actual,
+        )
 
         now = datetime.now(UTC)
         chunks = list(

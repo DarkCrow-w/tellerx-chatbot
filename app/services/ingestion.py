@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 
@@ -26,9 +27,9 @@ from app.db.models import (
     IngestionJob,
     OutboxEvent,
 )
-from app.integrations.openai_client import OpenAIModelClient
+from app.integrations.openai_client import ModelAPIError, OpenAIModelClient
 from app.integrations.search import SearchIndex
-from app.integrations.storage import LocalObjectStorage
+from app.integrations.storage import LocalObjectStorage, storage_path_errors
 from app.knowledge.chunking import TextChunk, chunk_units
 from app.knowledge.parsers import DocumentParser
 from app.repositories import ingestion_records
@@ -143,8 +144,9 @@ class IngestionService:
                     )
                     db.flush()
             except IntegrityError:
-                # 并发 Worker 可能已登记同一个不可变向量空间，此时直接复用即可。
-                pass
+                # 仅在并发请求确实已写入同一向量空间时复用，其他约束错误继续抛出。
+                if db.get(EmbeddingModel, fingerprint) is None:
+                    raise
             db.commit()
 
     @staticmethod
@@ -257,13 +259,34 @@ class IngestionService:
         cached: dict[str, EmbeddingCache],
         *,
         version_id: str | None = None,
+        job_id: str | None = None,
     ) -> None:
         """以十条为一批生成缺失向量，避免触发供应商载荷上限。"""
 
+        batch_count = (len(missing) + 9) // 10
         for start in range(0, len(missing), 10):
             if version_id is not None:
                 self._assert_document_active(db, version_id)
-            self._embed_batch(db, missing[start : start + 10], fingerprint, cached)
+            batch = missing[start : start + 10]
+            batch_number = start // 10 + 1
+            started = time.perf_counter()
+            logger.info(
+                "Embedding批次开始 job_id=%s batch=%d/%d inputs=%d",
+                job_id or "-",
+                batch_number,
+                batch_count,
+                len(batch),
+            )
+            self._embed_batch(db, batch, fingerprint, cached)
+            logger.info(
+                "Embedding批次完成 job_id=%s batch=%d/%d completed=%d/%d elapsed_ms=%.1f",
+                job_id or "-",
+                batch_number,
+                batch_count,
+                start + len(batch),
+                len(missing),
+                (time.perf_counter() - started) * 1000,
+            )
 
     def _embeddings(
         self,
@@ -272,19 +295,25 @@ class IngestionService:
         warnings: list[str],
         *,
         version_id: str | None = None,
+        job_id: str | None = None,
     ) -> dict[str, EmbeddingCache]:
         """优先复用内容寻址的向量缓存，仅为缺失内容批量请求新向量。"""
 
+        started = time.perf_counter()
         self._ensure_embedding_model(db)
         fingerprint = self.settings.embedding_fingerprint
         cached = self._load_embedding_cache(db, chunks, fingerprint)
         missing_chunks = self._missing_embedding_chunks(chunks, set(cached))
         logger.info(
-            "向量缓存检查完成 chunks=%d cached=%d missing=%d fingerprint=%s",
+            "Embedding准备完成 job_id=%s chunks=%d unique_inputs=%d cached=%d missing=%d "
+            "model=%s dimensions=%d",
+            job_id or "-",
             len(chunks),
+            len({chunk.embedding_input_hash for chunk in chunks}),
             len(cached),
             len(missing_chunks),
-            fingerprint,
+            self.settings.embedding_model,
+            self.settings.embedding_dimensions,
         )
         try:
             self._generate_missing_embeddings(
@@ -293,19 +322,34 @@ class IngestionService:
                 fingerprint,
                 cached,
                 version_id=version_id,
+                job_id=job_id,
             )
         except IngestionCancelled:
             raise
-        except Exception as exc:
+        except ModelAPIError as exc:
             db.rollback()
             if not self.settings.allow_bm25_only:
                 raise
             # 开启降级时保留词法索引能力，避免向量服务故障阻塞整个入库链路。
             logger.warning(
-                "Embedding不可用，降级为BM25-only error=%s",
-                type(exc).__name__,
+                "Embedding服务失败，保留已缓存向量并使用关键词检索 "
+                "job_id=%s cached=%d missing=%d status=%s code=%s elapsed_ms=%.1f",
+                job_id or "-",
+                len(cached),
+                len(self._missing_embedding_chunks(chunks, set(cached))),
+                exc.status_code,
+                exc.code,
+                (time.perf_counter() - started) * 1000,
             )
             warnings.append(f"Embedding unavailable; indexed for BM25 only ({type(exc).__name__})")
+        else:
+            logger.info(
+                "Embedding阶段完成 job_id=%s cached=%d generated=%d elapsed_ms=%.1f",
+                job_id or "-",
+                len(cached),
+                len(missing_chunks),
+                (time.perf_counter() - started) * 1000,
+            )
         return cached
 
     def _save_normalized_artifact(
@@ -400,21 +444,29 @@ class IngestionService:
         )
         if not version:
             raise ValueError(f"Unknown document version: {job.version_id}")
+        started = time.perf_counter()
         logger.info(
-            "入库任务处理开始 job_id=%s document_id=%s version_id=%s filename=%s",
+            "入库任务处理开始 job_id=%s filename=%s",
+            job_id,
+            version.document.filename,
+        )
+        logger.debug(
+            "入库任务关联 job_id=%s document_id=%s version_id=%s",
             job_id,
             version.document_id,
             version.id,
-            version.document.filename,
         )
+        stage = "parsing"
         try:
             self._assert_document_active(db, version.id)
             text_chunks, warnings = self._parse_document(db, job, version)
+            stage = "embedding"
             cache = self._embeddings(
                 db,
                 text_chunks,
                 warnings,
                 version_id=version.id,
+                job_id=job_id,
             )
             self._assert_document_active(db, version.id)
             version.technical_status = (
@@ -422,15 +474,18 @@ class IngestionService:
                 if len(cache) == len({item.embedding_input_hash for item in text_chunks})
                 else "bm25_only"
             )
+            stage = "persisting"
             event_id = self._persist_chunks_and_event(
                 db, job, version, text_chunks, cache, warnings
             )
             logger.info(
-                "入库数据写入完成 job_id=%s event_id=%s chunks=%d embeddings=%d",
+                "入库数据写入完成，等待索引发布 job_id=%s event_id=%s "
+                "chunks=%d embeddings=%d elapsed_ms=%.1f",
                 job_id,
                 event_id,
                 len(text_chunks),
                 len(cache),
+                (time.perf_counter() - started) * 1000,
             )
             return event_id
         except IngestionCancelled:
@@ -462,7 +517,13 @@ class IngestionService:
                 if version:
                     version.technical_status = "failed_final"
                 db.commit()
-            logger.exception("Ingestion job %s failed", job_id)
+            logger.exception(
+                "入库任务失败 job_id=%s stage=%s error=%s elapsed_ms=%.1f",
+                job_id,
+                stage,
+                type(exc).__name__,
+                (time.perf_counter() - started) * 1000,
+            )
             raise
 
     def _parse_document(
@@ -484,7 +545,25 @@ class IngestionService:
         )
         db.commit()
         source_path = self.storage.resolve(version.storage_path)
-        units, warnings = self.parser.parse(source_path)
+        started = time.perf_counter()
+        logger.info("文档解析开始 job_id=%s format=%s", job.id, source_path.suffix.lower())
+        with storage_path_errors():
+            units, warnings = self.parser.parse(source_path)
+        logger.info(
+            "文档解析完成 job_id=%s units=%d warnings=%d elapsed_ms=%.1f",
+            job.id,
+            len(units),
+            len(warnings),
+            (time.perf_counter() - started) * 1000,
+        )
+        started = time.perf_counter()
+        logger.info(
+            "文档切块开始 job_id=%s target_tokens=%d max_tokens=%d overlap_tokens=%d",
+            job.id,
+            self.settings.chunk_target_tokens,
+            self.settings.chunk_max_tokens,
+            self.settings.chunk_overlap_tokens,
+        )
         text_chunks = chunk_units(
             units,
             target_tokens=self.settings.chunk_target_tokens,
@@ -495,11 +574,14 @@ class IngestionService:
             raise ValueError("Parser produced no chunks")
         self._prepare_embedding_inputs(text_chunks, version.document)
         logger.info(
-            "文档解析切块完成 job_id=%s units=%d chunks=%d warnings=%d",
+            "文档切块完成 job_id=%s chunks=%d total_tokens=%d "
+            "min_chunk_tokens=%d max_chunk_tokens=%d elapsed_ms=%.1f",
             job.id,
-            len(units),
             len(text_chunks),
-            len(warnings),
+            sum(chunk.token_count for chunk in text_chunks),
+            min(chunk.token_count for chunk in text_chunks),
+            max(chunk.token_count for chunk in text_chunks),
+            (time.perf_counter() - started) * 1000,
         )
         self._assert_document_active(db, version.id)
         self._save_normalized_artifact(db, version, units, warnings)

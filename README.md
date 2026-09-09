@@ -1,6 +1,6 @@
 # TellerX Knowledge Chatbot — 纯源码版
 
-本分支保留 React 前端、FastAPI 后端、本地自动化测试、独立初始数据库迁移与必要依赖和配置。Python 源码统一使用 `.txt` 后缀，包括包入口、测试和迁移；内容仍是 Python，阅读交付版不能直接启动后端。
+本分支保留 React 前端、FastAPI 后端、本地自动化测试、独立初始数据库迁移与必要依赖和配置。Python 源码、测试和迁移已恢复 `.py` 后缀，安装依赖并完成配置后即可运行。
 
 ## 目录
 
@@ -8,41 +8,21 @@
 | --- | --- |
 | `frontend/src/` | 聊天、流式进度、证据卡片、知识库管理与前端测试 |
 | `frontend/index.html`、`frontend/vite.config.js` | 前端入口与构建配置 |
-| `app/` | 后端接口、用例、检索、入库、模型与数据访问源码（`.txt`） |
-| `tests/` | 后端本地测试（`.txt`），使用测试替身或内存 SQLite |
+| `app/` | 后端接口、用例、检索、入库、模型与数据访问源码 |
+| `tests/` | 后端本地测试，使用测试替身或内存 SQLite |
 | `alembic/`、`alembic.ini` | 数据库初始迁移与迁移配置 |
 | `config/models.yaml`、`.env.example` | 模型注册表与不含真实凭据的环境模板 |
 | `pyproject.toml`、`package.json`、`package-lock.json` | 安装、测试和构建依赖 |
 
 评估脚本、评估数据、设计文档及依赖独立 PostgreSQL 的集成测试已移除。运行数据、构建产物、虚拟环境、依赖目录和真实 `.env` 不属于交付内容。
 
-## 恢复 Python 后缀
-
-需要运行时，先复制本分支到独立目录，再在复制目录根路径执行下列命令。仅转换三个源码目录；不会重命名业务文档或第三方依赖。
-
-```bash
-python3 - <<'PY'
-from pathlib import Path
-
-sources = [path for root in ("app", "tests", "alembic")
-           for path in Path(root).rglob("*.txt")]
-conflicts = [path.with_suffix(".py") for path in sources
-             if path.with_suffix(".py").exists()]
-if conflicts:
-    raise SystemExit(f"目标文件已存在，未执行转换：{conflicts}")
-for path in sources:
-    path.rename(path.with_suffix(".py"))
-print(f"已恢复 {len(sources)} 个 Python 文件")
-PY
-```
-
-文件内的 Python 导入路径与工具配置保持运行时写法，无需修改。`alembic/script.py.mako` 是迁移生成模板，不是 `.py` 源文件，因此保留原名。
+`alembic/script.py.mako` 是迁移生成模板，保留原名。
 
 ## 安装与配置
 
 要求 Python 3.12 或更新版本、Node.js `^20.19.0` 或 `>=22.12.0`。运行后端还需 PostgreSQL、pgvector 0.7.0 或更新版本及 `pg_trgm` 扩展，以及可用的 OpenAI 兼容模型服务。
 
-恢复后缀后执行：
+在项目根目录执行：
 
 ```bash
 python3 -m venv .venv
@@ -58,7 +38,7 @@ cp .env.example .env
 
 ## 数据库初版
 
-唯一迁移是 `alembic/versions/0001_initial.txt`，恢复后缀后为 `.py`；`down_revision = None`。
+唯一迁移是 `alembic/versions/0001_initial.py`；`down_revision = None`。
 
 该初版固定了原迁移链截至 `0006_hierarchical_retrieval` 的最终结构，直接创建 21 张业务表，包括文档版本、章节树、向量缓存、入库任务、查询追踪和搜索投影。保留全文搜索、三元组索引、`halfvec(2560)`、HNSW 索引及当前批准版本的唯一性约束。迁移不导入应用模型，也不包含历史数据回填。
 
@@ -82,13 +62,31 @@ npm run local
 
 支持文档上传、版本管理、全库或指定文档检索、流式处理进度、引用原文、章节上下文和证据文档下载。解析、向量化及索引发布由后端后台任务处理。
 
+上传文件的磁盘名称使用固定长度的内容哈希和扩展名，界面仍显示原文件名，避免长文件名
+叠加临时标识后超出 Windows 限制。若存储目录本身过深，保存或解析时会明确提示路径过长；
+可将 `STORAGE_ROOT` 配置为较短的绝对路径，例如 `C:/tx-data`。已有文件不会自动搬迁。
+
+回答默认输出预算为 `ANSWER_MAX_TOKENS=8192`。模型报告输出截断，或返回无法解析的 JSON 时，
+最多重试一次，使用 `ANSWER_RETRY_MAX_TOKENS=16384`。两个配置都必须为正数，重试预算不能
+低于初次预算，并应符合所用模型的输出和上下文限制。重试后仍失败会返回明确的截断或 JSON
+格式错误；流式接口同时返回 `answer_output_truncated` 或 `answer_invalid_json` 错误码。
+答案可以按问题需要展开最多 16 条有引用的论点，引用校验和检索预算保持不变。
+
+日志默认输出到终端；可设置 `LOG_LEVEL=DEBUG` 查看调用细节。切块日志记录解析单元数、
+分块数、估算 Token 数及耗时；Embedding 日志记录缓存命中、待生成数量、批次进度及耗时；
+索引日志记录预期/实际分块数和重试状态。正常请求在 INFO 级别记录完成摘要，详细关联 ID
+和调用审计放在 DEBUG 级别，不逐块输出正文、向量或哈希。
+
+模型服务异常可按 `ALLOW_BM25_ONLY` 配置降级；程序错误、数据库和存储异常继续抛出。
+向量响应会校验数量、索引、维度及数值有效性；入库失败保存失败阶段并记录堆栈。
+
 ## 本地测试与构建
 
-恢复后缀后执行：
+在项目根目录执行：
 
 ```bash
 python -m pytest -q
-ruff check app tests/test_initial_migration.py
+ruff check app tests
 npm test
 npm run build
 ```

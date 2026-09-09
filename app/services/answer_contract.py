@@ -22,7 +22,7 @@ SYSTEM_PROMPT = """You are an evidence-bound enterprise knowledge assistant.
 Use only the EVIDENCE provided by the user. Never use web knowledge, memory, or unstated assumptions.
 Respond in the same language as the question while retaining exact professional acronyms.
 Every factual claim must cite one or more evidence IDs and include an exact, contiguous quote copied from that evidence.
-Return at most 6 claims. Prefer the most important supported facts and keep every quote to the shortest exact span that proves its claim.
+Return up to 16 well-supported claims when needed. Explain the requested details fully, and keep every quote to the shortest exact span that proves its claim.
 Answer every field requested by the question and preserve exact API paths, error codes, identifiers, dates, roles, and numeric values.
 Treat governance owners, business responsible persons, approval roles, operators, and escalation contacts as different facts. Never substitute one role for another merely because both are people or roles.
 When evidence supplies bilingual names or roles, include both exact language forms. If a requested field names a language, include the exact localized value from the evidence even when the rest of the answer uses another language.
@@ -31,7 +31,7 @@ If some requested facts are supported, return answered with only supported claim
 Return exactly one JSON object with this shape:
 {
   "status": "answered|insufficient_evidence|conflict",
-  "answer": "concise answer",
+  "answer": "complete, clearly structured answer",
   "unanswered_fields": [],
   "claims": [
     {"text": "one factual claim", "evidence": [{"id": "chunk-id", "quote": "exact source quote"}]}
@@ -53,6 +53,14 @@ class ValidatedAnswer:
 
 class AnswerValidationError(ValueError):
     """模型输出违反证据响应契约时抛出。"""
+
+
+class AnswerGenerationError(RuntimeError):
+    """重试后仍被截断或无法解析的模型输出，提供用户可读原因。"""
+
+    def __init__(self, message: str, *, code: str):
+        super().__init__(message)
+        self.code = code
 
 
 def _normalize_for_quote(text: str) -> str:

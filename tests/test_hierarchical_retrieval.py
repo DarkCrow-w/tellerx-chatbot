@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.db import Base
 from app.db.models import Chunk, Document, DocumentSection, DocumentVersion, Project
+from app.integrations.openai_client import ModelAPIError
 from app.knowledge.chunking import TextChunk
 from app.knowledge.document_scope import normalize_document_name, score_document_name
 from app.knowledge.parsers import DocumentParser
@@ -147,7 +148,7 @@ class RetrievalScopeDecisionTest(unittest.TestCase):
         ]
         self.index.lexical_search.return_value = []
         self.index.vector_search.return_value = []
-        self.model.embeddings.side_effect = RuntimeError("offline")
+        self.model.embeddings.side_effect = ModelAPIError("offline", code="connection_error")
         result = self.retriever.search_with_scope(
             "支付平台二期文档里怎么签名？",
             ["project"],
@@ -172,7 +173,7 @@ class RetrievalScopeDecisionTest(unittest.TestCase):
     def test_no_document_hint_keeps_global_search_path(self) -> None:
         self.index.lexical_search.return_value = []
         self.index.vector_search.return_value = []
-        self.model.embeddings.side_effect = RuntimeError("offline")
+        self.model.embeddings.side_effect = ModelAPIError("offline", code="connection_error")
         result = self.retriever.search_with_scope(
             "鉴权失败怎么处理？",
             ["project"],
@@ -186,7 +187,7 @@ class RetrievalScopeDecisionTest(unittest.TestCase):
     def test_cross_source_intent_is_preserved_without_a_document_filter(self) -> None:
         self.index.lexical_search.return_value = []
         self.index.vector_search.return_value = []
-        self.model.embeddings.side_effect = RuntimeError("offline")
+        self.model.embeddings.side_effect = ModelAPIError("offline", code="connection_error")
         plan = replace(
             fallback_query_plan("比较两个系统的超时规则", "test"),
             retrieval_intent="cross_source",

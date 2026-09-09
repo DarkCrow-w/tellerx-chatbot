@@ -21,6 +21,7 @@ from app.repositories.chat import ChatRepository
 from app.services.answer_bridges import attach_cross_document_bridges
 from app.services.answer_contract import (
     SYSTEM_PROMPT,
+    AnswerGenerationError,
     AnswerValidationError,
     ValidatedAnswer,
     build_evidence_prompt,
@@ -104,10 +105,18 @@ CITATION_CORRECTION_PROMPT = """
 
 PREVIOUS_OUTPUT_REJECTED: Return a fresh JSON object. Copy each quote exactly and
 contiguously from one evidence block. Do not paraphrase inside quote fields. Return
-at most 6 claims, use the shortest sufficient quote for each claim, and keep the JSON
-compact. Prioritize the most important supported facts instead of producing an
-exhaustive answer. For cross-document joins, cite the subject-to-identifier bridge
+up to 16 claims, use the shortest sufficient quote for each claim, and produce a
+complete JSON object with enough detail to answer all supported question fields.
+For cross-document joins, cite the subject-to-identifier bridge
 evidence together with the downstream value evidence.
+"""
+
+JSON_CORRECTION_PROMPT = """
+
+PREVIOUS_JSON_INVALID: Generate the complete answer again as one valid JSON object.
+Close all strings, arrays and objects; escape quotes and line breaks within strings.
+Do not append Markdown fences or commentary outside the JSON. Keep all factual
+claims grounded in the provided evidence, with exact source quotes.
 """
 
 
@@ -342,6 +351,31 @@ class AnswerService:
             failure_reason=outcome.failure_reason,
         )
 
+    def _validate_generated_answer(
+        self,
+        db: Session,
+        question: str,
+        preparation: AnswerPreparation,
+        content: str,
+    ) -> ValidatedAnswer:
+        """独立校验完整 JSON 与原文引用，扩充输出预算不放宽证据要求。"""
+
+        payload = parse_json_object(content)
+        validated = validate_answer(payload, preparation.evidence)
+        validated = attach_cross_document_bridges(question, validated, preparation.evidence)
+        if validated.status == "insufficient_evidence":
+            validated.answer = refusal_text(question)
+        self._validate_live_sources(db, validated, preparation.evidence)
+        missing = payload.get("unanswered_fields", [])
+        if validated.status == "answered" and isinstance(missing, list):
+            labels = [fact for fact in preparation.query_plan.requested_facts if fact in missing]
+            if labels:
+                prefix = "Missing evidence for: "
+                if preparation.query_plan.language != "en":
+                    prefix = "以下问题项未找到充分证据："
+                validated.answer += "\n" + prefix + "、".join(labels)
+        return validated
+
     def _generate_answer(
         self,
         db: Session,
@@ -359,16 +393,18 @@ class AnswerService:
         model_id: str | None = None
         attempted_tier = tier
         failure_kind = "validation"
+        max_tokens = self.settings.answer_max_tokens
         for attempt in range(2):
             # 第二次只提升非固定的 Plus 请求；固定模型评测必须保持可重复。
             if attempt == 1 and tier == "plus" and not pinned_model:
                 attempted_tier = "max"
             logger.info(
-                "回答生成尝试 attempt=%d tier=%s pinned=%s evidence_count=%d",
+                "回答生成尝试 attempt=%d tier=%s pinned=%s evidence_count=%d max_tokens=%d",
                 attempt + 1,
                 attempted_tier,
                 bool(pinned_model),
                 len(preparation.evidence),
+                max_tokens,
             )
             progress(
                 "generating",
@@ -382,36 +418,25 @@ class AnswerService:
                     user_prompt=user_prompt,
                     pinned_model=pinned_model,
                     prompt_version=self.settings.prompt_version,
+                    max_tokens=max_tokens,
                 )
                 progress("validating", "正在核对答案与原文引用")
                 model_id = call.model_id
-                payload = parse_json_object(call.content)
-                validated = validate_answer(
-                    payload,
-                    preparation.evidence,
-                )
-                validated = attach_cross_document_bridges(
-                    question,
-                    validated,
-                    preparation.evidence,
-                )
-                if validated.status == "insufficient_evidence":
-                    validated.answer = refusal_text(question)
-                self._validate_live_sources(db, validated, preparation.evidence)
-                missing = payload.get("unanswered_fields", [])
-                if validated.status == "answered" and isinstance(missing, list):
-                    labels = [
-                        fact for fact in preparation.query_plan.requested_facts if fact in missing
-                    ]
-                    if labels:
-                        prefix = (
-                            "Missing evidence for: "
-                            if preparation.query_plan.language == "en"
-                            else "以下问题项未找到充分证据："
-                        )
-                        validated.answer += "\n" + prefix + "、".join(labels)
+                validated = self._validate_generated_answer(db, question, preparation, call.content)
                 return GenerationResult(validated, model_id, attempted_tier)
-            except NoModelAvailable:
+            except NoModelAvailable as exc:
+                if exc.code == "output_truncated":
+                    failure_kind = "output_truncated"
+                    model_id = exc.model_id
+                    logger.warning(
+                        "回答达到输出上限 attempt=%d max_tokens=%d retry=%s next_max_tokens=%d",
+                        attempt + 1,
+                        max_tokens,
+                        attempt == 0,
+                        self.settings.answer_retry_max_tokens,
+                    )
+                    max_tokens = self.settings.answer_retry_max_tokens
+                    continue
                 failure_kind = "provider"
                 # Max 不可用时，允许一次仍受证据约束的 Plus 降级。
                 if tier == "max" and attempt == 0 and not pinned_model:
@@ -421,15 +446,26 @@ class AnswerService:
                     attempted_tier = "plus"
                     continue
                 break
-            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            except json.JSONDecodeError as exc:
+                failure_kind = "invalid_json"
                 logger.warning(
-                    "Answer output rejected; retrying with citation correction (%s: %s)",
+                    "回答JSON格式错误 attempt=%d line=%d column=%d retry=%s",
+                    attempt + 1,
+                    exc.lineno,
+                    exc.colno,
+                    attempt == 0,
+                )
+                max_tokens = self.settings.answer_retry_max_tokens
+                user_prompt += JSON_CORRECTION_PROMPT
+            except (TypeError, ValueError) as exc:
+                failure_kind = "validation"
+                logger.warning(
+                    "回答证据校验失败 attempt=%d error=%s retry=%s",
+                    attempt + 1,
                     type(exc).__name__,
-                    str(exc),
+                    attempt == 0,
                 )
                 user_prompt += CITATION_CORRECTION_PROMPT
-                if pinned_model:
-                    continue
         return GenerationResult(None, model_id, attempted_tier, failure_kind)
 
     def _persist_response(
@@ -572,6 +608,17 @@ class AnswerService:
 
     @staticmethod
     def _generation_refusal(question: str, generation: GenerationResult) -> ValidatedAnswer:
+        if generation.failure_kind == "output_truncated":
+            raise AnswerGenerationError(
+                "回答达到模型输出上限，扩大输出预算重试后仍未完整生成。"
+                "请将问题拆分，或在模型支持范围内提高 ANSWER_RETRY_MAX_TOKENS 后重试。",
+                code="answer_output_truncated",
+            )
+        if generation.failure_kind == "invalid_json":
+            raise AnswerGenerationError(
+                "模型返回的答案不是完整、有效的 JSON，重新生成后仍无法解析。请稍后重试。",
+                code="answer_invalid_json",
+            )
         return ValidatedAnswer(
             status="insufficient_evidence",
             answer=refusal_text(

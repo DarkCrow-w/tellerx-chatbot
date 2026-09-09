@@ -32,6 +32,11 @@ class RegisteredModel:
 class NoModelAvailable(RuntimeError):
     """没有满足启用状态、层级和本地配额条件的模型。"""
 
+    def __init__(self, message: str, *, code: str | None = None, model_id: str | None = None):
+        super().__init__(message)
+        self.code = code
+        self.model_id = model_id
+
 
 class ModelRegistry:
     """加载并查询按层级、优先级排序的模型注册表。"""
@@ -59,11 +64,7 @@ class ModelRegistry:
     def by_tier(self, tier: str) -> list[RegisteredModel]:
         """返回指定层级及可服务全部层级的已启用模型。"""
 
-        return [
-            model
-            for model in self.models
-            if model.tier in {tier, "all"} and model.enabled
-        ]
+        return [model for model in self.models if model.tier in {tier, "all"} and model.enabled]
 
 
 COMPLEX_QUERY_MARKERS = {
@@ -212,8 +213,7 @@ class QwenModelRouter:
             bool(pinned_model),
             ",".join(model.id for model in candidates),
         )
-        for model in candidates:
-            local_request_id = str(uuid.uuid4())
+        for position, model in enumerate(candidates):
             try:
                 result = self.client.chat_json(
                     model_id=model.id,
@@ -232,8 +232,8 @@ class QwenModelRouter:
                     latency_ms=result.latency_ms,
                     prompt_version=prompt_version,
                 )
-                logger.info(
-                    "模型调用审计成功 model=%s request_id=%s total_tokens=%d",
+                logger.debug(
+                    "模型用量已记录 model=%s provider_request_id=%s total_tokens=%d",
                     model.id,
                     result.request_id,
                     result.usage.total_tokens,
@@ -241,18 +241,35 @@ class QwenModelRouter:
                 return result
             except ModelAPIError as exc:
                 last_error = exc
+                failed_result = exc.result
                 self._record(
                     db,
                     model_id=model.id,
-                    request_id=local_request_id,
+                    request_id=failed_result.request_id if failed_result else str(uuid.uuid4()),
                     status="failed",
                     error_code=exc.code,
                     prompt_version=prompt_version,
+                    prompt_tokens=failed_result.usage.prompt_tokens if failed_result else 0,
+                    completion_tokens=failed_result.usage.completion_tokens if failed_result else 0,
+                    total_tokens=failed_result.usage.total_tokens if failed_result else 0,
+                    latency_ms=failed_result.latency_ms if failed_result else 0,
                 )
+                next_model = None
+                output_truncated = exc.code == "output_truncated"
+                if not pinned_model and not output_truncated and position + 1 < len(candidates):
+                    next_model = candidates[position + 1].id
                 logger.warning(
-                    "Qwen model %s failed with code %s; trying fallback", model.id, exc.code
+                    "模型调用失败 model=%s status=%s code=%s next_model=%s",
+                    model.id,
+                    exc.status_code,
+                    exc.code,
+                    next_model or "none",
                 )
-                if pinned_model:
+                if pinned_model or output_truncated:
                     break
         code = last_error.code if last_error else "unknown"
-        raise NoModelAvailable(f"All candidate models failed (code={code})")
+        raise NoModelAvailable(
+            f"Model generation failed (code={code})",
+            code=code,
+            model_id=model.id,
+        ) from last_error
