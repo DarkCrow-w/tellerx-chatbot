@@ -26,6 +26,9 @@ dependencies = [
   "uvicorn[standard]==0.52.1",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest==8.4.2", "ruff==0.16.2"]
+
 [project.scripts]
 tellerx-backend = "app.commands.local_server:main"
 model-diagnostics = "app.commands.diagnostics:diagnostics_main"

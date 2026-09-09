@@ -1,256 +1,98 @@
-# TellerX Knowledge Chatbot（本地核心版）
+# TellerX Knowledge Chatbot — 纯源码版
 
-这是无需 Docker 的内部本地运行分支，只包含 React 前端、FastAPI 后端、数据库迁移和运行所需配置。
+本分支保留 React 前端、FastAPI 后端、本地自动化测试、独立初始数据库迁移与必要依赖和配置。Python 源码统一使用 `.txt` 后缀，包括包入口、测试和迁移；内容仍是 Python，阅读交付版不能直接启动后端。
 
-本地开发模式把文档解析、切块、Embedding 和 PostgreSQL 搜索索引发布放在 FastAPI 后台任务中，因此只需要启动两个进程：
+## 目录
 
-- Python 后端：FastAPI、业务服务和文档入库任务；
-- Node 前端：React + Vite 开发服务器。
+| 路径 | 内容 |
+| --- | --- |
+| `frontend/src/` | 聊天、流式进度、证据卡片、知识库管理与前端测试 |
+| `frontend/index.html`、`frontend/vite.config.js` | 前端入口与构建配置 |
+| `app/` | 后端接口、用例、检索、入库、模型与数据访问源码（`.txt`） |
+| `tests/` | 后端本地测试（`.txt`），使用测试替身或内存 SQLite |
+| `alembic/`、`alembic.ini` | 数据库初始迁移与迁移配置 |
+| `config/models.yaml`、`.env.example` | 模型注册表与不含真实凭据的环境模板 |
+| `pyproject.toml`、`package.json`、`package-lock.json` | 安装、测试和构建依赖 |
 
-## 1. 环境要求
+评估脚本、评估数据、设计文档及依赖独立 PostgreSQL 的集成测试已移除。运行数据、构建产物、虚拟环境、依赖目录和真实 `.env` 不属于交付内容。
 
-- Python 3.12；
-- Node.js `^20.19.0` 或 `>=22.12.0`；
-- 可以访问公司 IKP PostgreSQL Service；
-- PostgreSQL 已安装 `vector` 和 `pg_trgm` 扩展；
-- 可以访问公司 OpenAI 兼容 SDK Endpoint。
+## 恢复 Python 后缀
 
-PostgreSQL 必须安装 pgvector 0.7.0 或更高版本。项目使用 `halfvec(2560)` 和 HNSW
-索引，以避开 `vector` 类型 HNSW 最多 2000 维的限制。模型固定使用：
-
-- Embedding：`qwen3-embedding`；
-- Chat：`qwen3.5-122B`；
-- Rerank：关闭。
-
-支持的文件格式为 `.docx`、`.xlsx`、`.xlsm`、`.md`、`.txt`、`.html`、文本型 `.pdf` 和 `.csv`。旧版 `.doc`、`.xls` 需要先另存为现代格式；扫描 PDF 需要先完成 OCR。
-
-## 2. 安装
-
-在项目根目录创建 Python 虚拟环境：
+需要运行时，先复制本分支到独立目录，再在复制目录根路径执行下列命令。仅转换三个源码目录；不会重命名业务文档或第三方依赖。
 
 ```bash
-python3.12 -m venv .venv
+python3 - <<'PY'
+from pathlib import Path
+
+sources = [path for root in ("app", "tests", "alembic")
+           for path in Path(root).rglob("*.txt")]
+conflicts = [path.with_suffix(".py") for path in sources
+             if path.with_suffix(".py").exists()]
+if conflicts:
+    raise SystemExit(f"目标文件已存在，未执行转换：{conflicts}")
+for path in sources:
+    path.rename(path.with_suffix(".py"))
+print(f"已恢复 {len(sources)} 个 Python 文件")
+PY
+```
+
+文件内的 Python 导入路径与工具配置保持运行时写法，无需修改。`alembic/script.py.mako` 是迁移生成模板，不是 `.py` 源文件，因此保留原名。
+
+## 安装与配置
+
+要求 Python 3.12 或更新版本、Node.js `^20.19.0` 或 `>=22.12.0`。运行后端还需 PostgreSQL、pgvector 0.7.0 或更新版本及 `pg_trgm` 扩展，以及可用的 OpenAI 兼容模型服务。
+
+恢复后缀后执行：
+
+```bash
+python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e .
-```
-
-安装前端依赖：
-
-```bash
-npm install
-```
-
-复制本地配置：
-
-```bash
+python -m pip install -e '.[dev]'
+npm ci
 cp .env.example .env
 ```
 
-在 `.env` 中直接填写公司模型网关 Token。`.env` 已被 Git 忽略，不要把真实 Token 写入其他配置或提交到仓库。
+编辑 `.env` 中的 `DATABASE_URL`、`MODEL_API_BASE_URL` 和 `MODEL_API_KEY`；数据库密码中的特殊字符须 URL 编码。不要提交真实凭据。
 
-## 3. 配置 IKP PostgreSQL
+生成模型由 `config/models.yaml` 配置，当前为 `glm-5.2`；Embedding 默认使用 `qwen3-embedding`、2560 维。重排默认关闭。数据与原文件默认保存在 `.local-data/knowledge`。
 
-编辑 `.env` 中的 `DATABASE_URL`。项目在 IKP 内运行时应使用 PostgreSQL Service 的 Internal Endpoint，而不是普通 HTTP Ingress，例如：
+## 数据库初版
 
-```env
-DATABASE_URL=postgresql+psycopg://tellerx_app:URL编码后的密码@postgresql.namespace.svc.cluster.local:5432/tellerx?sslmode=require
-```
+唯一迁移是 `alembic/versions/0001_initial.txt`，恢复后缀后为 `.py`；`down_revision = None`。
 
-如果程序运行在公司电脑而不是 IKP Pod 内，必须先确认电脑能够解析并访问这个 Internal Endpoint。不能访问时，需要公司 VPN、PostgreSQL TCP Endpoint 或经过批准的端口转发。
+该初版固定了原迁移链截至 `0006_hierarchical_retrieval` 的最终结构，直接创建 21 张业务表，包括文档版本、章节树、向量缓存、入库任务、查询追踪和搜索投影。保留全文搜索、三元组索引、`halfvec(2560)`、HNSW 索引及当前批准版本的唯一性约束。迁移不导入应用模型，也不包含历史数据回填。
 
-数据库账号至少要能创建和使用项目表、索引。首次迁移还需要已经存在以下扩展：
+**仅用于新建空数据库。** 现有数据库应继续使用原开发分支的迁移链；不要对旧数据库直接运行此初版或仅修改版本号冒充升级。本次整理没有修改已有业务数据库，也没有导出业务数据。
 
-```sql
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-```
-
-如果应用账号没有安装扩展的权限，请让数据库管理员预先安装。
-
-## 4. 配置公司模型接口
-
-编辑 `.env`：
-
-```env
-MODEL_API_BASE_URL=https://公司的SDK-Endpoint/v1
-MODEL_API_KEY="公司模型网关Token"
-EMBEDDING_MODEL=qwen3-embedding
-EMBEDDING_DIMENSIONS=2560
-MODEL_REGISTRY_PATH=config/models.yaml
-RERANK_ENABLED=false
-```
-
-诊断模型连通性会产生少量模型调用：
-
-```bash
-model-diagnostics
-```
-
-从旧版 1024 维结构升级时，请先把 `.env` 中的 `EMBEDDING_DIMENSIONS` 改为
-`2560`，再执行 `alembic upgrade head`。迁移会保留关键词搜索数据，但会清除
-不兼容的旧向量。迁移完成后执行以下命令，为已有文档重新生成 2560 维向量：
-
-```bash
-knowledge-reindex
-```
-
-重建完成前已有文档仍可使用关键词检索；新上传文档不受影响。
-
-升级到层级文档检索结构后，先执行数据库迁移，再通过不可变原文件重建章节树、
-分块关系和包含文件名/标题路径的上下文化向量：
+将 `.env` 的 `DATABASE_URL` 指向新建数据库，再执行：
 
 ```bash
 alembic upgrade head
-knowledge-reindex --reparse
 ```
 
-`--reparse` 走与正常上传相同的入库和 Outbox 发布链路。仅需修复搜索投影且现有
-章节数据已经完成升级时，仍可使用不带参数的 `knowledge-reindex`。
-若上线观察到范围识别异常，可临时设置 `HIERARCHICAL_RETRIEVAL_ENABLED=false`
-回到原有全库检索路径；原始 `heading_path` 和旧请求字段均继续保留。
+数据库需允许创建表、索引及所需扩展；若应用账号不能创建扩展，由管理员提前安装 `vector` 和 `pg_trgm`。回滚会删除全部业务表，保留可能共享的扩展。
 
-## 5. 启动前后端
-
-确保 Python 虚拟环境已激活，然后在项目根目录执行：
+## 启动
 
 ```bash
 npm run local
 ```
 
-这条命令会同时启动：
+默认前端端口为 5173，后端端口为 8000。也可分别执行 `npm run backend` 和 `npm run dev`。后端启动时会执行数据库迁移，因此运行前务必完成新数据库配置。
 
-- 后端：<http://127.0.0.1:8000>；
-- API 文档：<http://127.0.0.1:8000/docs>；
-- 前端：<http://localhost:5173>。
+支持文档上传、版本管理、全库或指定文档检索、流式处理进度、引用原文、章节上下文和证据文档下载。解析、向量化及索引发布由后端后台任务处理。
 
-后端启动前会自动执行 `alembic upgrade head`。数据库迁移失败时，前端仍可能启动，但后端会明确退出；优先检查 `DATABASE_URL`、网络、TLS 和数据库权限。
+## 本地测试与构建
 
-使用 `Ctrl+C` 会同时停止前后端。
-
-后端日志默认输出到当前终端，包含 HTTP 请求 ID、状态码、耗时，以及数据库迁移、
-文档解析、Embedding、索引发布、检索和 Chat 调用等关键阶段。IKP 部署时直接由平台
-采集标准输出即可，不需要在应用内配置日志文件。临时排障可在 `.env` 中设置：
-
-```env
-LOG_LEVEL=DEBUG
-```
-
-每个 HTTP 响应都会返回 `X-Request-ID`；出现问题时可用该值在日志中串联同一次请求。
-日志不会记录模型 Token、问题正文、Prompt 或文档正文。
-
-如果 8000 端口已被占用，可以整体改用其他后端端口，Vite 代理会自动同步：
+恢复后缀后执行：
 
 ```bash
-TELLERX_API_PORT=18001 npm run local
-```
-
-也可以分开启动，便于分别查看日志：
-
-```bash
-# 终端 1
-source .venv/bin/activate
-tellerx-backend
-
-# 终端 2
-npm run dev
-```
-
-如果已经由管理员执行过迁移，可以跳过启动时迁移：
-
-```bash
-tellerx-backend --skip-migrations
-```
-
-## 6. 上传和使用文档
-
-打开前端后，从左侧进入“知识库管理”：
-
-1. 新建或选择一个知识库；
-2. 点击“选择文件”上传一个或多个文档，或点击“选择文件夹”导入完整目录；
-3. 等待页面中的任务状态变成“可检索”；
-4. 返回问答页，可选择对应知识库，也可保留“全部知识库”后直接提问。
-
-问答中可只提供可识别的文件名片段，例如“支付平台二期文档里怎么定义签名”。
-唯一匹配时系统只在该文档当前批准版本内检索；名称接近时会显示候选卡片供选择；
-没有文档范围表达时继续执行全知识库混合检索。
-
-文件夹导入会保留根目录以内的相对路径，用于区分不同目录下的同名文件。每次最多并行构建两份文档；单份失败不会阻断其余文件。管理页还可以查看历史版本、重试失败任务、上传新版本、下载、废弃或软删除文档。
-
-管理页提供两种不可恢复的知识库级操作，执行前必须输入完整知识库名称确认：
-
-- “清理删除残留”只物理回收已经软删除的文档、版本、分块、任务、解析产物和不再被其他文档引用的向量缓存，仍在使用的文档不受影响；
-- “删除知识库”会执行相同清理，并删除知识库本身。
-
-普通单文档和批量“删除所选”仍是软删除，便于重新上传同一逻辑文档；软删除后的文档不会再被全量重建、索引修复或入库 Worker 处理。需要回收它们占用的磁盘和数据库空间时，使用“清理删除残留”或“删除知识库”。共享原文件或向量仍被其他知识库引用时不会被误删。
-
-需要调试接口时仍可打开 Swagger：
-
-<http://127.0.0.1:8000/docs>
-
-调用 `POST /api/v1/documents`，或执行：
-
-```bash
-curl -X POST 'http://127.0.0.1:8000/api/v1/documents' \
-  -F 'file=@/absolute/path/example.docx' \
-  -F 'project=TellerX' \
-  -F 'document_type=business-document' \
-  -F 'lifecycle_status=approved' \
-  -F 'version_label=1.0'
-```
-
-返回的 `job_id` 可用于查询处理状态：
-
-```bash
-curl 'http://127.0.0.1:8000/api/v1/ingestion-jobs/JOB_ID'
-```
-
-本地模式不需要单独启动 Worker 或 Indexer。处理状态到达 `succeeded` 后，文档才可以被检索。
-
-## 7. 前端构建
-
-开发时直接使用 `npm run dev`。如需让 FastAPI 同时提供构建后的前端：
-
-```bash
-npm run build
-tellerx-backend
-```
-
-构建结果写入 `app/static/`。未构建前端时，访问后端根路径会跳转到 `/docs`，不会影响 Vite 前端。
-
-## 8. 核心目录
-
-```text
-app/                 FastAPI 后端和业务代码
-frontend/            React 前端源码
-config/models.yaml   公司 Chat 模型清单
-alembic/             PostgreSQL 数据库迁移
-.env.example         本地配置模板
-pyproject.toml       Python 依赖和命令入口
-package.json         前端依赖和启动命令
-```
-
-`.env`、`.local-data/`、`.venv/` 和 `node_modules/` 均不会提交到 Git。
-
-## 9. 开发检查
-
-```bash
-python -m unittest discover -s tests
+python -m pytest -q
+ruff check app tests/test_initial_migration.py
 npm test
 npm run build
-ruff check app
 ```
 
-这些检查不调用公司模型接口；完整验收仍应在已配置 PostgreSQL 和模型 Token 的环境中上传真实文档并执行一次问答。
+这些测试不要求真实模型服务或外部数据库。初始迁移测试以 PostgreSQL 方言离线生成 SQL，检查建表、索引和回滚边界；前端测试包含请求协议、状态规则和组件渲染。构建产物写入被忽略的 `app/static/`。
 
-### 业务关键词全库检索
-
-`BUSINESS_RETRIEVAL_ENABLED=true`（默认）启用业务文档组发现、逐问题项召回、事实覆盖排序与局部章节扩展。业务名可出现在文件名或正文；每个通道都沿用项目、ACL和当前版本条件。用户明确指定文件时仍只搜索该文件。
-
-设置为 `false` 可关闭新增业务检索通道及事实排序，保留原有全库召回路径；主体解析的错误修复仍生效，因此此开关不代表逐字节恢复旧版本。检索追踪中的 `candidate_stages` 记录文档组、查询项、过滤前后候选排名和最终候选。`fact_coverage` 是词法诊断，不等于事实已被语义验证。
-
-设计与测试见 [业务关键词检索方案](docs/global-business-keyword-retrieval-plan.md)。
-
-### 阅读和维护代码
-
-从 [代码阅读与维护指南](docs/code-navigation.md) 开始，了解问答、检索、入库和知识库页面的调用顺序，以及每类规则应该修改的位置。
+本次合并迁移另在临时 PostgreSQL + pgvector 环境中验证：旧六步迁移链与新初版的 191 个字段、45 个约束、88 个索引及扩展一致，并通过回滚后重新建库验证。临时数据库仅用于验证，不属于交付内容。
