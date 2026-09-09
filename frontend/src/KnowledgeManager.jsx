@@ -33,6 +33,27 @@ import BatchStatus from "./knowledge/BatchStatus";
 import ProjectPanel from "./knowledge/ProjectPanel";
 import DocumentRow from "./knowledge/DocumentRow";
 
+function documentActionMessage(action) {
+  if (action === "delete") return "文档已删除";
+  if (action === "retry") return "已重新开始构建";
+  return "版本状态已更新";
+}
+
+function projectConfirmationCopy(action, name) {
+  if (action === "delete") {
+    return {
+      title: "彻底删除知识库",
+      description: `将永久删除“${name}”中的全部原文件、版本、分块和无引用向量，知识库本身也会被删除。`,
+      confirm: "确认彻底删除",
+    };
+  }
+  return {
+    title: "清理删除残留",
+    description: `将永久回收“${name}”中已经删除的文档残留；仍在使用的文档不会受到影响。`,
+    confirm: "确认清理",
+  };
+}
+
 export default function KnowledgeManager({
   projects,
   projectId,
@@ -151,7 +172,7 @@ export default function KnowledgeManager({
         return next;
       });
       await loadDocuments(true);
-      onToast(action === "delete" ? "文档已删除" : action === "retry" ? "已重新开始构建" : "版本状态已更新");
+      onToast(documentActionMessage(action));
     } catch (error) {
       onToast(error.message);
     } finally {
@@ -266,6 +287,10 @@ export default function KnowledgeManager({
     event.target.value = "";
   }
 
+  const projectActionsDisabled = !selectedProject || batchRunning || !!projectAction;
+  const confirmation = projectConfirmationCopy(projectConfirmAction, selectedProject?.name);
+  const confirmationDisabled = !!projectAction
+    || projectConfirmationName.trim() !== selectedProject?.name;
   const accept = capabilities?.allowed_extensions.join(",") || undefined;
   const lastPage = Math.max(0, Math.floor(Math.max(total - 1, 0) / PAGE_SIZE) * PAGE_SIZE);
   const currentPageSelected = documents.length > 0
@@ -296,16 +321,16 @@ export default function KnowledgeManager({
                 <p>{selectedProject ? `${total} 份文档` : "创建或选择一个知识库后开始上传"}</p>
               </div>
               <div className="upload-buttons">
-                <button className="secondary-button danger-button" type="button" disabled={!selectedProject || batchRunning || !!projectAction} onClick={() => openProjectConfirmation("cleanup")}>
+                <button className="secondary-button danger-button" type="button" disabled={projectActionsDisabled} onClick={() => openProjectConfirmation("cleanup")}>
                   {projectAction === "cleanup" ? <LoaderCircle className="spin" size={15} /> : <Archive size={15} />}清理删除残留
                 </button>
-                <button className="secondary-button danger-button" type="button" disabled={!selectedProject || batchRunning || !!projectAction} onClick={() => openProjectConfirmation("delete")}>
+                <button className="secondary-button danger-button" type="button" disabled={projectActionsDisabled} onClick={() => openProjectConfirmation("delete")}>
                   {projectAction === "delete" ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}删除知识库
                 </button>
-                <button className="secondary-button" type="button" disabled={!selectedProject || batchRunning || !!projectAction} onClick={() => fileInputRef.current?.click()}>
+                <button className="secondary-button" type="button" disabled={projectActionsDisabled} onClick={() => fileInputRef.current?.click()}>
                   <FilePlus2 size={15} />选择文件
                 </button>
-                <button className="primary-button" type="button" disabled={!selectedProject || batchRunning || !!projectAction} onClick={() => folderInputRef.current?.click()}>
+                <button className="primary-button" type="button" disabled={projectActionsDisabled} onClick={() => folderInputRef.current?.click()}>
                   <FolderOpen size={15} />选择文件夹
                 </button>
               </div>
@@ -420,12 +445,10 @@ export default function KnowledgeManager({
             <div className="danger-dialog-icon"><AlertTriangle size={20} /></div>
             <div>
               <h2 id="project-danger-title">
-                {projectConfirmAction === "delete" ? "彻底删除知识库" : "清理删除残留"}
+                {confirmation.title}
               </h2>
               <p>
-                {projectConfirmAction === "delete"
-                  ? `将永久删除“${selectedProject.name}”中的全部原文件、版本、分块和无引用向量，知识库本身也会被删除。`
-                  : `将永久回收“${selectedProject.name}”中已经删除的文档残留；仍在使用的文档不会受到影响。`}
+                {confirmation.description}
                 操作无法恢复。
               </p>
               <label>
@@ -451,11 +474,11 @@ export default function KnowledgeManager({
                 <button
                   className="danger-confirm-button"
                   type="button"
-                  disabled={!!projectAction || projectConfirmationName.trim() !== selectedProject.name}
+                  disabled={confirmationDisabled}
                   onClick={runProjectAction}
                 >
                   {projectAction && <LoaderCircle className="spin" size={14} />}
-                  {projectConfirmAction === "delete" ? "确认彻底删除" : "确认清理"}
+                  {confirmation.confirm}
                 </button>
               </div>
             </div>

@@ -28,6 +28,7 @@ from app.services.answer_contract import (
     refusal_text,
     validate_answer,
 )
+from app.services.answer_progress import progress
 from app.services.model_router import NoModelAvailable, route_tier
 from app.services.query_understanding import (
     QueryPlan,
@@ -169,6 +170,37 @@ class AnswerService:
         search_backend = getattr(self.retriever, "index", None)
         if search_backend and hasattr(search_backend, "trace_index_name"):
             retrieval_index = search_backend.trace_index_name()
+        citations = [source.model_dump() for source in validated.sources]
+        normalized_query = normalize_query(question)
+        retrieval_trace = {
+            "prompt_version": getattr(self.settings, "prompt_version", None),
+            "routing": {
+                "requested_tier": requested_tier,
+                "actual_tier": actual_tier,
+            },
+            "query_understanding": query_plan.as_trace_dict(),
+            "candidate_stages": retrieval_diagnostics(),
+            "scope_resolution": {
+                "retrieval_intent": retrieval_intent,
+                "resolved_document": resolved_document,
+                "resolved_scope": resolved_scope,
+                "retrieval_confidence": retrieval_confidence,
+                "clarification_options": clarification_options,
+                "failure_reason": failure_reason,
+            },
+            "embedding_fingerprint": getattr(self.settings, "embedding_fingerprint", None),
+            "evidence": [
+                {
+                    "chunk_id": item.chunk_id,
+                    "document_id": item.document_id,
+                    "version_id": item.version_id,
+                    "section_id": item.section_id,
+                    "breadcrumb": list(item.breadcrumb),
+                    "score": item.score,
+                }
+                for item in evidence
+            ],
+        }
         return self.repository.save_exchange(
             db,
             conversation=conversation,
@@ -177,39 +209,11 @@ class AnswerService:
             answer_status=validated.status,
             model_id=model_id,
             trace_id=trace_id,
-            citations=[source.model_dump() for source in validated.sources],
-            normalized_query=normalize_query(question),
+            citations=citations,
+            normalized_query=normalized_query,
             project_ids=project_ids,
             index_name=retrieval_index,
-            retrieval_json={
-                "prompt_version": getattr(self.settings, "prompt_version", None),
-                "routing": {
-                    "requested_tier": requested_tier,
-                    "actual_tier": actual_tier,
-                },
-                "query_understanding": query_plan.as_trace_dict(),
-                "candidate_stages": retrieval_diagnostics(),
-                "scope_resolution": {
-                    "retrieval_intent": retrieval_intent,
-                    "resolved_document": resolved_document,
-                    "resolved_scope": resolved_scope,
-                    "retrieval_confidence": retrieval_confidence,
-                    "clarification_options": clarification_options,
-                    "failure_reason": failure_reason,
-                },
-                "embedding_fingerprint": getattr(self.settings, "embedding_fingerprint", None),
-                "evidence": [
-                    {
-                        "chunk_id": item.chunk_id,
-                        "document_id": item.document_id,
-                        "version_id": item.version_id,
-                        "section_id": item.section_id,
-                        "breadcrumb": list(item.breadcrumb),
-                        "score": item.score,
-                    }
-                    for item in evidence
-                ],
-            },
+            retrieval_json=retrieval_trace,
             latency_ms=(time.perf_counter() - started_at) * 1000,
         )
 
@@ -240,6 +244,7 @@ class AnswerService:
     ) -> AnswerPreparation:
         """完成查询理解、检索、路由和证据预算准备。"""
 
+        progress("understanding", "正在理解问题与查询范围")
         if self.query_understanding is None:
             query_plan = fallback_query_plan(question, "service-not-configured")
         else:
@@ -248,6 +253,12 @@ class AnswerService:
                 question,
                 pinned_model=pinned_model,
             )
+        focus = list(dict.fromkeys((*query_plan.subjects, *query_plan.requested_facts)))[:3]
+        progress(
+            "retrieving",
+            "正在检索相关文档和章节",
+            ["查询重点：" + "、".join(focus)] if focus else None,
+        )
         if hasattr(self.retriever, "search_with_scope"):
             outcome: RetrievalOutcome = self.retriever.search_with_scope(
                 question,
@@ -264,6 +275,19 @@ class AnswerService:
             else:
                 evidence = self.retriever.search(question, project_ids, query_plan=query_plan)
             outcome = RetrievalOutcome(evidence=evidence)
+        progress(
+            "retrieved",
+            f"检索得到 {len({item.document_id for item in evidence})} 份候选文档、{len(evidence)} 段参考内容",
+            [
+                "相关文档：" + name
+                for name in list(dict.fromkeys(item.filename for item in evidence))[:2]
+            ]
+            + (
+                ["相关章节：" + " › ".join(evidence[0].breadcrumb)]
+                if evidence and evidence[0].breadcrumb
+                else []
+            ),
+        )
         if not evidence:
             logger.info(
                 "证据检索完成 evidence_count=0 project_count=%d",
@@ -346,6 +370,10 @@ class AnswerService:
                 bool(pinned_model),
                 len(preparation.evidence),
             )
+            progress(
+                "generating",
+                "正在根据参考内容整理答案" if attempt == 0 else "正在重新整理答案并核对引用",
+            )
             try:
                 call = self.router.call(
                     db,
@@ -355,6 +383,7 @@ class AnswerService:
                     pinned_model=pinned_model,
                     prompt_version=self.settings.prompt_version,
                 )
+                progress("validating", "正在核对答案与原文引用")
                 model_id = call.model_id
                 payload = parse_json_object(call.content)
                 validated = validate_answer(
@@ -515,6 +544,7 @@ class AnswerService:
             generation = GenerationResult(None, None, None)
             validated = self._retrieval_refusal(question, preparation.failure_reason)
 
+        progress("saving", "正在保存问答结果")
         return self._persist_response(
             db,
             conversation=conversation,

@@ -328,10 +328,15 @@ def prefer_complete_entity_matches(
         if any(signal in candidate_ranking.source_text(row) for signal in signals)
     )
     linked = {value.casefold() for value in linked_identifiers or []}
-    return [
-        row
-        for row in rows
-        if str(row["hit"]["_source"].get("document_id") or "") in documents - {""}
-        or any(signal in candidate_ranking.source_text(row) for signal in signals)
-        or any(identifier in candidate_ranking.source_text(row) for identifier in linked)
-    ]
+    documents.discard("")
+    selected = []
+    for row in rows:
+        document_id = str(row["hit"]["_source"].get("document_id") or "")
+        if document_id in documents:
+            selected.append(row)
+            continue
+        text = candidate_ranking.source_text(row)
+        matches_subject = any(signal in text for signal in signals)
+        if matches_subject or any(identifier in text for identifier in linked):
+            selected.append(row)
+    return selected

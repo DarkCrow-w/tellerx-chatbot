@@ -603,17 +603,20 @@ class Retriever:
             fused, subjects, subject_documents = self._business_channel(
                 query, project_ids, principal_ids, query_plan, fused, document_ids
             )
-        semantic_anchors = (
-            subjects if enabled else (query_plan.anchor_signals if query_plan else ())
-        )
+        semantic_anchors = ()
+        if enabled:
+            semantic_anchors = subjects
+        elif query_plan:
+            semantic_anchors = query_plan.anchor_signals
         fused = candidate_ranking.boost_anchor_matches(fused, semantic_anchors)
-        if (
+        subject_is_ungrounded = (
             query_plan
             and subjects
             and document_ids is None
             and not subject_documents
             and not candidate_selection.has_grounded_subject(fused, subjects)
-        ):
+        )
+        if subject_is_ungrounded:
             logger.info("Semantic subject was not grounded in any candidate; abstaining")
             return []
         seeds = self._link_seeds(fused, query_plan, enabled)
@@ -679,11 +682,11 @@ class Retriever:
         """原问题召回之后，再合并查询计划给出的有限个改写。"""
         focus_terms = list(query_plan.subjects) if query_plan else _query_subject_signals(query)
         focus_query = " ".join(focus_terms)
-        retrieval_queries = (
-            list(query_plan.retrieval_queries)
-            if query_plan
-            else ([focus_query] if focus_query else [])
-        )
+        retrieval_queries = []
+        if query_plan:
+            retrieval_queries = list(query_plan.retrieval_queries)
+        elif focus_query:
+            retrieval_queries = [focus_query]
         for retrieval_query in retrieval_queries[:4]:
             retrieval_query = normalize_query(retrieval_query)
             if not retrieval_query or retrieval_query.casefold() == query.casefold():

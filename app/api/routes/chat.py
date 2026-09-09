@@ -4,11 +4,13 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.api.error_mapping import run_application
+from app.api.routes.chat_stream import router as stream_router
 from app.contracts.schemas import ChatRequest, ChatResponse, FeedbackIn
 from app.core.container import chat_application_service
 from app.db import get_db
 
 router = APIRouter(tags=["chat"])
+router.include_router(stream_router)
 
 
 @router.post("/chat", response_model=ChatResponse)

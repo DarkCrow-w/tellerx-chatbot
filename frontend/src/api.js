@@ -5,11 +5,12 @@ async function requestJson(path, options = {}) {
   const response = await fetch(path, options);
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
-    const detail = typeof body.detail === "string"
-      ? body.detail
-      : Array.isArray(body.detail)
-        ? body.detail.map((item) => item.msg).filter(Boolean).join("；")
-        : `请求失败（${response.status}）`;
+    let detail = `请求失败（${response.status}）`;
+    if (typeof body.detail === "string") {
+      detail = body.detail;
+    } else if (Array.isArray(body.detail)) {
+      detail = body.detail.map((item) => item.msg).filter(Boolean).join("；");
+    }
     throw new Error(detail);
   }
   if (response.status === 204) return null;
@@ -169,4 +170,73 @@ export function askKnowledgeBase({
       section_path: sectionPath,
     }),
   });
+}
+
+/** Read SSE frames across arbitrary network / UTF-8 boundaries. */
+export async function readAnswerStream(response, onProgress = () => {}) {
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(typeof body.detail === "string" ? body.detail : `请求失败（${response.status}）`);
+  }
+  if (!response.body) throw new Error("浏览器未能建立响应流，请重试。");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+      let boundary;
+      while ((boundary = /\r?\n\r?\n/.exec(buffer))) {
+        const frame = buffer.slice(0, boundary.index);
+        buffer = buffer.slice(boundary.index + boundary[0].length);
+        const lines = frame.split(/\r?\n/);
+        const event = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
+        const data = lines.filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trimStart()).join("\n");
+        if (!data) continue;
+        const payload = JSON.parse(data);
+        if (event === "stage") onProgress(payload);
+        if (event === "error") throw new Error(payload.detail || "问答中断，请重试。");
+        if (event === "final") return payload;
+      }
+      if (done) throw new Error("连接已断开，尚未收到完整答案，请重试。");
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
+export async function askKnowledgeBaseStream({
+  question, conversationId, projectId, documentId = null, signal, onProgress,
+}) {
+  const response = await fetch("/api/v1/chat/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    signal,
+    body: JSON.stringify({
+      question, conversation_id: conversationId, project_ids: projectId ? [projectId] : [],
+      document_id: documentId,
+    }),
+  });
+  return readAnswerStream(response, onProgress);
+}
+
+/** Resolve the cited chunk's version; never silently download a newer upload. */
+export async function downloadEvidenceDocument(chunkId) {
+  const source = await requestJson(`/api/v1/sources/${encodeURIComponent(chunkId)}`);
+  const response = await fetch(documentDownloadUrl(source.document_id, source.version_id));
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(typeof body.detail === "string" ? body.detail : `请求失败（${response.status}）`);
+  }
+  const url = URL.createObjectURL(await response.blob());
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = source.filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
 }

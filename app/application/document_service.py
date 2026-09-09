@@ -522,6 +522,12 @@ class DocumentApplicationService:
         """把已加载的分块转换为包含章节定位的公开来源。"""
 
         version = chunk.version
+        breadcrumb = []
+        if chunk.heading_path:
+            breadcrumb = [part.strip() for part in chunk.heading_path.split(">") if part.strip()]
+        section_level = chunk.section.level if chunk.section else None
+        has_numbered_section = chunk.section is not None and chunk.section.level > 0
+        location_confidence = 1.0 if has_numbered_section else 0.7
         return SourceOut(
             chunk_id=chunk.id,
             document_id=version.document_id,
@@ -530,15 +536,9 @@ class DocumentApplicationService:
             content=chunk.content,
             heading_path=chunk.heading_path,
             section_id=chunk.section_id,
-            breadcrumb=(
-                [part.strip() for part in chunk.heading_path.split(">") if part.strip()]
-                if chunk.heading_path
-                else []
-            ),
-            section_level=chunk.section.level if chunk.section else None,
-            location_confidence=(
-                1.0 if chunk.section is not None and chunk.section.level > 0 else 0.7
-            ),
+            breadcrumb=breadcrumb,
+            section_level=section_level,
+            location_confidence=location_confidence,
             page_number=chunk.page_number,
             sheet_name=chunk.sheet_name,
             cell_range=chunk.cell_range,

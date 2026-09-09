@@ -154,6 +154,9 @@ class QueryPlan:
     def as_trace_dict(self) -> dict[str, Any]:
         """转换为可写入查询追踪记录的 JSON 结构。"""
 
+        normalized_document_hint = None
+        if self.document_hint:
+            normalized_document_hint = normalize_document_name(self.document_hint)
         return {
             "strategy": self.strategy,
             "language": self.language,
@@ -166,9 +169,7 @@ class QueryPlan:
             "retrieval_queries": list(self.retrieval_queries),
             "retrieval_intent": self.retrieval_intent,
             "document_hint": self.document_hint,
-            "normalized_document_hint": (
-                normalize_document_name(self.document_hint) if self.document_hint else None
-            ),
+            "normalized_document_hint": normalized_document_hint,
             "document_question": self.document_question,
             "section_hints": list(self.section_hints),
             "model_id": self.model_id,

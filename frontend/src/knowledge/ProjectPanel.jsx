@@ -65,27 +65,30 @@ export default function ProjectPanel({
         </form>
       )}
       <div className="project-list">
-        {projects.map((project) => editingId === project.id ? (
-          <form className="inline-name-form project-rename" key={project.id} onSubmit={(event) => submitRename(event, project.id)}>
-            <input autoFocus value={editingName} onChange={(event) => setEditingName(event.target.value)} maxLength="200" />
-            <button type="submit" disabled={saving || !editingName.trim()}>保存</button>
-            <button type="button" onClick={() => setEditingId(null)}>取消</button>
-          </form>
-        ) : (
-          <div className={`project-row ${project.id === projectId ? "active" : ""}`} key={project.id}>
-            <button type="button" onClick={() => onSelect(project.id)} title={project.name}>
-              <FolderOpen size={15} /><span>{project.name}</span>
-            </button>
-            <button
-              className="mini-icon-button rename-project"
-              type="button"
-              onClick={() => { setEditingId(project.id); setEditingName(project.name); }}
-              aria-label={`重命名 ${project.name}`}
-            >
-              <Pencil size={13} />
-            </button>
-          </div>
-        ))}
+        {projects.map((project) => {
+          if (editingId === project.id) return (
+            <form className="inline-name-form project-rename" key={project.id} onSubmit={(event) => submitRename(event, project.id)}>
+              <input autoFocus value={editingName} onChange={(event) => setEditingName(event.target.value)} maxLength="200" />
+              <button type="submit" disabled={saving || !editingName.trim()}>保存</button>
+              <button type="button" onClick={() => setEditingId(null)}>取消</button>
+            </form>
+          );
+          return (
+            <div className={`project-row ${project.id === projectId ? "active" : ""}`} key={project.id}>
+              <button type="button" onClick={() => onSelect(project.id)} title={project.name}>
+                <FolderOpen size={15} /><span>{project.name}</span>
+              </button>
+              <button
+                className="mini-icon-button rename-project"
+                type="button"
+                onClick={() => { setEditingId(project.id); setEditingName(project.name); }}
+                aria-label={`重命名 ${project.name}`}
+              >
+                <Pencil size={13} />
+              </button>
+            </div>
+          );
+        })}
         {!projects.length && !creating && (
           <button className="empty-projects" type="button" onClick={() => setCreating(true)}>
             <Plus size={16} />创建第一个知识库

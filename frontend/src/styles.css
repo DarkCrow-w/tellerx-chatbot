@@ -374,3 +374,35 @@ h1 { margin: 0; font-size: clamp(28px, 4vw, 40px); font-weight: 610; letter-spac
   .version-actions { flex-wrap: wrap; }
   .batch-card > header { align-items: flex-start; flex-direction: column; }
 }
+
+/* Live, server-reported answer stages. */
+.answer-progress { min-width: 0; padding: 11px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); color: var(--muted); font-size: 12px; }
+.progress-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.progress-toggle, .progress-stop { display: inline-flex; align-items: center; gap: 8px; padding: 0; border: 0; color: inherit; background: transparent; cursor: pointer; }
+.progress-toggle { min-width: 0; font-weight: 600; }
+.progress-toggle > svg { flex-shrink: 0; }
+.progress-toggle .rotated { transform: rotate(180deg); }
+.progress-time { font-size: 11px; font-weight: 400; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.progress-stop { flex-shrink: 0; padding: 5px 7px; border-radius: 6px; font-size: 11px; }
+.progress-stop:hover { color: var(--ink); background: var(--hover); }
+.progress-current { margin-top: 10px; color: var(--ink); line-height: 1.6; }
+.progress-steps { display: grid; gap: 10px; margin: 13px 0 2px; padding: 0; list-style: none; }
+.progress-steps li { display: flex; align-items: baseline; gap: 9px; line-height: 1.5; overflow-wrap: anywhere; }
+.progress-dot { flex: 0 0 5px; height: 5px; border-radius: 50%; background: var(--muted); opacity: .45; }
+.progress-steps .current { color: var(--ink); }
+.progress-steps .current .progress-dot { background: var(--accent); opacity: 1; }
+.progress-note { margin: 12px 0 0; line-height: 1.6; font-size: 11px; }
+.progress-spinner { color: var(--accent); animation: progress-spin 1.4s linear infinite; }
+.saved-progress { margin: 0 0 12px 45px; }
+@keyframes progress-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .progress-spinner { animation: none; } }
+@media (max-width: 600px) { .saved-progress { margin-left: 41px; } .answer-progress { padding: 10px; } }
+.source-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; margin-top: 9px; }
+.source-actions .section-context-trigger { margin-top: 0; }
+.source-download { display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; color: var(--accent); background: transparent; font-size: 12px; cursor: pointer; }
+.source-download:disabled { opacity: .6; cursor: wait; }
+.section-context h4 { margin: 0 0 12px; color: var(--ink); font-size: 13px; line-height: 1.6; }
+.context-chunk + .context-chunk { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.context-chunk h5 { margin: 0 0 6px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.retrieval-scope small { display: block; margin-top: 5px; line-height: 1.6; }
+.progress-detail { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }

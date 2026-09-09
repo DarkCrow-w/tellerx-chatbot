@@ -21,7 +21,7 @@ import {
   ThumbsUp,
 } from "lucide-react";
 
-import { getSectionContext } from "./api";
+import SourceCard from "./SourceCard";
 
 const STARTERS = [
   {
@@ -55,22 +55,7 @@ const STATUS = {
 function SourceList({ sources, onToast }) {
   /** 按需展开引用原文，避免长证据列表压过回答主体。 */
   const [open, setOpen] = useState(false);
-  const [contexts, setContexts] = useState({});
-  const [loadingSection, setLoadingSection] = useState(null);
   if (!sources?.length) return null;
-
-  async function loadContext(sectionId) {
-    if (contexts[sectionId]) return;
-    setLoadingSection(sectionId);
-    try {
-      const context = await getSectionContext(sectionId);
-      setContexts((current) => ({ ...current, [sectionId]: context }));
-    } catch (error) {
-      onToast?.(error.message);
-    } finally {
-      setLoadingSection(null);
-    }
-  }
 
   return (
     <div className={`sources ${open ? "is-open" : ""}`}>
@@ -85,40 +70,9 @@ function SourceList({ sources, onToast }) {
       </button>
       {open && (
         <div className="source-list">
-          {sources.map((source, index) => {
-            const location = [
-              source.breadcrumb?.length ? source.breadcrumb.join(" › ") : source.heading_path,
-              source.page_number && `第 ${source.page_number} 页`,
-              source.sheet_name,
-              source.cell_range,
-            ].filter(Boolean).join(" · ");
-            return (
-              <article className="source-card" key={`${source.chunk_id || source.filename}-${index}`}>
-                <header>
-                  <strong>{source.filename}</strong>
-                  {location && <span>{location}</span>}
-                </header>
-                <p>{source.quote}</p>
-                {source.section_id && (
-                  <button
-                    className="section-context-trigger"
-                    type="button"
-                    onClick={() => loadContext(source.section_id)}
-                  >
-                    {loadingSection === source.section_id ? "正在加载…" : "查看章节上下文"}
-                  </button>
-                )}
-                {contexts[source.section_id] && (
-                  <div className="section-context">
-                    {contexts[source.section_id].chunks.map((chunk) => (
-                      <p key={chunk.chunk_id}>{chunk.content}</p>
-                    ))}
-                    {contexts[source.section_id].truncated && <small>章节过长，仅展示前 100 个内容块。</small>}
-                  </div>
-                )}
-              </article>
-            );
-          })}
+          {sources.map((source, index) => (
+            <SourceCard key={`${source.chunk_id || source.filename}-${index}`} source={source} onToast={onToast} />
+          ))}
         </div>
       )}
     </div>
@@ -164,14 +118,31 @@ export function Message({ message, onToast, onSelectDocument }) {
   }
 
   const status = STATUS[message.status] || STATUS.answered;
+  const isGlobalScope = message.resolvedScope === "global";
+  const showScope = message.resolvedDocument || isGlobalScope;
+  const scopeLabel = isGlobalScope
+    ? message.searchScope || "未限定单一文档（历史消息未记录知识库选择）"
+    : message.resolvedDocument?.filename || message.resolvedScope;
+  const scopeKind = isGlobalScope ? "跨文档检索" : "指定文档检索";
+  const hasSources = message.sources?.length > 0;
+  const citedFiles = hasSources
+    ? [...new Set(message.sources.map((source) => source.filename))].join("、")
+    : "";
+  let modelLabel = "未调用生成模型";
+  if (message.modelId) {
+    modelLabel = message.modelId;
+    if (message.routeTier) modelLabel += ` · ${message.routeTier}`;
+  }
   return (
     <article className="message assistant-message">
       <div className="assistant-avatar"><span>T</span></div>
       <div className="assistant-content">
         <div className="answer-copy">{message.content}</div>
-        {(message.resolvedDocument || message.resolvedScope === "global") && (
+        {showScope && (
           <div className="retrieval-scope">
-            检索范围：{message.resolvedScope === "global" ? "全部知识库" : message.resolvedScope}
+            <div>检索范围：{scopeLabel}</div>
+            {hasSources && <div className="retrieval-files">实际引用：{citedFiles}</div>}
+            <small>{scopeKind} · 仅检索当前已批准、可搜索且可见的文档；实际依据见下方原文证据。</small>
           </div>
         )}
         {message.clarificationOptions?.length > 0 && (
@@ -191,12 +162,27 @@ export function Message({ message, onToast, onSelectDocument }) {
         <SourceList sources={message.sources} onToast={onToast} />
         <div className="answer-meta">
           <span className={`answer-status ${status.className}`}><i />{status.label}</span>
-          <span>{message.modelId ? `${message.modelId}${message.routeTier ? ` · ${message.routeTier}` : ""}` : "未调用生成模型"}</span>
+          <span>{modelLabel}</span>
         </div>
         <AnswerActions answer={message.content} onToast={onToast} />
       </div>
     </article>
   );
+}
+
+function ChatHistory({ chats, activeId, onOpenChat }) {
+  if (!chats.length) return <p className="empty-history">你的最近对话会显示在这里</p>;
+  return chats.map((chat) => (
+    <button
+      className={`history-item ${chat.id === activeId ? "active" : ""}`}
+      type="button"
+      key={chat.id}
+      onClick={() => onOpenChat(chat.id)}
+    >
+      <MessageSquareText size={14} />
+      <span>{chat.title}</span>
+    </button>
+  ));
 }
 
 export function Sidebar({ open, onClose, chats, activeId, onNew, onOpenChat, activeView, onManage, theme, onToggleTheme }) {
@@ -226,17 +212,7 @@ export function Sidebar({ open, onClose, chats, activeId, onNew, onOpenChat, act
         <nav className="history" aria-label="最近对话">
           <p className="nav-label">最近</p>
           <div className="history-list">
-            {chats.length ? chats.map((chat) => (
-              <button
-                className={`history-item ${chat.id === activeId ? "active" : ""}`}
-                type="button"
-                key={chat.id}
-                onClick={() => onOpenChat(chat.id)}
-              >
-                <MessageSquareText size={14} />
-                <span>{chat.title}</span>
-              </button>
-            )) : <p className="empty-history">你的最近对话会显示在这里</p>}
+            <ChatHistory chats={chats} activeId={activeId} onOpenChat={onOpenChat} />
           </div>
         </nav>
 

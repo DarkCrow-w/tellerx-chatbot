@@ -192,6 +192,9 @@ def diversify_documents(
 def to_evidence(source: dict[str, Any], score: float) -> Evidence:
     """把搜索后端记录转换成业务层稳定的证据对象。"""
 
+    section_path = str(source.get("section_path") or source.get("title_path") or "")
+    breadcrumb = tuple(part.strip() for part in section_path.split(">") if part.strip())
+    location_confidence = 1.0 if int(source.get("section_level") or 0) > 0 else 0.7
     return Evidence(
         chunk_id=source["chunk_id"],
         document_id=source["document_id"],
@@ -204,12 +207,8 @@ def to_evidence(source: dict[str, Any], score: float) -> Evidence:
         heading_path=source.get("title_path") or source.get("heading_path"),
         section_id=source.get("section_id"),
         section_level=source.get("section_level"),
-        breadcrumb=tuple(
-            part.strip()
-            for part in str(source.get("section_path") or source.get("title_path") or "").split(">")
-            if part.strip()
-        ),
-        location_confidence=(1.0 if int(source.get("section_level") or 0) > 0 else 0.7),
+        breadcrumb=breadcrumb,
+        location_confidence=location_confidence,
         page_number=source.get("page_number"),
         sheet_name=source.get("sheet_name"),
         cell_range=source.get("cell_range"),

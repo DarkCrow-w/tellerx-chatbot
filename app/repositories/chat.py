@@ -54,13 +54,15 @@ class ChatRepository:
             .join(Document, DocumentVersion.document_id == Document.id)
             .where(Chunk.id.in_(chunk_ids))
         ).all()
-        return {
-            chunk_id
-            for chunk_id, lifecycle, technical, is_current, is_deleted in rows
-            if not is_deleted
-            and technical == "searchable"
-            and (lifecycle == "draft" or (lifecycle == "approved" and is_current))
-        }
+        live_ids = set()
+        for chunk_id, lifecycle, technical, is_current, is_deleted in rows:
+            if is_deleted or technical != "searchable":
+                continue
+            is_draft = lifecycle == "draft"
+            is_current_approved = lifecycle == "approved" and is_current
+            if is_draft or is_current_approved:
+                live_ids.add(chunk_id)
+        return live_ids
 
     def save_exchange(
         self,
