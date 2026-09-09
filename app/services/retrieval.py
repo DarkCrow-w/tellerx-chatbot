@@ -216,11 +216,12 @@ class Retriever:
                 principal_ids,
                 **scope_kwargs,
             )
-        except Exception as exc:
+        except ModelAPIError as exc:
             if not self.settings.allow_bm25_only:
                 raise
             logger.warning(
-                "Vector retrieval unavailable; BM25-only fallback: %s", type(exc).__name__
+                "查询向量服务失败，使用关键词召回 status=%s code=%s lexical_hits=%d",
+                exc.status_code, exc.code, len(lexical),
             )
         fused = candidate_ranking.rrf(lexical, vector_hits)
         logger.debug(

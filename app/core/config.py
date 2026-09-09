@@ -52,6 +52,8 @@ class Settings(BaseSettings):
         ),
     )
     model_api_json_mode_enabled: bool = True
+    answer_max_tokens: int = Field(default=8192, gt=0)
+    answer_retry_max_tokens: int = Field(default=16384, gt=0)
     # 公司 qwen3-embedding 默认返回 2560 维；数据库迁移 0005 与此维度一致。
     embedding_model: str = Field(
         default="qwen3-embedding",
@@ -171,6 +173,8 @@ class Settings(BaseSettings):
             raise ValueError("embedding dimensions and HNSW ef_search must be positive")
         if self.model_api_max_retries < 0:
             raise ValueError("model_api_max_retries cannot be negative")
+        if self.answer_retry_max_tokens < self.answer_max_tokens:
+            raise ValueError("ANSWER_RETRY_MAX_TOKENS must be at least ANSWER_MAX_TOKENS")
         if self.query_embedding_cache_size <= 0 or self.query_embedding_cache_ttl_seconds <= 0:
             raise ValueError("query embedding cache size and TTL must be positive")
 

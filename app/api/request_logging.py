@@ -35,7 +35,7 @@ async def log_http_request(
     context_token = set_request_id(request_id)
     started_at = time.perf_counter()
     client = request.client.host if request.client else "unknown"
-    logger.info(
+    logger.debug(
         "HTTP请求开始 method=%s path=%s client=%s",
         request.method,
         request.url.path,

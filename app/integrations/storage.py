@@ -2,15 +2,49 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import logging
 import os
 import re
 import struct
 import uuid
 import zlib
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO
+
+logger = logging.getLogger(__name__)
+
+
+class StoragePathTooLongError(OSError):
+    """磁盘路径超出操作系统限制，需缩短存储目录。"""
+
+
+@contextmanager
+def storage_path_errors() -> Iterator[None]:
+    """统一解释 Windows 206 和其他平台的文件名过长错误。"""
+
+    try:
+        yield
+    except OSError as exc:
+        if exc.errno == errno.ENAMETOOLONG or getattr(exc, "winerror", None) == 206:
+            raise StoragePathTooLongError(
+                "文件存储路径过长，无法保存或解析文档。请将 STORAGE_ROOT 设置为较短的绝对路径"
+                "（例如 C:/tx-data），重新上传后重试；已有文件需迁移到新目录。"
+            ) from exc
+        raise
+
+
+def _remove_temporary_file(path: Path) -> None:
+    """临时文件清理失败应记录，但不能覆盖实际保存或解析错误。"""
+
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("临时文件清理失败 error=%s errno=%s", type(exc).__name__, exc.errno)
 
 
 def safe_filename(name: str) -> str:
@@ -24,17 +58,22 @@ def safe_filename(name: str) -> str:
 class LocalObjectStorage:
     """基于本地文件系统的不可变、内容寻址对象存储。"""
 
+    @storage_path_errors()
     def __init__(self, root: Path):
         """初始化并确保对象存储根目录存在。"""
 
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
 
+    @storage_path_errors()
     def save(self, stream: BinaryIO, filename: str, max_bytes: int) -> tuple[Path, str, int]:
         """流式保存上传文件，边读取边校验大小并计算内容哈希。"""
 
-        name = safe_filename(filename)
-        temp_path = self.root / f".{os.getpid()}-{uuid.uuid4().hex}-{name}.upload"
+        # 展示名称由 documents 保留；磁盘名只使用内容哈希和解析所需的扩展名。
+        suffix = Path(filename).suffix.lower()
+        if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
+            suffix = ""
+        temp_path = self.root / f".{uuid.uuid4().hex}.upload"
         digest = hashlib.sha256()
         size = 0
         try:
@@ -48,18 +87,17 @@ class LocalObjectStorage:
             sha = digest.hexdigest()
             target_dir = self.root / sha[:2] / sha[2:4]
             target_dir.mkdir(parents=True, exist_ok=True)
-            target = target_dir / f"{sha}-{name}"
+            target = target_dir / f"{sha}{suffix}"
             try:
                 # 硬链接提供“目标存在则不覆盖”的原子提交语义。
                 os.link(temp_path, target)
             except FileExistsError:
                 pass
-            temp_path.unlink(missing_ok=True)
             return target, sha, size
-        except Exception:
-            temp_path.unlink(missing_ok=True)
-            raise
+        finally:
+            _remove_temporary_file(temp_path)
 
+    @storage_path_errors()
     def resolve(self, storage_path: str) -> Path:
         """解析对象路径，并阻止相对路径逃逸存储根目录。"""
 
@@ -89,13 +127,14 @@ class LocalObjectStorage:
             parent = parent.parent
         return True
 
+    @storage_path_errors()
     def save_bytes(self, relative_path: str, data: bytes) -> tuple[str, str, int]:
         """以不可覆盖语义保存字节；同路径不同内容视为对象碰撞。"""
 
         target = self.resolve(relative_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256(data).hexdigest()
-        temp = target.with_name(f".{os.getpid()}-{uuid.uuid4().hex}-{target.name}.tmp")
+        temp = target.with_name(f".{uuid.uuid4().hex}.tmp")
         try:
             temp.write_bytes(data)
             try:
@@ -105,7 +144,7 @@ class LocalObjectStorage:
                 if hashlib.sha256(existing).hexdigest() != digest:
                     raise ValueError(f"Immutable object collision at {relative_path}")
         finally:
-            temp.unlink(missing_ok=True)
+            _remove_temporary_file(temp)
         return str(target.relative_to(self.root.resolve())), digest, len(data)
 
     def save_json(self, relative_path: str, value: object) -> tuple[str, str, int]:

@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.application.errors import ResourceNotFoundError, UpstreamServiceError
 from app.contracts.schemas import ChatResponse, FeedbackIn
 from app.repositories.chat import ChatRepository
-from app.services.answer_contract import AnswerValidationError
+from app.services.answer_contract import AnswerGenerationError, AnswerValidationError
 from app.services.model_router import NoModelAvailable
 
 
@@ -73,6 +73,8 @@ class ChatApplicationService:
                     section_path=section_path,
                 )
             return self.answering_provider().answer(db, **arguments)
+        except AnswerGenerationError as exc:
+            raise UpstreamServiceError(str(exc), code=exc.code) from exc
         except NoModelAvailable as exc:
             raise UpstreamServiceError(str(exc)) from exc
         except AnswerValidationError as exc:

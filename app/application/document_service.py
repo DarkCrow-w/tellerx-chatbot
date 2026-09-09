@@ -15,6 +15,7 @@ from app.application.errors import (
     InvalidRequestError,
     ResourceConflictError,
     ResourceNotFoundError,
+    StorageConfigurationError,
     UnsupportedDocumentError,
     UploadTooLargeError,
 )
@@ -34,6 +35,7 @@ from app.contracts.schemas import (
 )
 from app.core.config import Settings
 from app.db.models import DocumentVersion, IngestionJob, Project
+from app.integrations.storage import StoragePathTooLongError
 from app.knowledge.document_scope import has_meaningful_document_hint
 from app.knowledge.parsers import DocumentParser
 from app.repositories.documents import DocumentRepository
@@ -287,6 +289,8 @@ class DocumentApplicationService:
                 filename,
                 self.settings.max_upload_bytes,
             )
+        except StoragePathTooLongError as exc:
+            raise StorageConfigurationError(str(exc)) from exc
         except ValueError as exc:
             raise UploadTooLargeError(str(exc)) from exc
 

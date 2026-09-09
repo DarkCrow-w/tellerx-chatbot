@@ -66,7 +66,8 @@ class LoggingTest(unittest.TestCase):
 
         self.assertEqual(response.headers["X-Request-ID"], "req-http-123")
         value = self.output.getvalue()
-        self.assertIn("HTTP请求开始", value)
+        self.assertNotIn("HTTP请求开始", value)
+        self.assertEqual(value.count("HTTP请求完成"), 1)
         self.assertIn("status=204", value)
         self.assertIn("request_id=req-http-123", value)
 

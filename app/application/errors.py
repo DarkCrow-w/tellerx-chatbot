@@ -46,8 +46,17 @@ class UploadTooLargeError(ApplicationError):
     status_code = 413
 
 
+class StorageConfigurationError(ApplicationError):
+    """存储路径配置导致文档无法保存或读取。"""
+
+    status_code = 500
+
+
 class UpstreamServiceError(ApplicationError):
     """外部模型或其响应契约暂时不可用。"""
 
     status_code = 502
 
+    def __init__(self, detail: str, *, code: str = "upstream_error"):
+        super().__init__(detail)
+        self.code = code

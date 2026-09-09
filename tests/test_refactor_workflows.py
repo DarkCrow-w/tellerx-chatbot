@@ -198,8 +198,10 @@ def test_ingestion_retry_preserves_sections_neighbors_and_outbox_transaction():
 
 
 @pytest.mark.parametrize("empty_document", [False, True])
-def test_ingestion_process_saves_success_or_failure_stage(empty_document):
+def test_ingestion_process_saves_success_or_failure_stage(empty_document, caplog):
     from app.knowledge.chunking import ParsedUnit
+
+    caplog.set_level("INFO", logger="app.services.ingestion")
 
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -235,12 +237,19 @@ def test_ingestion_process_saves_success_or_failure_stage(empty_document):
             assert job.status == "failed"
             assert version.technical_status == "failed_final"
             service._embeddings.assert_not_called()
+            assert "stage=parsing" in caplog.text
+            assert "入库任务失败" in caplog.text
         else:
             event_id = service.process(db, job.id)
             assert db.get(OutboxEvent, event_id).event_type == "index_version"
             assert job.status == "index_pending"
             assert len(list(db.scalars(select(Chunk)))) == 1
             service._save_normalized_artifact.assert_called_once()
+            assert "文档切块开始" in caplog.text
+            assert "min_chunk_tokens=" in caplog.text
+            assert "max_chunk_tokens=" in caplog.text
+            assert "elapsed_ms=" in caplog.text
+            assert "接口规则正文" not in caplog.text
     engine.dispose()
 
 

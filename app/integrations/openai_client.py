@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import ssl
 import time
 import uuid
@@ -22,12 +23,20 @@ logger = logging.getLogger(__name__)
 class ModelAPIError(RuntimeError):
     """保留 HTTP 状态和供应商错误码的统一模型网关异常。"""
 
-    def __init__(self, message: str, *, status_code: int | None = None, code: str | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        code: str | None = None,
+        result: ChatCallResult | None = None,
+    ):
         """记录安全截断后的错误消息及可用于审计的元数据。"""
 
         super().__init__(message)
         self.status_code = status_code
         self.code = code
+        self.result = result
 
 
 @dataclass(slots=True)
@@ -81,15 +90,9 @@ class OpenAIModelClient:
     def _usage(raw: object | None) -> Usage:
         """兼容 Chat 和 Embedding 的 SDK 用量对象。"""
 
-        prompt = int(
-            getattr(raw, "prompt_tokens", 0)
-            or getattr(raw, "input_tokens", 0)
-            or 0
-        )
+        prompt = int(getattr(raw, "prompt_tokens", 0) or getattr(raw, "input_tokens", 0) or 0)
         completion = int(
-            getattr(raw, "completion_tokens", 0)
-            or getattr(raw, "output_tokens", 0)
-            or 0
+            getattr(raw, "completion_tokens", 0) or getattr(raw, "output_tokens", 0) or 0
         )
         total = int(getattr(raw, "total_tokens", 0) or prompt + completion)
         return Usage(prompt_tokens=prompt, completion_tokens=completion, total_tokens=total)
@@ -103,11 +106,14 @@ class OpenAIModelClient:
         code: str | None = None
         if isinstance(body, dict):
             nested = body.get("error")
-            code = str(
-                body.get("code")
-                or (nested.get("code") if isinstance(nested, dict) else "")
-                or ""
-            ) or None
+            code = (
+                str(
+                    body.get("code")
+                    or (nested.get("code") if isinstance(nested, dict) else "")
+                    or ""
+                )
+                or None
+            )
         if code is None:
             code = str(getattr(exc, "code", "") or "") or type(exc).__name__
         return ModelAPIError(
@@ -116,13 +122,47 @@ class OpenAIModelClient:
             code=code,
         )
 
+    def _embedding_vectors(self, response: Any, input_count: int) -> list[list[float]]:
+        """拒绝缺失、错序或损坏的向量响应，避免把错误向量写入缓存。"""
+
+        try:
+            rows = sorted(response.data, key=lambda row: row.index)
+            indexes = [row.index for row in rows]
+            vectors = [list(row.embedding) for row in rows]
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ModelAPIError(
+                "Embedding response has an invalid shape", code="invalid_response"
+            ) from exc
+        if len(vectors) != input_count:
+            raise ModelAPIError(
+                f"Embedding response count mismatch: expected {input_count}, got {len(vectors)}",
+                code="invalid_response",
+            )
+        if indexes != list(range(input_count)):
+            raise ModelAPIError("Embedding response indexes are invalid", code="invalid_response")
+        for vector in vectors:
+            if len(vector) != self.settings.embedding_dimensions:
+                raise ModelAPIError(
+                    "Embedding dimension mismatch: expected "
+                    f"{self.settings.embedding_dimensions}, got {len(vector)}",
+                    code="invalid_response",
+                )
+            if not all(
+                isinstance(value, (float, int)) and math.isfinite(value) for value in vector
+            ):
+                raise ModelAPIError(
+                    "Embedding response contains non-finite or non-numeric values",
+                    code="invalid_response",
+                )
+        return vectors
+
     def embeddings(self, texts: list[str]) -> tuple[list[list[float]], Usage]:
         """按输入顺序返回文本向量，并校验数量和维度。"""
 
         if not texts:
             return [], Usage()
         started = time.perf_counter()
-        logger.info(
+        logger.debug(
             "Embedding调用开始 model=%s batch_size=%d dimensions=%d",
             self.settings.embedding_model,
             len(texts),
@@ -137,7 +177,7 @@ class OpenAIModelClient:
             )
         except openai.OpenAIError as exc:
             translated = self._translate_error(exc)
-            logger.warning(
+            logger.debug(
                 "Embedding调用失败 model=%s status=%s code=%s elapsed_ms=%.1f",
                 self.settings.embedding_model,
                 translated.status_code,
@@ -145,35 +185,9 @@ class OpenAIModelClient:
                 (time.perf_counter() - started) * 1000,
             )
             raise translated from exc
-        rows = sorted(response.data, key=lambda row: row.index)
-        embeddings = [list(row.embedding) for row in rows]
-        if len(embeddings) != len(texts):
-            raise ModelAPIError(
-                "Embedding response count does not match input",
-                code="invalid_response",
-            )
-        invalid_dimension = next(
-            (
-                len(vector)
-                for vector in embeddings
-                if len(vector) != self.settings.embedding_dimensions
-            ),
-            None,
-        )
-        if invalid_dimension is not None:
-            logger.error(
-                "Embedding响应维度错误 model=%s expected=%d actual=%d",
-                self.settings.embedding_model,
-                self.settings.embedding_dimensions,
-                invalid_dimension,
-            )
-            raise ModelAPIError(
-                "Embedding dimension mismatch: expected "
-                f"{self.settings.embedding_dimensions}, got {invalid_dimension}",
-                code="invalid_response",
-            )
+        embeddings = self._embedding_vectors(response, len(texts))
         usage = self._usage(response.usage)
-        logger.info(
+        logger.debug(
             "Embedding调用完成 model=%s batch_size=%d tokens=%d elapsed_ms=%.1f",
             self.settings.embedding_model,
             len(texts),
@@ -194,10 +208,12 @@ class OpenAIModelClient:
         model_id: str,
         system_prompt: str,
         user_prompt: str,
-        max_tokens: int = 1600,
+        max_tokens: int | None = None,
     ) -> ChatCallResult:
         """以零温度调用 Chat Completion，并返回待业务校验的 JSON 文本。"""
 
+        if max_tokens is None:
+            max_tokens = self.settings.answer_max_tokens
         request: dict[str, Any] = {
             "model": model_id,
             "messages": [
@@ -210,7 +226,7 @@ class OpenAIModelClient:
         if self.settings.model_api_json_mode_enabled:
             request["response_format"] = {"type": "json_object"}
         started = time.perf_counter()
-        logger.info(
+        logger.debug(
             "Chat调用开始 model=%s max_tokens=%d json_mode=%s",
             model_id,
             max_tokens,
@@ -220,7 +236,7 @@ class OpenAIModelClient:
             response = self._client.chat.completions.create(**request)
         except openai.OpenAIError as exc:
             translated = self._translate_error(exc)
-            logger.warning(
+            logger.debug(
                 "Chat调用失败 model=%s status=%s code=%s elapsed_ms=%.1f",
                 model_id,
                 translated.status_code,
@@ -231,27 +247,35 @@ class OpenAIModelClient:
         latency_ms = (time.perf_counter() - started) * 1000
         try:
             content = response.choices[0].message.content
+            finish_reason = getattr(response.choices[0], "finish_reason", None)
         except (AttributeError, IndexError, TypeError) as exc:
             raise ModelAPIError(
                 "Chat response has an invalid shape",
                 code="invalid_response",
             ) from exc
+        result = ChatCallResult(
+            model_id=str(response.model or model_id),
+            request_id=str(response.id or uuid.uuid4()),
+            content=content if isinstance(content, str) else "",
+            usage=self._usage(response.usage),
+            latency_ms=latency_ms,
+        )
+        if finish_reason == "length":
+            # 截断的正文不能进入 JSON/引用校验；保留用量供路由层审计并扩大预算重试。
+            raise ModelAPIError(
+                f"Model response reached the output limit of {max_tokens} tokens",
+                code="output_truncated",
+                result=result,
+            )
         if not isinstance(content, str) or not content.strip():
             raise ModelAPIError(
                 "Chat response did not contain text content",
                 code="invalid_response",
+                result=result,
             )
-        result = ChatCallResult(
-            model_id=str(response.model or model_id),
-            request_id=str(response.id or uuid.uuid4()),
-            content=content,
-            usage=self._usage(response.usage),
-            latency_ms=latency_ms,
-        )
         logger.info(
-            "Chat调用完成 model=%s provider_request_id=%s tokens=%d elapsed_ms=%.1f",
+            "Chat调用完成 model=%s tokens=%d elapsed_ms=%.1f",
             result.model_id,
-            result.request_id,
             result.usage.total_tokens,
             result.latency_ms,
         )

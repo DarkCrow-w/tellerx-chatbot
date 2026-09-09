@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from datetime import datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, UploadFile
@@ -31,20 +30,14 @@ from app.core.container import document_application_service
 from app.db import SessionLocal, get_db
 
 router = APIRouter(tags=["documents"])
-logger = logging.getLogger(__name__)
 
 
 def _run_job(job_id: str) -> None:
     """在独立数据库会话中执行仅供开发环境使用的内联任务。"""
 
-    logger.info("后台入库任务开始 job_id=%s", job_id)
-    try:
-        with SessionLocal() as db:
-            document_application_service().process_ingestion_job(db, job_id)
-    except Exception:
-        logger.exception("后台入库任务异常 job_id=%s", job_id)
-        raise
-    logger.info("后台入库任务完成 job_id=%s", job_id)
+    # 入库和索引服务记录各自阶段及失败原因；异常继续交给后台任务运行器。
+    with SessionLocal() as db:
+        document_application_service().process_ingestion_job(db, job_id)
 
 
 @router.get("/projects", response_model=list[ProjectOut])

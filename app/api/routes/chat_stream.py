@@ -9,6 +9,7 @@ from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
+from app.application.errors import ApplicationError
 from app.contracts.schemas import ChatRequest
 from app.core.container import chat_application_service
 from app.db import SessionLocal
@@ -21,6 +22,15 @@ _pending_workers: set[asyncio.Task] = set()
 
 def encode_event(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _error_detail(exc: Exception) -> dict:
+    if isinstance(exc, ApplicationError):
+        code = getattr(exc, "code", "application_error")
+        logger.warning("流式问答未完成 code=%s", code)
+        return {"detail": exc.detail, "code": code}
+    logger.exception("流式问答失败")
+    return {"detail": "本次问答未能完成，请稍后重试。"}
 
 
 async def answer_events(request: ChatRequest):
@@ -43,12 +53,12 @@ async def answer_events(request: ChatRequest):
                 send("final", result.model_dump(mode="json"))
         except AnswerCancelled:
             pass
-        except Exception:
-            logger.exception("流式问答失败")
+        except Exception as exc:  # noqa: BLE001 -- worker boundary; helper logs unexpected errors
+            detail = _error_detail(exc)
             if not stopped.is_set():
                 loop.call_soon_threadsafe(
                     queue.put_nowait,
-                    ("error", {"detail": "本次问答未能完成，请稍后重试。"}),
+                    ("error", detail),
                 )
 
     # Starlette's worker pool bounds simultaneous blocking work.
