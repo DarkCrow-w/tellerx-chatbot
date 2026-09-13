@@ -1,0 +1,235 @@
+#requires -Version 5.1
+<#
+配置下方参数后运行。GitHubRepoUrl 留空时使用现有 origin 的 push 地址。
+PAT 由已配置的 Git 凭据管理器提供，请勿把 PAT 写入本脚本或仓库地址。
+支持 Windows PowerShell 5.1 / PowerShell 7；请保持 UTF-8 BOM 编码。
+#>
+param(
+    [string]$RepoPath = 'C:\Users\14116\PycharmProjects\ObsidianNote',
+    [string]$GitHubRepoUrl = '', # 例如 https://github.com/你的用户名/你的仓库.git
+    [string]$RemoteName = 'origin'
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function Invoke-RepoGit {
+    param([string[]]$GitArgs, [switch]$Capture)
+    $previousPreference = $ErrorActionPreference
+    try {
+        # PowerShell 5.1 会把 Git 的正常 stderr 进度包装为 ErrorRecord。
+        $ErrorActionPreference = 'Continue'
+        if ($Capture) {
+            $result = @(& git -C $script:Root --literal-pathspecs @GitArgs 2>&1)
+            $code = $LASTEXITCODE
+        } else {
+            & git -C $script:Root --literal-pathspecs @GitArgs 2>&1 | ForEach-Object { Write-Host "$_" }
+            $code = $LASTEXITCODE
+        }
+    } finally { $ErrorActionPreference = $previousPreference }
+    if ($code -ne 0) {
+        if ($Capture) { $detail = ($result | ForEach-Object { "$_" }) -join "`n" }
+        else { $detail = '请查看上方 Git 输出。' }
+        throw "Git 执行失败（退出码 $code）：$detail"
+    }
+    if ($Capture) { return (($result | ForEach-Object { "$_" }) -join "`n").Trim() }
+}
+
+function Read-CleanInput([string]$Prompt) {
+    return (Read-Host $Prompt).Trim().Trim('"').Trim("'")
+}
+
+function Get-SafeTarget([string]$RelativePath) {
+    if ([IO.Path]::IsPathRooted($RelativePath) -or $RelativePath.Contains(':')) {
+        throw '目标必须是仓库内的相对路径，例如 notes 或 notes/2026。'
+    }
+    $full = [IO.Path]::GetFullPath((Join-Path $script:Root $RelativePath)).TrimEnd('\', '/')
+    if ($full -ne $script:Root -and -not $full.StartsWith($script:Root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw '目标路径不能越出仓库。'
+    }
+    $relative = $full.Substring($script:Root.Length).TrimStart('\')
+    $cursor = $script:Root
+    foreach ($part in ($relative -split '\\')) {
+        if (-not $part) { continue }
+        if ($part -ieq '.git' -or $part.TrimEnd(' ', '.') -ne $part) { throw '目标包含不允许的路径段。' }
+        $cursor = Join-Path $cursor $part
+        if (Test-Path -LiteralPath $cursor) {
+            $item = Get-Item -LiteralPath $cursor -Force
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw '目标路径不能经过符号链接或目录联接。' }
+            if ($item.PSIsContainer -and (Test-Path -LiteralPath (Join-Path $cursor '.git'))) {
+                throw '目标不能位于嵌套仓库或子模块中。'
+            }
+        }
+    }
+    return $full
+}
+
+function Assert-FileCanBeAdded([string]$RelativePath) {
+    $staged = Invoke-RepoGit -GitArgs @('diff', '--cached', '--name-only', '--', $RelativePath) -Capture
+    if ($staged) { throw "文件已有暂存改动，请先处理后再使用脚本：$RelativePath" }
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & git -C $script:Root check-ignore -q -- $RelativePath 2>$null
+        $code = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousPreference }
+    if ($code -eq 0) { throw "文件被 .gitignore 忽略，请先调整规则：$RelativePath" }
+    if ($code -ne 1) { throw '无法检查 .gitignore 规则。' }
+}
+
+function Save-PendingCommit {
+    if ($script:Pending.Count -eq 0) { Write-Host '当前没有等待 commit 的文件。'; return }
+    $files = @($script:Pending.Keys)
+    Invoke-RepoGit -GitArgs (@('add', '--') + $files)
+    $changed = Invoke-RepoGit -GitArgs (@('diff', '--cached', '--name-only', '--') + $files) -Capture
+    if (-not $changed) {
+        Write-Host '文件内容与当前提交一致，无需创建 commit。' -ForegroundColor Yellow
+        $script:Pending.Clear()
+        return
+    }
+    $message = Read-CleanInput '请输入 commit 说明（回车默认：上传文件）'
+    if (-not $message) { $message = '上传文件 ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') }
+    # --only 限定此次提交的文件，不会提交其他文件的已有暂存改动。
+    Invoke-RepoGit -GitArgs (@('commit', '--only', '-m', $message, '--') + $files)
+    $hash = Invoke-RepoGit -GitArgs @('rev-parse', 'HEAD') -Capture
+    foreach ($file in $files) {
+        $script:Records.Add([pscustomobject]@{ Path = $file; Commit = $hash; Pushed = $false })
+    }
+    $script:Pending.Clear()
+    Write-Host 'Commit 已完成，内容已保存在本地。' -ForegroundColor Green
+}
+
+function Push-CurrentBranch {
+    Write-Host "正在 push 到 $script:Branch，请等待网络和 Git 返回结果……" -ForegroundColor Cyan
+    Invoke-RepoGit -GitArgs @('push', '--progress', $script:PushUrl, "HEAD:refs/heads/$script:Branch")
+    foreach ($record in $script:Records) { $record.Pushed = $true }
+    Write-Host 'Push 成功！' -ForegroundColor Green
+    return ((Read-Host '回车继续；输入 Q 退出脚本') -ine 'q')
+}
+
+function Add-UploadFile {
+    $folder = Read-CleanInput '上传到仓库哪个文件夹？（回车默认根目录，例如 notes/2026）'
+    $targetFolder = Get-SafeTarget -RelativePath $folder
+    $sourceInput = Read-CleanInput '请输入本地文件的完整路径（支持带引号的路径）'
+    if (-not $sourceInput) { throw '未输入文件路径。' }
+    $source = Get-Item -LiteralPath $sourceInput -Force
+    if ($source.PSIsContainer) { throw '请输入一个文件的路径，文件夹内的文件请逐个添加。' }
+    $relative = if ($folder) { Join-Path $folder $source.Name } else { $source.Name }
+    $target = Get-SafeTarget -RelativePath $relative
+    $relative = $target.Substring($script:Root.Length + 1).Replace('\', '/')
+    if (-not $script:Pending.Contains($relative)) { Assert-FileCanBeAdded $relative }
+    if ($source.FullName -ine $target) {
+        if (Test-Path -LiteralPath $target) {
+            if ((Get-Item -LiteralPath $target -Force).PSIsContainer) { throw '目标同名路径是文件夹。' }
+            if ((Read-Host "目标已存在：$relative；输入 Y 覆盖，其他输入取消") -ine 'y') { return }
+        }
+        [IO.Directory]::CreateDirectory($targetFolder) | Out-Null
+        Copy-Item -LiteralPath $source.FullName -Destination $target -Force
+    }
+    $script:Pending[$relative] = $true
+    Write-Host "已准备：/$relative（尚未 commit / push）" -ForegroundColor Green
+}
+
+function Add-TestCommits {
+    $relative = 'test_github.txt'
+    $target = Get-SafeTarget $relative
+    if ($script:Pending.Contains($relative)) { throw 'test_github.txt 已在待提交列表中，请先 commit。' }
+    Assert-FileCanBeAdded $relative
+    if (Test-Path -LiteralPath $target) {
+        $status = Invoke-RepoGit -GitArgs @('status', '--porcelain', '--', $relative) -Capture
+        if ($status -and (Read-Host 'test_github.txt 存在未提交内容，将一起提交。输入 Y 继续') -ine 'y') { return $false }
+    }
+    for ($i = 1; $i -le 3; $i++) {
+        Write-Host "正常运行：正在生成第 $i/3 次测试 commit……" -ForegroundColor Cyan
+        $line = "`r`n" + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff zzz') + ' 测试github pat是否过期'
+        # 新文件使用 UTF-8；已有文件优先识别 BOM，兼容常见 UTF-8/UTF-16 文本。
+        $encoding = New-Object System.Text.UTF8Encoding($false)
+        if (Test-Path -LiteralPath $target -PathType Leaf) {
+            $reader = New-Object System.IO.StreamReader($target, $encoding, $true)
+            try { $null = $reader.Peek(); $encoding = $reader.CurrentEncoding } finally { $reader.Dispose() }
+        }
+        [IO.File]::AppendAllText($target, $line, $encoding)
+        $script:Pending[$relative] = $true
+        Invoke-RepoGit -GitArgs @('add', '--', $relative)
+        Invoke-RepoGit -GitArgs @('commit', '--only', '-m', "测试github pat是否过期 ($i/3)", '--', $relative)
+        $hash = Invoke-RepoGit -GitArgs @('rev-parse', 'HEAD') -Capture
+        $script:Records.Add([pscustomobject]@{ Path = $relative; Commit = $hash; Pushed = $false })
+        $script:Pending.Remove($relative)
+    }
+    return $true
+}
+
+function Show-Summary {
+    Write-Host "`n========== 本次运行汇总 ==========" -ForegroundColor Cyan
+    Write-Host "GitHub 地址：$script:PushUrl"
+    Write-Host "本地仓库：$script:Root"
+    Write-Host "目标分支：$script:Branch"
+    if ($script:Records.Count -eq 0) { Write-Host '本次没有创建 commit，也没有确认上传的文件。' }
+    foreach ($record in $script:Records) {
+        $status = if ($record.Pushed) { '已上传' } else { '已 commit，尚未成功 push' }
+        Write-Host ("[{0}] /{1}  commit: {2}" -f $status, $record.Path, $record.Commit.Substring(0, 7))
+    }
+    foreach ($file in $script:Pending.Keys) { Write-Host "[仅保存在本地，尚未 commit] /$file" -ForegroundColor Yellow }
+    Write-Host '祝您长生不老，生活愉快！' -ForegroundColor Magenta
+}
+
+function Start-GitHubUploader {
+    $script:Root = $RepoPath
+    $script:PushUrl = $GitHubRepoUrl
+    $script:Branch = '(尚未读取)'
+    $script:Pending = [ordered]@{}
+    $script:Records = New-Object 'System.Collections.Generic.List[object]'
+    try {
+        Write-Host '脚本已启动，正在检查 Git 和本地仓库……' -ForegroundColor Cyan
+        Get-Command git -ErrorAction Stop | Out-Null
+        $script:Root = (Get-Item -LiteralPath $RepoPath).FullName.TrimEnd('\', '/')
+        $top = Invoke-RepoGit -GitArgs @('rev-parse', '--show-toplevel') -Capture
+        if ([IO.Path]::GetFullPath($top).TrimEnd('\', '/') -ine $script:Root) { throw 'RepoPath 必须指向 Git 仓库根目录。' }
+        $script:Branch = Invoke-RepoGit -GitArgs @('symbolic-ref', '--quiet', '--short', 'HEAD') -Capture
+        foreach ($state in @('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply')) {
+            $statePath = Invoke-RepoGit -GitArgs @('rev-parse', '--git-path', $state) -Capture
+            if (-not [IO.Path]::IsPathRooted($statePath)) { $statePath = Join-Path $script:Root $statePath }
+            if (Test-Path -LiteralPath $statePath) { throw '仓库有未完成的 merge/rebase/cherry-pick/revert，请先完成。' }
+        }
+        if (-not $script:PushUrl) {
+            $script:PushUrl = Invoke-RepoGit -GitArgs @('remote', 'get-url', '--push', $RemoteName) -Capture
+        }
+        Write-Host "正常运行 | 仓库：$script:Root | 分支：$script:Branch" -ForegroundColor Green
+        Write-Host "GitHub 地址：$script:PushUrl"
+        Write-Host 'Push 会推送当前分支所有尚未推送的 commit。脚本不会自动 pull 或强制 push。'
+        $running = $true
+        while ($running) {
+            Write-Host "`n1. 自行上传文件 / 继续添加文件"
+            Write-Host '2. 自动刷 commit（追加测试文字，连续 commit 3 次，然后 push）'
+            Write-Host '3. Commit 待提交文件'
+            Write-Host '4. Commit 待提交文件 & Push（没有待提交文件时直接 Push）'
+            Write-Host 'Q. 退出'
+            Write-Host "当前待提交文件数：$($script:Pending.Count)"
+            try {
+                switch ((Read-Host '请选择').Trim().ToLowerInvariant()) {
+                    '1' {
+                        Add-UploadFile
+                        if ($script:Pending.Count -gt 0) {
+                            switch ((Read-Host '1=继续添加，2=commit，3=commit & push，回车=主菜单').Trim()) {
+                                '1' { continue }
+                                '2' { Save-PendingCommit }
+                                '3' { Save-PendingCommit; $running = Push-CurrentBranch }
+                            }
+                        }
+                    }
+                    '2' { if (Add-TestCommits) { $running = Push-CurrentBranch } }
+                    '3' { Save-PendingCommit }
+                    '4' { Save-PendingCommit; $running = Push-CurrentBranch }
+                    'q' { $running = $false }
+                    default { Write-Host '请输入 1、2、3、4 或 Q。' -ForegroundColor Yellow }
+                }
+            } catch {
+                Write-Host "操作未完成：$($_.Exception.Message)" -ForegroundColor Red
+                Write-Host '本地文件和已创建的 commit 会保留。修复问题后可通过菜单重试；push 失败时选 4。'
+            }
+        }
+    } catch { Write-Host "启动失败：$($_.Exception.Message)" -ForegroundColor Red }
+    finally { Show-Summary }
+}
+
+if ($MyInvocation.InvocationName -ne '.') { Start-GitHubUploader }
