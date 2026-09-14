@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Evidence-first internal knowledge chatbot with a local Python and Vite runtime"
 requires-python = ">=3.12"
 dependencies = [
+  "boto3==1.43.91",
   # 固定直接依赖，保证内部机器重复安装时得到一致运行环境。
   "alembic==1.19.1",
   "beautifulsoup4==4.15.0",
@@ -32,6 +33,7 @@ dev = ["pytest==8.4.2", "ruff==0.16.2"]
 [project.scripts]
 tellerx-backend = "app.commands.local_server:main"
 model-diagnostics = "app.commands.diagnostics:diagnostics_main"
+storage-migrate = "app.commands.storage_migrate:main"
 knowledge-reindex = "app.commands.reindex:main"
 
 [tool.setuptools.packages.find]

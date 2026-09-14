@@ -406,3 +406,11 @@ h1 { margin: 0; font-size: clamp(28px, 4vw, 40px); font-weight: 610; letter-spac
 .context-chunk h5 { margin: 0 0 6px; color: var(--muted); font-size: 11px; line-height: 1.6; }
 .retrieval-scope small { display: block; margin-top: 5px; line-height: 1.6; }
 .progress-detail { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+
+.scan-panel { margin: 16px 0; padding: 16px; border: 1px solid var(--border); border-radius: 12px; }
+.scan-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.scan-panel p { font-size: 13px; color: var(--muted); margin: 8px 0; }
+.scan-heading button { flex-shrink: 0; }
+.scan-path { display: block; overflow-wrap: anywhere; font-size: 12px; margin: 8px 0; user-select: all; }
+.scan-panel details { font-size: 13px; overflow-wrap: anywhere; }
+@media (max-width: 640px) { .scan-heading { align-items: flex-start; flex-direction: column; } }

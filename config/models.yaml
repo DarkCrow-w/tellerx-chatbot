@@ -1,5 +1,5 @@
 models:
-  - id: glm-5.2
+  - id: deepseek-v3
     tier: all
     quota_tokens: 100000000
     priority: 10

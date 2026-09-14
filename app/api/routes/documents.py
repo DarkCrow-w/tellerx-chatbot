@@ -5,10 +5,12 @@ from __future__ import annotations
 from datetime import datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.api.error_mapping import run_application
+from app.api.object_download import ObjectDownloadResponse
+from app.api.routes.scans import router as scans_router
 from app.application.document_service import UploadDocumentCommand
 from app.contracts.schemas import (
     BulkDeleteDocumentsIn,
@@ -30,6 +32,7 @@ from app.core.container import document_application_service
 from app.db import SessionLocal, get_db
 
 router = APIRouter(tags=["documents"])
+router.include_router(scans_router)
 
 
 def _run_job(job_id: str) -> None:
@@ -276,7 +279,7 @@ def download_document(
     document_id: str,
     version_id: str | None = None,
     db: Session = Depends(get_db),
-) -> FileResponse:
+) -> StreamingResponse:
     """下载指定版本；未指定版本时返回最近上传版本。"""
 
     result = run_application(
@@ -286,7 +289,7 @@ def download_document(
             version_id=version_id,
         )
     )
-    return FileResponse(result.path, filename=result.filename)
+    return ObjectDownloadResponse(result.stream, result.filename)
 
 
 @router.delete("/documents/{document_id}", status_code=204)

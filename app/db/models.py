@@ -437,3 +437,26 @@ class QueryTrace(Base):
     model_id: Mapped[str | None] = mapped_column(String(100))
     latency_ms: Mapped[float] = mapped_column(Float, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class KnowledgeScan(Base):
+    """持久化知识库对象扫描进度；同一知识库只允许一个运行任务。"""
+
+    __tablename__ = "knowledge_scans"
+    __table_args__ = (
+        Index("uq_knowledge_scan_running", "project_id", unique=True,
+              postgresql_where=text("status = 'running'"),
+              sqlite_where=text("status = 'running'")),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="running")
+    processed: Mapped[int] = mapped_column(Integer, default=0)
+    imported: Mapped[int] = mapped_column(Integer, default=0)
+    skipped: Mapped[int] = mapped_column(Integer, default=0)
+    failed: Mapped[int] = mapped_column(Integer, default=0)
+    current_key: Mapped[str | None] = mapped_column(String(1200))
+    details: Mapped[list] = mapped_column(JSON, default=list)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

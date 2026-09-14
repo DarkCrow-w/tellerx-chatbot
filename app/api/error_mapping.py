@@ -8,6 +8,7 @@ from collections.abc import Callable
 from fastapi import HTTPException
 
 from app.application.errors import ApplicationError
+from app.integrations.s3_storage import StorageUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,8 @@ def run_application[T](action: Callable[[], T]) -> T:
 
     try:
         return action()
+    except StorageUnavailableError as exc:
+        raise HTTPException(503, "文件存储服务暂不可用，请稍后重试") from exc
     except ApplicationError as exc:
         # 业务异常不打印堆栈；类型和 HTTP 状态足以排查，且避免重复记录用户输入。
         logger.warning(

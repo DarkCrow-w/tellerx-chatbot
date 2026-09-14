@@ -55,3 +55,13 @@ for (const [detail, expected] of [
     }
   });
 }
+
+// Scan requests must stay scoped to the selected project.
+test("扫描接口按知识库编码路径并使用 POST", async () => {
+  const { startKnowledgeScan, getKnowledgeScan } = await import("../api.js");
+  const { request: start } = await captureRequest(() => startKnowledgeScan("project/id"));
+  assert.equal(start.path, "/api/v1/projects/project%2Fid/scan");
+  assert.equal(start.options.method, "POST");
+  const { request: status } = await captureRequest(() => getKnowledgeScan("project/id"));
+  assert.equal(status.path, "/api/v1/projects/project%2Fid/scan");
+});

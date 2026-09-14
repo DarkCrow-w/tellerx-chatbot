@@ -24,7 +24,7 @@ from app.db.models import (
     OutboxEvent,
 )
 from app.integrations.search import SearchIndex
-from app.integrations.storage import LocalObjectStorage
+from app.integrations.storage import ObjectStorage, create_storage
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +45,13 @@ class IndexingService:
         self,
         settings: Settings,
         index: SearchIndex,
-        storage: LocalObjectStorage | None = None,
+        storage: ObjectStorage | None = None,
     ):
         """组装搜索投影与不可变向量对象的访问依赖。"""
 
         self.settings = settings
         self.index = index
-        self.storage = storage or LocalObjectStorage(settings.storage_root)
+        self.storage = storage or create_storage(settings)
 
     def ensure_generation(self, db: Session) -> IndexGeneration:
         """确保当前物理搜索索引存在对应的代次审计记录。"""

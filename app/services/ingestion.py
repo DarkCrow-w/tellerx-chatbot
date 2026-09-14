@@ -12,6 +12,7 @@ import logging
 import time
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
@@ -29,7 +30,7 @@ from app.db.models import (
 )
 from app.integrations.openai_client import ModelAPIError, OpenAIModelClient
 from app.integrations.search import SearchIndex
-from app.integrations.storage import LocalObjectStorage, storage_path_errors
+from app.integrations.storage import ObjectStorage, create_storage, storage_path_errors
 from app.knowledge.chunking import TextChunk, chunk_units
 from app.knowledge.parsers import DocumentParser
 from app.repositories import ingestion_records
@@ -52,7 +53,7 @@ class IngestionService:
         model_client: OpenAIModelClient,
         index: SearchIndex,
         indexer: IndexingService | None = None,
-        storage: LocalObjectStorage | None = None,
+        storage: ObjectStorage | None = None,
     ):
         """组装解析、向量化、对象存储和索引发布所需的依赖。"""
 
@@ -60,7 +61,7 @@ class IngestionService:
         self.parser = parser
         self.model_client = model_client
         self.index = index
-        self.storage = storage or LocalObjectStorage(settings.storage_root)
+        self.storage = storage or create_storage(settings)
         self.indexer = indexer or IndexingService(settings, index, self.storage)
 
     @staticmethod
@@ -544,10 +545,9 @@ class IngestionService:
             f"-m{self.settings.chunk_max_tokens}-o{self.settings.chunk_overlap_tokens}"
         )
         db.commit()
-        source_path = self.storage.resolve(version.storage_path)
         started = time.perf_counter()
-        logger.info("文档解析开始 job_id=%s format=%s", job.id, source_path.suffix.lower())
-        with storage_path_errors():
+        logger.info("文档解析开始 job_id=%s format=%s", job.id, Path(version.storage_path).suffix.lower())
+        with storage_path_errors(), self.storage.materialize(version.storage_path) as source_path:
             units, warnings = self.parser.parse(source_path)
         logger.info(
             "文档解析完成 job_id=%s units=%d warnings=%d elapsed_ms=%.1f",

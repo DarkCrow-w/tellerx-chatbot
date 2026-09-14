@@ -9,7 +9,18 @@ import sys
 from app.core.config import get_settings
 from app.core.container import model_client
 from app.core.logging import configure_logging
-from app.integrations.openai_client import ModelAPIError
+from app.integrations.openai_client import ModelAPIError, parse_json_object
+from app.services.model_router import ModelRegistry
+
+
+def _validate_probe(content: str) -> None:
+    """探针只有收到可解析的预期 JSON 才算成功。"""
+    try:
+        payload = parse_json_object(content)
+    except (TypeError, ValueError) as exc:
+        raise ModelAPIError("Probe returned invalid JSON", code="invalid_json") from exc
+    if payload.get("status") != "ok":
+        raise ModelAPIError("Probe returned unexpected status", code="invalid_probe_response")
 
 
 def _safe_error(component: str, exc: ModelAPIError, **fields: object) -> str:
@@ -32,11 +43,19 @@ def diagnostics_main() -> None:
     parser = argparse.ArgumentParser(
         description="Run minimal OpenAI-compatible embedding and chat diagnostics"
     )
-    parser.add_argument("--chat-model", default="qwen3.5-122B")
+    parser.add_argument(
+        "--chat-model", help="Override the first enabled model in MODEL_REGISTRY_PATH"
+    )
     parser.add_argument("--skip-chat", action="store_true")
     parser.add_argument("--skip-embedding", action="store_true")
     args = parser.parse_args()
-    configure_logging(get_settings().log_level, stream=sys.stderr)
+    settings = get_settings()
+    if not args.skip_chat and not args.chat_model:
+        registry = ModelRegistry.load(settings.model_registry_path)
+        args.chat_model = next((model.id for model in registry.models if model.enabled), None)
+        if args.chat_model is None:
+            parser.error("MODEL_REGISTRY_PATH contains no enabled chat model")
+    configure_logging(settings.log_level, stream=sys.stderr)
     client = model_client()
     failures = 0
     if not args.skip_embedding:
@@ -63,8 +82,9 @@ def diagnostics_main() -> None:
                 model_id=args.chat_model,
                 system_prompt="Return JSON only.",
                 user_prompt='Return {"status":"ok"}.',
-                max_tokens=30,
+                max_tokens=settings.answer_max_tokens,
             )
+            _validate_probe(result.content)
             print(
                 json.dumps(
                     {

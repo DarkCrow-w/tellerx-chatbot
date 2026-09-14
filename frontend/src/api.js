@@ -240,3 +240,11 @@ export async function downloadEvidenceDocument(chunkId) {
   anchor.remove();
   setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
+
+export function getKnowledgeScan(projectId) {
+  return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}/scan`);
+}
+
+export function startKnowledgeScan(projectId) {
+  return requestJson(`/api/v1/projects/${encodeURIComponent(projectId)}/scan`, { method: "POST" });
+}

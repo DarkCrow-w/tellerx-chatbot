@@ -11,12 +11,17 @@ import re
 import struct
 import uuid
 import zlib
+from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO
 
 logger = logging.getLogger(__name__)
+
+
+class ImmutableObjectCollisionError(ValueError):
+    """同一对象 key 已存在不同内容。"""
 
 
 class StoragePathTooLongError(OSError):
@@ -55,7 +60,72 @@ def safe_filename(name: str) -> str:
     return clean[:240] or "document"
 
 
-class LocalObjectStorage:
+class ObjectStorage(ABC):
+    """共享对象编码；具体存储实现负责字节和文件生命周期。"""
+
+    @abstractmethod
+    def save(self, stream: BinaryIO, filename: str, max_bytes: int) -> tuple[str, str, int]:
+        """保存原始文件并返回稳定对象 key、SHA-256 和字节数。"""
+
+    @abstractmethod
+    def save_bytes(self, key: str, data: bytes) -> tuple[str, str, int]:
+        """不可变地保存字节。"""
+
+    @abstractmethod
+    def open(self, key: str):
+        """打开由调用方关闭的二进制流。"""
+
+    def read_bytes(self, key: str) -> bytes:
+        with self.open(key) as stream:
+            return stream.read()
+
+    @abstractmethod
+    def materialize(self, key: str):
+        """返回管理解析临时文件生命周期的上下文管理器。"""
+
+    @abstractmethod
+    def delete(self, key: str) -> bool:
+        """删除无引用对象；不存在返回 False。"""
+
+    @abstractmethod
+    def available(self) -> bool:
+        """检查存储是否可访问。"""
+
+    def save_json(self, relative_path: str, value: object) -> tuple[str, str, int]:
+        """紧凑序列化并压缩 JSON 对象。"""
+
+        data = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return self.save_bytes(relative_path, zlib.compress(data, level=6))
+
+    def load_json(self, object_uri: str) -> object:
+        """读取、解压并解析 JSON 对象。"""
+
+        return json.loads(zlib.decompress(self.read_bytes(object_uri)))
+
+    def save_vector(
+        self, embedding_fingerprint: str, content_hash: str, vector: list[float]
+    ) -> tuple[str, str, int]:
+        """按小端 float32 序列化并压缩向量。"""
+
+        payload = struct.pack(f"<{len(vector)}f", *vector)
+        return self.save_bytes(
+            f"embeddings/{embedding_fingerprint}/{content_hash}.f32.zlib",
+            zlib.compress(payload, level=6),
+        )
+
+    def load_vector(self, object_uri: str, dimensions: int, checksum: str) -> list[float]:
+        """校验校验和与维度后加载 float32 向量。"""
+
+        compressed = self.read_bytes(object_uri)
+        if hashlib.sha256(compressed).hexdigest() != checksum:
+            raise ValueError(f"Embedding checksum mismatch for {object_uri}")
+        payload = zlib.decompress(compressed)
+        if len(payload) != dimensions * 4:
+            raise ValueError(f"Embedding dimensions mismatch for {object_uri}")
+        return list(struct.unpack(f"<{dimensions}f", payload))
+
+
+class LocalObjectStorage(ObjectStorage):
     """基于本地文件系统的不可变、内容寻址对象存储。"""
 
     @storage_path_errors()
@@ -66,7 +136,7 @@ class LocalObjectStorage:
         self.root.mkdir(parents=True, exist_ok=True)
 
     @storage_path_errors()
-    def save(self, stream: BinaryIO, filename: str, max_bytes: int) -> tuple[Path, str, int]:
+    def save(self, stream: BinaryIO, filename: str, max_bytes: int) -> tuple[str, str, int]:
         """流式保存上传文件，边读取边校验大小并计算内容哈希。"""
 
         # 展示名称由 documents 保留；磁盘名只使用内容哈希和解析所需的扩展名。
@@ -92,8 +162,9 @@ class LocalObjectStorage:
                 # 硬链接提供“目标存在则不覆盖”的原子提交语义。
                 os.link(temp_path, target)
             except FileExistsError:
-                pass
-            return target, sha, size
+                if hashlib.sha256(target.read_bytes()).hexdigest() != sha:
+                    raise ImmutableObjectCollisionError("Immutable object collision")
+            return target.relative_to(self.root).as_posix(), sha, size
         finally:
             _remove_temporary_file(temp_path)
 
@@ -142,40 +213,29 @@ class LocalObjectStorage:
             except FileExistsError:
                 existing = target.read_bytes()
                 if hashlib.sha256(existing).hexdigest() != digest:
-                    raise ValueError(f"Immutable object collision at {relative_path}")
+                    raise ImmutableObjectCollisionError(f"Immutable object collision at {relative_path}")
         finally:
             _remove_temporary_file(temp)
         return str(target.relative_to(self.root.resolve())), digest, len(data)
 
-    def save_json(self, relative_path: str, value: object) -> tuple[str, str, int]:
-        """紧凑序列化并压缩 JSON 对象。"""
 
-        data = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        return self.save_bytes(relative_path, zlib.compress(data, level=6))
+    def read_bytes(self, key: str) -> bytes:
+        return self.resolve(key).read_bytes()
 
-    def load_json(self, object_uri: str) -> object:
-        """读取、解压并解析 JSON 对象。"""
+    def open(self, key: str):
+        return self.resolve(key).open("rb")
 
-        return json.loads(zlib.decompress(self.resolve(object_uri).read_bytes()))
+    @contextmanager
+    def materialize(self, key: str):
+        yield self.resolve(key)
 
-    def save_vector(
-        self, embedding_fingerprint: str, content_hash: str, vector: list[float]
-    ) -> tuple[str, str, int]:
-        """按小端 float32 序列化并压缩向量。"""
+    def available(self) -> bool:
+        return self.root.is_dir()
 
-        payload = struct.pack(f"<{len(vector)}f", *vector)
-        return self.save_bytes(
-            f"embeddings/{embedding_fingerprint}/{content_hash}.f32.zlib",
-            zlib.compress(payload, level=6),
-        )
 
-    def load_vector(self, object_uri: str, dimensions: int, checksum: str) -> list[float]:
-        """校验校验和与维度后加载 float32 向量。"""
-
-        compressed = self.resolve(object_uri).read_bytes()
-        if hashlib.sha256(compressed).hexdigest() != checksum:
-            raise ValueError(f"Embedding checksum mismatch for {object_uri}")
-        payload = zlib.decompress(compressed)
-        if len(payload) != dimensions * 4:
-            raise ValueError(f"Embedding dimensions mismatch for {object_uri}")
-        return list(struct.unpack(f"<{dimensions}f", payload))
+def create_storage(settings) -> ObjectStorage:
+    """所有运行入口使用相同的存储选择，S3 失败不降级。"""
+    if settings.storage_backend == "s3":
+        from app.integrations.s3_storage import S3ObjectStorage
+        return S3ObjectStorage(settings)
+    return LocalObjectStorage(settings.storage_root)

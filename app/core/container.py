@@ -20,7 +20,7 @@ from app.application.operations_service import (
 from app.core.config import Settings, get_settings
 from app.integrations.openai_client import OpenAIModelClient
 from app.integrations.search import SearchIndex
-from app.integrations.storage import LocalObjectStorage
+from app.integrations.storage import ObjectStorage, create_storage
 from app.knowledge.parsers import DocumentParser
 from app.repositories.chat import ChatRepository
 from app.repositories.documents import DocumentRepository
@@ -52,10 +52,10 @@ class ApplicationContainer:
         return SearchIndex(self.settings)
 
     @cached_property
-    def storage(self) -> LocalObjectStorage:
+    def storage(self) -> ObjectStorage:
         """返回进程内共享的不可变对象存储适配器。"""
 
-        return LocalObjectStorage(self.settings.storage_root)
+        return create_storage(self.settings)
 
     @cached_property
     def chat_repository(self) -> ChatRepository:
@@ -164,11 +164,14 @@ class ApplicationContainer:
     def health_application(self) -> HealthApplicationService:
         """返回依赖就绪检查应用服务。"""
 
-        return HealthApplicationService(self.operations_repository, self.index)
+        return HealthApplicationService(self.operations_repository, self.index, self.storage)
 
     def close(self) -> None:
         """只关闭实际初始化过的基础设施客户端。"""
 
+        storage = self.__dict__.get("storage")
+        if storage is not None and hasattr(storage, "close"):
+            storage.close()
         model_client = self.__dict__.get("model_client")
         if model_client is not None:
             model_client.close()

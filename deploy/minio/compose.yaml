@@ -1,0 +1,19 @@
+name: tellerx-minio
+services:
+  minio:
+    image: tellerx-minio:7aac2a2c-77f82e18
+    build: .
+    command: server /data --console-address :9001
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    env_file:
+      - /Users/cliff/TellerXData/minio/admin.env
+    volumes:
+      - /Users/cliff/TellerXData/minio/data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 6

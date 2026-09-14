@@ -31,6 +31,7 @@ import { formatBytes } from "./knowledge/upload";
 import { ACTIVE_JOB_STATUSES, PAGE_SIZE } from "./knowledge/documentDisplay";
 import BatchStatus from "./knowledge/BatchStatus";
 import ProjectPanel from "./knowledge/ProjectPanel";
+import ScanPanel from "./knowledge/ScanPanel";
 import DocumentRow from "./knowledge/DocumentRow";
 
 function documentActionMessage(action) {
@@ -335,6 +336,8 @@ export default function KnowledgeManager({
                 </button>
               </div>
             </header>
+
+            {selectedProject && <ScanPanel key={projectId} projectId={projectId} onUpdated={() => loadDocuments(true)} onToast={onToast} />}
 
             <input ref={fileInputRef} className="visually-hidden" aria-hidden="true" tabIndex="-1" type="file" multiple accept={accept} onChange={selectFiles} />
             <input ref={folderInputRef} className="visually-hidden" aria-hidden="true" tabIndex="-1" type="file" multiple accept={accept} webkitdirectory="" directory="" onChange={selectFiles} />

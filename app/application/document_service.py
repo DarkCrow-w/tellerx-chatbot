@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, ClassVar, Protocol
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -34,25 +35,18 @@ from app.contracts.schemas import (
     VersionOut,
 )
 from app.core.config import Settings
-from app.db.models import DocumentVersion, IngestionJob, Project
-from app.integrations.storage import StoragePathTooLongError
+from app.db.models import DocumentVersion, IngestionJob, KnowledgeScan, Project
+from app.integrations.s3_storage import StorageUnavailableError
+from app.integrations.storage import (
+    ImmutableObjectCollisionError,
+    ObjectStorage,
+    StoragePathTooLongError,
+)
 from app.knowledge.document_scope import has_meaningful_document_hint
 from app.knowledge.parsers import DocumentParser
 from app.repositories.documents import DocumentRepository
 
 logger = logging.getLogger(__name__)
-
-
-class ObjectStorage(Protocol):
-    """文档应用层需要的最小对象存储能力。"""
-
-    def save(
-        self, stream: BinaryIO, filename: str, max_bytes: int
-    ) -> tuple[Path, str, int]: ...
-
-    def resolve(self, storage_path: str) -> Path: ...
-
-    def delete(self, storage_path: str) -> bool: ...
 
 
 class IngestionProcessor(Protocol):
@@ -81,6 +75,7 @@ class UploadDocumentCommand:
     effective_at: datetime | None = None
     owner: str | None = None
     supersedes_document_id: str | None = None
+    project_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +90,7 @@ class UploadDocumentResult:
 class DownloadDocumentResult:
     """下载端点构造文件响应所需的信息。"""
 
-    path: Path
+    stream: BinaryIO
     filename: str
 
 
@@ -284,17 +279,24 @@ class DocumentApplicationService:
         self._validate_upload(command)
         filename = Path(command.filename).name or "document"
         try:
-            path, sha256, byte_size = self.storage.save(
+            key, sha256, byte_size = self.storage.save(
                 command.stream,
                 filename,
                 self.settings.max_upload_bytes,
             )
         except StoragePathTooLongError as exc:
             raise StorageConfigurationError(str(exc)) from exc
+        except ImmutableObjectCollisionError as exc:
+            raise ResourceConflictError("文件对象内容冲突") from exc
         except ValueError as exc:
             raise UploadTooLargeError(str(exc)) from exc
 
-        project = self.repository.get_or_create_project(db, command.project.strip())
+        project = (
+            self.repository.get_project(db, command.project_id)
+            if command.project_id else self.repository.get_or_create_project(db, command.project.strip())
+        )
+        if project is None:
+            raise ResourceNotFoundError("Project not found")
         document = self.repository.get_or_restore_document(
             db,
             project_id=project.id,
@@ -320,7 +322,7 @@ class DocumentApplicationService:
         version = DocumentVersion(
             document_id=document.id,
             sha256=sha256,
-            storage_path=str(path.relative_to(self.settings.storage_root)),
+            storage_path=key,
             lifecycle_status=command.lifecycle_status,
             technical_status="received",
             version_label=command.version_label,
@@ -567,10 +569,11 @@ class DocumentApplicationService:
         )
         if version is None or version.document.is_deleted:
             raise ResourceNotFoundError("Document not found")
-        path = self.storage.resolve(version.storage_path)
-        if not path.exists():
-            raise ResourceNotFoundError("Stored file is missing")
-        return DownloadDocumentResult(path=path, filename=version.document.filename)
+        try:
+            stream = self.storage.open(version.storage_path)
+        except FileNotFoundError as exc:
+            raise ResourceNotFoundError("Stored file is missing") from exc
+        return DownloadDocumentResult(stream=stream, filename=version.document.filename)
 
     def delete_document(self, db: Session, document_id: str) -> None:
         """软删除文档，并为每个版本发布投影删除事件。"""
@@ -686,6 +689,12 @@ class DocumentApplicationService:
     ) -> ProjectCleanupOut:
         """提交数据库删除后回收文件；文件失败不回滚已经完成的数据清理。"""
 
+        self.repository.get_project_for_update(db, project_id)
+        if db.scalar(select(KnowledgeScan.id).where(
+            KnowledgeScan.project_id == project_id, KnowledgeScan.status == "running"
+        )):
+            raise ResourceConflictError("知识库正在扫描，请等待扫描结束后再清理或删除")
+
         snapshot = self.repository.purge_project(
             db,
             project_id=project_id,
@@ -700,7 +709,7 @@ class DocumentApplicationService:
         for object_path in snapshot.object_paths:
             try:
                 files_deleted += int(self.storage.delete(object_path))
-            except (OSError, ValueError):
+            except (OSError, ValueError, StorageUnavailableError):
                 files_failed += 1
                 logger.exception(
                     "知识库对象删除失败 project_id=%s object_path=%s",

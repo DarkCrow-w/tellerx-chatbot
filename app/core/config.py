@@ -32,6 +32,15 @@ class Settings(BaseSettings):
     pgvector_hnsw_ef_search: int = 200
     storage_root: Path = Path(".local-data/knowledge")
 
+    storage_credentials_file: Path | None = None
+    storage_backend: str = "local"
+    s3_endpoint_url: str = "http://127.0.0.1:9000"
+    s3_bucket: str = "tellerx-knowledge"
+    s3_region: str = "us-east-1"
+    s3_access_key: str = Field(default="", repr=False, exclude=True)
+    s3_secret_key: str = Field(default="", repr=False, exclude=True)
+    storage_temp_dir: Path = Path(".local-data/storage-tmp")
+
     # Token 只从进程环境读取；exclude/repr=False 防止配置日志或序列化意外泄露。
     model_api_key: str = Field(
         default="",
@@ -121,6 +130,17 @@ class Settings(BaseSettings):
     def validate_runtime_invariants(self) -> Settings:
         """拒绝不安全、相互矛盾或与数据库结构不兼容的配置。"""
 
+        if self.storage_credentials_file:
+            if not self.storage_credentials_file.is_file():
+                raise ValueError("Storage credentials file does not exist")
+            from dotenv import dotenv_values
+            values = dotenv_values(self.storage_credentials_file)
+            self.s3_access_key = self.s3_access_key or values.get("S3_ACCESS_KEY", "")
+            self.s3_secret_key = self.s3_secret_key or values.get("S3_SECRET_KEY", "")
+        if self.storage_backend not in {"local", "s3"}:
+            raise ValueError("STORAGE_BACKEND must be local or s3")
+        if self.storage_backend == "s3" and not (self.s3_access_key and self.s3_secret_key):
+            raise ValueError("S3 credentials are required")
         self._validate_logging_configuration()
         self._validate_search_configuration()
         self._validate_chunk_configuration()

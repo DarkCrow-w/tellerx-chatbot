@@ -23,7 +23,7 @@ from app.db.models import (
     IngestionJob,
 )
 from app.integrations.search import SearchIndex
-from app.integrations.storage import LocalObjectStorage
+from app.integrations.storage import create_storage
 from app.knowledge.chunking import TextChunk
 from app.knowledge.parsers import DocumentParser
 from app.services.indexing import IndexingService
@@ -246,7 +246,7 @@ def main() -> None:
     index = search_index()
     index.ensure_index()
     started = time.perf_counter()
-    storage = LocalObjectStorage(settings.storage_root)
+    storage = create_storage(settings)
     indexer = IndexingService(settings, index, storage)
     ingestion = IngestionService(
         settings,

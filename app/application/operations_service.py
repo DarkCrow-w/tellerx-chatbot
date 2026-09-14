@@ -80,9 +80,10 @@ class OperationsApplicationService:
 class HealthApplicationService:
     """组合数据库与搜索后端的就绪状态。"""
 
-    def __init__(self, repository: OperationsRepository, search: SearchStatusPort):
+    def __init__(self, repository: OperationsRepository, search: SearchStatusPort, storage=None):
         self.repository = repository
         self.search = search
+        self.storage = storage
 
     def readiness(self, db: Session) -> dict[str, str | bool]:
         """返回可供编排器判断的依赖就绪信息。"""
@@ -90,8 +91,10 @@ class HealthApplicationService:
         database = self.repository.database_available(db)
         search_state = self.search.status()
         search = bool(search_state.get("available") and search_state.get("table_ready"))
+        storage = self.storage.available() if self.storage is not None else True
         return {
-            "status": "ready" if database and search else "not_ready",
+            "storage": storage,
+            "status": "ready" if database and search and storage else "not_ready",
             "database": database,
             "search": search,
         }

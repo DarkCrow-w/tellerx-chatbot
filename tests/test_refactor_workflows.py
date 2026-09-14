@@ -210,6 +210,9 @@ def test_ingestion_process_saves_success_or_failure_stage(empty_document, caplog
     service = IngestionService(
         Settings(_env_file=None), parser, Mock(), Mock(), indexer=Mock(), storage=Mock()
     )
+    from contextlib import nullcontext
+    from pathlib import Path
+    service.storage.materialize.side_effect = lambda key: nullcontext(Path(key))
     service._save_normalized_artifact = Mock()
     service._embeddings = Mock(return_value={})
     with Session(engine) as db:

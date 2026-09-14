@@ -22,7 +22,8 @@ from app.services.query_understanding import fallback_query_plan
 @pytest.mark.parametrize("filename", ["a" * 220 + ".md", "文" * 100 + ".docx", "文" * 300 + ".PDF"])
 def test_long_upload_filename_uses_short_parseable_storage_path(tmp_path, filename):
     storage = LocalObjectStorage(tmp_path)
-    path, _, size = storage.save(BytesIO(b"document content"), filename, 1024)
+    key, _, size = storage.save(BytesIO(b"document content"), filename, 1024)
+    path = storage.resolve(key)
     assert path.read_bytes() == b"document content"
     assert size == 16
     assert path.suffix == filename[filename.rindex(".") :].lower()
